@@ -128,4 +128,4 @@ CI requires no API keys and does not control a phone. Live `run --execute` and d
 | `scripts/demo.mjs`      | Repeatable demo and outcome verification                         |
 | `artifacts/`            | Local-only traces, screenshots and measurements                  |
 
-Design reference: [browser-use/jev-ultrafast](https://github.com/browser-use/jev-ultrafast). This is an independent mobile implementation of its operation/target decomposition. MIT licensed; dependencies retain their respective licenses.
+MIT licensed; dependencies retain their respective licenses.
