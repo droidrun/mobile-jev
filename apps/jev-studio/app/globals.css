@@ -197,6 +197,49 @@ p {
   margin-left: 78px;
 }
 
+.workspace-header {
+  flex-shrink: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 24px;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--line);
+}
+.workspace-header h1 {
+  font-size: 16px;
+  font-weight: 600;
+}
+.workspace-header p {
+  margin-top: 4px;
+  color: #5e708c;
+  font-size: 11px;
+  line-height: 1.6;
+}
+.workspace-header p a {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.workspace-header nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  color: #376cbc;
+  font-size: 12px;
+}
+.workspace-header nav a {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 32px;
+}
+.workspace-header a:hover {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
 main {
   max-width: 1550px;
   margin: auto;

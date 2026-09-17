@@ -64,12 +64,51 @@ export default function Studio() {
           </button>
         </div>
         <div className="rail-bottom">
-          <span className="rail-label">MOBILE AGENT</span>
+          <span className="rail-label">MOBILE JEV</span>
           <span className="avatar">J</span>
         </div>
       </aside>
 
       <div className="workspace" id="workspace">
+        <header className="workspace-header">
+          <div>
+            <h1>Mobile Jev</h1>
+            <p>
+              By{' '}
+              <a href="https://droidrun.ai" target="_blank" rel="noreferrer">
+                Droidrun
+              </a>
+              {' · '}
+              <a href="https://docs.typesafe.ai/" target="_blank" rel="noreferrer">
+                Jev
+              </a>
+              {' decides · '}
+              <a href="https://mobilerun.ai" target="_blank" rel="noreferrer">
+                mobilerun
+              </a>
+              {' executes'}
+            </p>
+          </div>
+          <nav aria-label="Project resources">
+            <a
+              href="https://github.com/droidrun/mobile-jev#run-it"
+              target="_blank"
+              rel="noreferrer"
+            >
+              Setup guide
+            </a>
+            <a
+              href="https://github.com/droidrun/mobile-jev#how-mobile-jev-mobilerun-and-droidrun-fit-together"
+              target="_blank"
+              rel="noreferrer"
+            >
+              About
+            </a>
+            <a href="https://github.com/droidrun/mobile-jev" target="_blank" rel="noreferrer">
+              GitHub <ArrowUpRight size={12} aria-hidden="true" />
+            </a>
+          </nav>
+        </header>
         <main>
           <div className="work-grid">
             <section className="control-column">

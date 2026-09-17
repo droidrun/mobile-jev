@@ -1,5 +1,7 @@
 # Choosing a useful speed demo
 
+[Back to Mobile Jev](../README.md) · [Setup guide](../README.md#run-it)
+
 The first supported demo is **“Turn on dark theme in Android Settings.”** It has a visible before/after result, requires no account or third-party content load, and can be checked against an actual accessibility switch state. It is a small, reproducible utility task—not a demonstration of arbitrary travel booking.
 
 ## Run and verify

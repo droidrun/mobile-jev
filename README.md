@@ -1,14 +1,29 @@
 # Mobile Jev
 
+**One goal. A real Android phone. Jev makes the decisions.**
+
+A standalone mobile agent from [Droidrun](https://droidrun.ai), built on [mobilerun](https://mobilerun.ai) and powered by [TypeSafe's Jev](https://docs.typesafe.ai/). Includes a live React studio, a CLI, execution traces, and request-level latency measurements. No ADB connection is required.
+
+[Get started](#run-it) · [mobilerun Cloud](https://cloud.mobilerun.ai) · [API docs](https://docs.mobilerun.ai/) · [Jev docs](https://docs.typesafe.ai/) · [Demo guide](docs/DEMO.md) · [Report an issue](https://github.com/droidrun/mobile-jev/issues)
+
 [![Watch Jev navigate Uber on a live Mobilerun phone](docs/media/uber-demo.gif)](https://github.com/droidrun/mobile-jev/blob/main/docs/media/uber-demo.mp4)
 
 **[▶ Watch the demo](https://github.com/droidrun/mobile-jev/blob/main/docs/media/uber-demo.mp4)** — Jev opens Uber, enters a route from San Francisco Airport to the Golden Gate Bridge, and reaches payment selection. The recorded task timer shows about **21 seconds for 9 actions**. A completed booking is not demonstrated.
 
-**One goal. A real Android phone. Jev makes the decisions.**
+## How Mobile Jev, mobilerun, and Droidrun fit together
 
-A standalone mobile agent for [Mobilerun](https://mobilerun.ai), powered by [TypeSafe's Jev](https://docs.typesafe.ai/) and the [Mobilerun API](https://docs.mobilerun.ai/). Includes a live React studio, a CLI, execution traces, and request-level latency measurements. No ADB connection is required.
+[Droidrun](https://droidrun.ai) is the company behind mobilerun. The open-source framework formerly named Droidrun is now [mobilerun](https://github.com/droidrun/mobilerun); the GitHub organization is still `droidrun`.
 
-[Mobilerun](https://mobilerun.ai) · [Mobilerun docs](https://docs.mobilerun.ai) · [TypeSafe](https://typesafe.ai) · [Jev docs](https://docs.typesafe.ai) · [Demo guide](docs/DEMO.md)
+| Project                                                              | Role                                                                                                | Use it for                                                       |
+| -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| **Mobile Jev — this repo**                                           | A local Node.js agent and studio using Jev for decisions and the mobilerun device API for execution | Running and inspecting a Jev-driven Android agent                |
+| [mobilerun Cloud](https://cloud.mobilerun.ai)                        | Device provisioning, control APIs, and live streaming                                               | Connecting or provisioning the Android phone this repo controls  |
+| [mobilerun Framework](https://github.com/droidrun/mobilerun)         | The open-source Python agent framework                                                              | Running the general-purpose mobile agent with your choice of LLM |
+| [Mobile Harness](https://github.com/droidrun/mobile-harness)         | Phone-control instructions and tools for an existing coding agent                                   | Giving your coding agent access to a phone                       |
+| [mobilerun examples](https://github.com/droidrun/mobilerun-examples) | Runnable Cloud API and SDK integrations                                                             | Starting from other integration examples                         |
+| [TypeSafe / Jev](https://typesafe.ai)                                | The external model provider that selects typed operations and targets                               | Supplying the decision model used by this repo                   |
+
+Mobile Jev runs its own agent loop and calls TypeSafe directly. It uses mobilerun's **device APIs**, rather than submitting a goal to the hosted mobilerun agent. This is why it needs **both a mobilerun API key and a TypeSafe API key**. It does not import the Python framework or Mobile Harness. This integration currently targets **Android**, even though other mobilerun products also support iOS.
 
 ## Run it
 
@@ -34,7 +49,7 @@ Open **http://127.0.0.1:3040**. Enter a goal and press **Run task**.
 
 - Get a Mobilerun key from [API keys](https://cloud.mobilerun.ai/api-keys).
 - Get a TypeSafe key from the [TypeSafe console](https://console.typesafe.ai/).
-- Connect or provision your own Android device through Mobilerun. Device/service charges are separate from this project.
+- Connect or provision your own Android device in the [mobilerun dashboard](https://cloud.mobilerun.ai). Device/service charges and TypeSafe usage are separate from this MIT-licensed project; see [mobilerun pricing](https://mobilerun.ai/pricing/).
 - The default API endpoint is production. Set `MOBILERUN_BASE_URL` to your own environment if needed; the code contains no fixed account or device ID.
 
 Already export your variables? That works too. Exported variables take precedence over `.env.local`, which takes precedence over `.env`.
@@ -112,6 +127,8 @@ An identical prompt is not guaranteed to produce an identical trace. App version
 
 ## Development
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and what to include in a bug report. The [repository audit and follow-up plan](docs/REPOSITORY-AUDIT.md) records the ecosystem links and GitHub About setup.
+
 ```sh
 pnpm check       # tests, lint, typecheck, formatting, production build
 pnpm build
@@ -128,4 +145,4 @@ CI requires no API keys and does not control a phone. Live `run --execute` and d
 | `scripts/demo.mjs`      | Repeatable demo and outcome verification                         |
 | `artifacts/`            | Local-only traces, screenshots and measurements                  |
 
-MIT licensed; dependencies retain their respective licenses.
+[MIT licensed](LICENSE); dependencies retain their respective licenses. Built by [Droidrun](https://droidrun.ai) with [mobilerun](https://mobilerun.ai) and [TypeSafe](https://typesafe.ai).
