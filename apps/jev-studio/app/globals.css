@@ -18,6 +18,28 @@
 * {
   box-sizing: border-box;
 }
+.activity-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.clear-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 5px 7px;
+  background: transparent;
+  color: var(--quiet);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.clear-button:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
 body {
   margin: 0;
   background: var(--paper);

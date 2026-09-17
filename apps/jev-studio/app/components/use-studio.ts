@@ -11,6 +11,8 @@ export function useStudio() {
   const [run, setRun] = useState<Run | null>(null);
   const [runs, setRuns] = useState<Run[]>([]);
   const [submitting, setSubmitting] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const clearedRunIds = useRef(new Set<string>());
   const [error, setError] = useState('');
   const [panel, setPanel] = useState<'activity' | 'history'>('activity');
   const [now, setNow] = useState(0);
@@ -37,6 +39,7 @@ export function useStudio() {
   }, []);
 
   const updateRun = useCallback((next: Run) => {
+    if (clearedRunIds.current.has(next.id)) return;
     setRun(next);
     setRuns((previous) => [next, ...previous.filter((item) => item.id !== next.id)].slice(0, 30));
   }, []);
@@ -100,7 +103,7 @@ export function useStudio() {
   }, [actions.length, latest?.sequence]);
 
   const start = async () => {
-    if (!goal.trim() || submitting || activeAnywhere) return;
+    if (!goal.trim() || submitting || clearing || activeAnywhere) return;
     setSubmitting(true);
     setError('');
     setPanel('activity');
@@ -133,6 +136,27 @@ export function useStudio() {
     }
   };
 
+  const clear = async () => {
+    if (activeAnywhere || submitting || clearing) return;
+    setClearing(true);
+    try {
+      const response = await fetch('/api/studio/runs/clear', { method: 'POST' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error);
+      for (const item of runs) clearedRunIds.current.add(item.id);
+      if (run) clearedRunIds.current.add(run.id);
+      setRun(null);
+      setRuns([]);
+      setNow(0);
+      setError('');
+      setEventConnected(true);
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : 'Could not clear recent runs.');
+    } finally {
+      setClearing(false);
+    }
+  };
+
   return {
     device,
     deviceError,
@@ -146,6 +170,8 @@ export function useStudio() {
     setRun,
     runs,
     submitting,
+    clearing,
+    clear,
     error,
     setError,
     panel,

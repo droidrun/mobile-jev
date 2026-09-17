@@ -10,6 +10,7 @@ import {
   Loader2,
   MousePointer2,
   Play,
+  RotateCcw,
   Square,
   Terminal,
 } from 'lucide-react';
@@ -28,6 +29,10 @@ export function ActivityPanel({ state }: { state: StudioState }) {
     runs,
     setRun,
     setGoal,
+    clear,
+    clearing,
+    submitting,
+    activeAnywhere,
   } = state;
   return (
     <div className="activity panel">
@@ -48,10 +53,25 @@ export function ActivityPanel({ state }: { state: StudioState }) {
             Recent runs
           </button>
         </div>
-        <span className={`task-status ${run?.status || ''}`}>
-          <i />
-          {run ? statusLabels[run.status] : 'Standby'}
-        </span>
+        <div className="activity-controls">
+          <span className={`task-status ${run?.status || ''}`}>
+            <i />
+            {run ? statusLabels[run.status] : 'Standby'}
+          </span>
+          <button
+            className="clear-button"
+            onClick={() => void clear()}
+            disabled={activeAnywhere || submitting || clearing || (!runs.length && !run)}
+            title={
+              activeAnywhere
+                ? 'Stop the task before clearing'
+                : 'Clear recent runs and reset the timer'
+            }
+          >
+            <RotateCcw size={12} className={clearing ? 'spin' : undefined} />
+            {clearing ? 'Clearing…' : 'Clear'}
+          </button>
+        </div>
       </div>
       {panel === 'activity' ? (
         <div className="activity-body" ref={feed} aria-live="polite">

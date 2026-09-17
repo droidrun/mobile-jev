@@ -46,6 +46,13 @@ export function createStore({
   return {
     list: () => [...runs.values()].reverse().map((r) => snapshot(r.id)),
     get: snapshot,
+    clear() {
+      if (active()) throw new StudioError('Stop the active task before clearing recent runs.', 409);
+      const cleared = runs.size;
+      runs.clear();
+      listeners.clear();
+      return { cleared };
+    },
     subscribe(id, callback) {
       if (!runs.has(id)) throw new StudioError('Run not found.', 404);
       if (!listeners.has(id)) listeners.set(id, new Set());

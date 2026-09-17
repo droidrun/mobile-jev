@@ -1,6 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { StaleObservationError } from './device.mjs';
 import { describeAction } from './actions.mjs';
+import { confirmInput } from './input-verification.mjs';
 export { candidatesFor } from './actions.mjs';
 export { TypeSafePolicy } from './policy.mjs';
 
@@ -15,13 +16,14 @@ export async function runAgent({
   settleMs = 0,
   settleTimeoutMs = 400,
   waitTimeoutMs = 15_000,
+  inputTimeoutMs = 2500,
   onStep = () => {},
   onAction = () => {},
   onObservation = () => {},
 }) {
   if (!Number.isSafeInteger(maxSteps) || maxSteps < 1 || maxSteps > 100)
     throw new Error('maxSteps must be 1–100.');
-  for (const [key, value] of Object.entries({ settleMs, settleTimeoutMs })) {
+  for (const [key, value] of Object.entries({ settleMs, settleTimeoutMs, inputTimeoutMs })) {
     if (!Number.isFinite(value) || value < 0 || value > 10_000)
       throw new Error(`${key} must be 0–10000.`);
   }
@@ -100,6 +102,7 @@ export async function runAgent({
     } else waitingSince = undefined;
     const actionStart = performance.now();
     let stale = false;
+    let receipt;
     try {
       if (isWait)
         await wait(
@@ -109,7 +112,7 @@ export async function runAgent({
             Math.max(0, waitTimeoutMs - (performance.now() - waitingSince)),
           ),
         );
-      else await device.act(decision.action, { expected: observation });
+      else receipt = await device.act(decision.action, { expected: observation });
     } catch (error) {
       if (!(error instanceof StaleObservationError)) throw error; // Never retry uncertain mutations.
       timings.staleRetries++;
@@ -144,10 +147,34 @@ export async function runAgent({
     });
     if (settleMs) await wait(settleMs);
     let after = await observe();
+    if (receipt?.inputVerification) {
+      const confirmation = await confirmInput({
+        initial: after,
+        verification: receipt.inputVerification,
+        observe,
+        timeoutMs: inputTimeoutMs,
+        sleep: wait,
+      });
+      after = confirmation.observation;
+      if (!confirmation.verified) {
+        observation = after;
+        await onObservation({
+          step,
+          observation: after,
+          screenChanged: entry.before !== after.fingerprint,
+        });
+        return finish('input_unverified', {
+          ...decision,
+          reason:
+            'Text was sent, but its complete value could not be confirmed in the input field. Inspect the screen before retrying.',
+        });
+      }
+    }
     const waitDeadline = performance.now() + settleTimeoutMs;
     // Skip a transient system-bar-only snapshot (no foreground app) before asking Jev again.
     while (
       !isWait &&
+      !receipt?.inputVerification &&
       (after.fingerprint === observation.fingerprint || !after.phone.packageName) &&
       performance.now() + 60 < waitDeadline
     ) {

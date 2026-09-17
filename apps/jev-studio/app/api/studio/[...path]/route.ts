@@ -23,6 +23,7 @@ async function handle(request: Request, context: { params: Promise<{ path: strin
       });
     }
     if (request.method === 'GET' && path.join('/') === 'runs') return json(studio.list());
+    if (request.method === 'POST' && path.join('/') === 'runs/clear') return json(studio.clear());
     if (request.method === 'POST' && path.join('/') === 'runs') {
       if (!process.env.MOBILERUN_API_KEY && !process.env.MOBILERUN_CLOUD_API_KEY)
         throw new StudioError('Mobilerun credentials are missing on the server.', 503);

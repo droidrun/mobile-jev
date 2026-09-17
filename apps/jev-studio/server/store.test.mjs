@@ -112,3 +112,32 @@ test('live subscribers receive updates and can detach', () => {
   assert.equal(updates.length, 1);
   assert.equal(updates[0].events.length, 1);
 });
+
+test('clear removes ended runs from both list and detail, including their timing', () => {
+  const { child, store, setTime } = fixture();
+  const run = store.start({ goal: 'A goal' });
+  child.stdout.write('{"type":"result","outcome":"done"}\n');
+  setTime(4000);
+  child.emit('close', 0);
+  assert.equal(store.get(run.id).endedAt, 4000);
+  assert.deepEqual(store.clear(), { cleared: 1 });
+  assert.deepEqual(store.list(), []);
+  assert.equal(store.get(run.id), null);
+  assert.deepEqual(store.clear(), { cleared: 0 });
+});
+
+test('clear cannot orphan a running or stopping task', () => {
+  const { store } = fixture();
+  const run = store.start({ goal: 'A goal' });
+  assert.throws(
+    () => store.clear(),
+    (error) => error.status === 409,
+  );
+  assert.equal(store.get(run.id).status, 'running');
+  store.stop(run.id);
+  assert.throws(
+    () => store.clear(),
+    (error) => error.status === 409,
+  );
+  assert.equal(store.get(run.id).status, 'stopping');
+});
