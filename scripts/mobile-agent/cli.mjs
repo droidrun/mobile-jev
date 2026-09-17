@@ -5,6 +5,7 @@ import { MobilerunDevice } from './device.mjs';
 import { TypeSafePolicy, runAgent } from './agent.mjs';
 import { pooledRequest, decodeJson } from './http.mjs';
 import { measuredRequest, summarizeMetrics } from './metrics.mjs';
+import { confirmInput } from './input-verification.mjs';
 
 const help = `Mobilerun device harness (Node 22+ and curl)
 
@@ -33,6 +34,7 @@ Options:
   --confidence N                 Optional operation/target cutoff (default 0; disabled)
   --settle-ms N                  Extra fixed wait after actions (default 0)
   --wait-timeout-ms N            Consecutive loading wait budget (default 15000)
+  --text-completion MODE         accepted (verify locally) or committed (server waits)
   --execute                      Execute TypeSafe-selected actions
   --trace PATH                   Save model requests, responses, actions, and final state (JSONL)
 
@@ -60,6 +62,7 @@ async function main() {
       confidence: { type: 'string', default: '0' },
       'settle-ms': { type: 'string', default: '0' },
       'wait-timeout-ms': { type: 'string', default: '15000' },
+      'text-completion': { type: 'string' },
       text: { type: 'string', multiple: true, default: [] },
     },
   });
@@ -75,6 +78,7 @@ async function main() {
   };
   const device = new MobilerunDevice({
     deviceId: values.device || process.env.MOBILERUN_DEVICE_ID,
+    textCompletionMode: values['text-completion'],
   });
   if (command === 'devices') {
     arity(0);
@@ -233,8 +237,22 @@ async function main() {
     default:
       throw new Error('Unknown command. Use --help.');
   }
-  await device.act(action, { expected });
-  print({ status: 'executed', observation: await device.observe() });
+  const receipt = await device.act(action, { expected });
+  let observation = await device.observe();
+  if (receipt?.inputVerification) {
+    const confirmation = await confirmInput({
+      initial: observation,
+      verification: receipt.inputVerification,
+      observe: () => device.observe(),
+    });
+    observation = confirmation.observation;
+    if (!confirmation.verified) {
+      print({ status: 'input_unverified', observation });
+      process.exitCode = 2;
+      return;
+    }
+  }
+  print({ status: 'executed', observation });
 }
 
 main().catch((error) => {

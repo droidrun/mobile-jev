@@ -31,6 +31,7 @@ export default function Studio() {
     stop,
     run,
     submitting,
+    clearing,
     start,
     activeAnywhere,
     error,
@@ -129,7 +130,11 @@ export default function Studio() {
                       className="run-button"
                       onClick={() => void start()}
                       disabled={
-                        !goal.trim() || submitting || activeAnywhere || device?.state !== 'ready'
+                        !goal.trim() ||
+                        submitting ||
+                        clearing ||
+                        activeAnywhere ||
+                        device?.state !== 'ready'
                       }
                     >
                       {submitting ? (

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { curlRequest, decodeJson } from './http.mjs';
+import { prepareInputVerification } from './input-verification.mjs';
 
 export const GLOBAL_ACTIONS = { back: 1, home: 2, recent: 3 };
 export const KEYS = { back: 4, tab: 61, enter: 66, delete: 67, forward_delete: 112 };
@@ -192,6 +193,7 @@ export class MobilerunDevice {
     apiKey = process.env.MOBILERUN_API_KEY || process.env.MOBILERUN_CLOUD_API_KEY,
     deviceId = process.env.MOBILERUN_DEVICE_ID,
     baseUrl = process.env.MOBILERUN_BASE_URL || 'https://api.mobilerun.ai/v1',
+    textCompletionMode = process.env.MOBILERUN_TEXT_COMPLETION_MODE || 'accepted',
     request = curlRequest,
   } = {}) {
     this.apiKey = apiKey;
@@ -201,6 +203,9 @@ export class MobilerunDevice {
       throw new Error('MOBILERUN_BASE_URL must be an HTTPS API base URL.');
     this.baseUrl = url.href.replace(/\/$/, '');
     this.request = request;
+    if (!['accepted', 'committed'].includes(textCompletionMode))
+      throw new Error('Text completion mode must be accepted or committed.');
+    this.textCompletionMode = textCompletionMode;
     this.readyAt = -Infinity;
     this.installedApps = [];
   }
@@ -282,7 +287,8 @@ export class MobilerunDevice {
     };
     let suffix,
       method = 'POST',
-      body;
+      body,
+      inputVerification;
     switch (action.type) {
       case 'tap':
         point(action.x, action.y);
@@ -337,7 +343,13 @@ export class MobilerunDevice {
         )
           throw new Error('Text must be a string and clear must be boolean.');
         suffix = '/keyboard';
-        body = { text: action.text, clear: action.clear ?? false, completionMode: 'committed' };
+        inputVerification =
+          this.textCompletionMode === 'accepted' ? prepareInputVerification(current, action) : null;
+        body = {
+          text: action.text,
+          clear: action.clear ?? false,
+          completionMode: inputVerification ? 'accepted' : 'committed',
+        };
         break;
       case 'clear':
         if (!current.phone.isEditable) throw new Error('Focus an editable field before clearing.');
@@ -360,5 +372,6 @@ export class MobilerunDevice {
         throw new Error('Unsupported action type.');
     }
     await this.api(this.path(suffix), method, body);
+    return inputVerification ? { inputVerification } : undefined;
   }
 }
