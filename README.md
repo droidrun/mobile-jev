@@ -1,6 +1,6 @@
 # Mobile Jev
 
-[![Watch Jev navigate Uber on a live Mobilerun phone](docs/media/uber-demo.jpg)](https://github.com/droidrun/mobile-jev/blob/main/docs/media/uber-demo.mp4)
+[![Watch Jev navigate Uber on a live Mobilerun phone](docs/media/uber-demo.gif)](https://github.com/droidrun/mobile-jev/blob/main/docs/media/uber-demo.mp4)
 
 **[▶ Watch the demo](https://github.com/droidrun/mobile-jev/blob/main/docs/media/uber-demo.mp4)** — Jev opens Uber, enters a route from San Francisco Airport to the Golden Gate Bridge, and reaches payment selection. The recorded task timer shows about **21 seconds for 9 actions**. A completed booking is not demonstrated.
 
