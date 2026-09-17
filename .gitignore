@@ -1,0 +1,13 @@
+node_modules/
+.next/
+**/.next/
+.env*
+!.env.example
+artifacts/
+**/artifacts/
+coverage/
+*.tsbuildinfo
+next-env.d.ts
+.DS_Store
+*.log
+*.pem

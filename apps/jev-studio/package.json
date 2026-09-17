@@ -1,0 +1,27 @@
+{
+  "name": "@jev-mobile/studio",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "node launch.mjs dev",
+    "build": "next build",
+    "start": "node launch.mjs start",
+    "typecheck": "next typegen && tsc --noEmit",
+    "test": "node --test server/*.test.mjs",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "@mobilerun/react": "0.1.0",
+    "@mobilerun/sdk": "5.5.0",
+    "lucide-react": "^0.553.0",
+    "next": "16.2.10",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "typescript": "^5.9.3"
+  }
+}

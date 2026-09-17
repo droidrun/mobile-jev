@@ -1,0 +1,9 @@
+node_modules
+.next
+**/.next
+**/artifacts
+pnpm-lock.yaml
+next-env.d.ts
+**/next-env.d.ts
+.env*
+coverage

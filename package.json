@@ -1,0 +1,51 @@
+{
+  "name": "mobile-jev",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A fast mobile agent: Jev makes typed decisions, Mobilerun executes them.",
+  "license": "MIT",
+  "packageManager": "pnpm@10.30.1",
+  "engines": {
+    "node": ">=22.16.0"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @jev-mobile/studio dev",
+    "build": "pnpm --filter @jev-mobile/studio build",
+    "start": "pnpm --filter @jev-mobile/studio start",
+    "agent": "node scripts/run.mjs",
+    "devices": "node scripts/run.mjs devices",
+    "doctor": "node scripts/doctor.mjs",
+    "demo": "node scripts/demo.mjs",
+    "test": "node --test scripts/mobile-agent/*.test.mjs scripts/*.test.mjs apps/jev-studio/server/*.test.mjs",
+    "typecheck": "pnpm --filter @jev-mobile/studio typecheck",
+    "lint": "eslint .",
+    "format": "prettier . --check",
+    "format:fix": "prettier . --write",
+    "check": "pnpm test && pnpm lint && pnpm typecheck && pnpm format && pnpm build"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.4",
+    "eslint": "9.39.4",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "globals": "16.5.0",
+    "prettier": "3.8.1",
+    "typescript-eslint": "8.70.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "react": "19.2.7",
+      "react-dom": "19.2.7"
+    },
+    "onlyBuiltDependencies": [
+      "sharp"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/droidrun/mobile-jev.git"
+  },
+  "homepage": "https://github.com/droidrun/mobile-jev#readme",
+  "bugs": {
+    "url": "https://github.com/droidrun/mobile-jev/issues"
+  }
+}
