@@ -13,7 +13,6 @@ export function prepareInputVerification(observation, action) {
       id: target.id,
       resourceId: target.resourceId,
       hint: target.hint,
-      bounds: target.bounds,
     },
     text: action.text,
   };
@@ -32,13 +31,19 @@ export function inputMatches(observation, verification) {
     candidates = inputs.filter((e) => e.resourceId === target.resourceId);
     if (candidates.length > 1) candidates = candidates.filter((e) => e.id === target.id);
   } else {
-    // No stable resource ID: require the original tree position, hint and bounds.
+    // Layout may move or resize after typing (for example, a Send button appears).
+    // Keep tree identity and hint, then require unambiguous input/focus evidence.
     candidates = inputs.filter(
-      (e) =>
-        e.id === target.id &&
-        e.hint === target.hint &&
-        JSON.stringify(e.bounds) === JSON.stringify(target.bounds),
+      (e) => e.id === target.id && e.hint === target.hint && !e.resourceId,
     );
+    if (candidates.length !== 1) return false;
+    const editable = observation.elements.filter((e) => e.editable);
+    const focused = editable.filter((e) => e.focused);
+    if (observation.phone.inputElementId && observation.phone.inputElementId !== target.id)
+      return false;
+    if (focused.length > 0) {
+      if (focused.length !== 1 || focused[0] !== candidates[0]) return false;
+    } else if (editable.length !== 1) return false;
   }
   return candidates.length === 1 && candidates[0].text === verification.text;
 }
