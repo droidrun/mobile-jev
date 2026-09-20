@@ -155,3 +155,99 @@ test('agent confirms text before another decision and never repeats an unverifie
     assert.equal(decisions, complete ? 2 : 1);
   }
 });
+
+function anonymousScreen(text = '') {
+  const current = screen(text);
+  current.elements[0].resourceId = '';
+  current.elements[0].focused = true;
+  return current;
+}
+
+test('anonymous input readback survives resizing and keyboard layout movement', () => {
+  const verification = prepareInputVerification(anonymousScreen(), action);
+  for (const focused of [true, false]) {
+    const current = anonymousScreen('Berlin');
+    current.elements[0].bounds = { left: 0, top: 200, right: 80, bottom: 250 };
+    current.elements[0].focused = focused;
+    if (!focused) delete current.phone.inputElementId;
+    assert.equal(inputMatches(current, verification), true);
+    current.elements[0].text = 'Ber';
+    assert.equal(inputMatches(current, verification), false);
+  }
+});
+
+test('anonymous input identity cannot be replaced by matching text or conflicting focus', () => {
+  const verification = prepareInputVerification(anonymousScreen(), action);
+  const other = { ...anonymousScreen('Berlin').elements[0], id: 'other', focused: false };
+  for (const change of [
+    (o) => {
+      o.elements[0].id = 'other';
+    },
+    (o) => {
+      o.elements[0].hint = 'Another field';
+    },
+    (o) => {
+      o.elements[0].resourceId = 'another';
+    },
+    (o) => {
+      o.elements[0].text = '';
+      o.elements.push({ ...other });
+    },
+    (o) => {
+      o.elements.push({ ...other, focused: true });
+    },
+    (o) => {
+      o.elements[0].focused = false;
+      o.elements.push({ ...other, focused: true });
+    },
+    (o) => {
+      o.elements[0].focused = false;
+      o.elements.push({ ...other });
+    },
+    (o) => {
+      o.phone.inputElementId = 'other';
+    },
+    (o) => {
+      o.elements.push({ ...o.elements[0] });
+    },
+  ]) {
+    const current = anonymousScreen('Berlin');
+    change(current);
+    assert.equal(inputMatches(current, verification), false);
+  }
+  const current = anonymousScreen('Berlin');
+  current.elements.push(other);
+  assert.equal(inputMatches(current, verification), true);
+});
+
+test('agent proceeds after anonymous input resizes without repeating the input', async () => {
+  const before = anonymousScreen();
+  const after = anonymousScreen('Berlin');
+  after.elements[0].bounds.right = 80;
+  let reads = 0,
+    mutations = 0,
+    decisions = 0;
+  const result = await runAgent({
+    device: {
+      assertReady: async () => {},
+      observe: async () => (reads++ === 0 ? before : after),
+      act: async () => {
+        mutations++;
+        return { inputVerification: prepareInputVerification(before, action) };
+      },
+    },
+    policy: {
+      decide: async ({ observation }) => {
+        if (decisions++ === 0) return { status: 'action', action };
+        assert.equal(observation, after);
+        return { status: 'done' };
+      },
+    },
+    goal: 'Berlin',
+    execute: true,
+    inputTimeoutMs: 0,
+  });
+  assert.equal(result.status, 'done');
+  assert.equal(mutations, 1);
+  assert.equal(decisions, 2);
+});
