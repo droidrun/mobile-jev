@@ -1,2 +1,9 @@
 packages:
   - 'apps/*'
+
+overrides:
+  react: 19.2.7
+  react-dom: 19.2.7
+
+allowBuilds:
+  sharp: true
