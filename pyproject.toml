@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mobilerun-agents"
+version = "0.1.0"
+description = "LLM-powered agents for Mobilerun"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = {file = "LICENSE"}
+dependencies = [
+  "mobilerun>=0.7.4", "llama-index==0.14.23", "llama-index-workflows>=2.16.0,<3.0.0",
+  "llama-index-llms-openai==0.7.10", "llama-index-llms-openai-like==0.7.2",
+  "llama-index-llms-google-genai>=0.8.5", "llama-index-llms-ollama>=0.7.2",
+  "llama-index-llms-openrouter>=0.4.2", "llama-index-callbacks-arize-phoenix>=0.6.1",
+  "opentelemetry-exporter-otlp-proto-http>=1.40.0", "opentelemetry-sdk>=1.40.0",
+  "posthog>=6.7.6", "mcp>=1.28.1,<2.0.0", "filelock>=3.20.0", "PyJWT[crypto]>=2.14.0",
+  "async_adbutils", "pydantic>=2.11.10", "pydantic-settings>=2.16.0,<3", "rich>=14.1.0",
+  "httpx>=0.27.0", "click>=8.1", "PyYAML>=6.0", "requests>=2.0", "aiofiles>=25.1.0",
+  "openai>=2.0.0",
+  "Pillow>=13.0.0", "mobilerun-core-local[cloud]>=0.6.3", "aiohttp>=3.14.4",
+  "anyio>=4.14.2", "certifi>=2026.10.19", "fsspec>=2026.6.0", "urllib3>=2.8.0",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.67.0,<2", "llama-index-llms-anthropic>=0.8.6,<0.9.0"]
+langfuse = ["langfuse==4.15.1", "openinference-instrumentation-llama-index>=3.0.0", "llama-index-instrumentation"]
+deepseek = []
+dev = ["black==26.10.1", "ruff>=0.13.0", "pytest>=8.0.0", "hatchling>=1.27"]
+
+[tool.uv]
+override-dependencies = ["filelock>=4.2.1"]
+
+[tool.hatch.build.targets.wheel]
+only-include = ["src/mobilerun/agents"]
+sources = ["src"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/pyproject.toml", "/README.md", "/CONTRIBUTING.md", "/AGENTS.md", "/LICENSE", "/docs", "/scripts", "/tests", "/uv.lock"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["smoke: opt-in real-world smoke tests", "smoke_llm: smoke tests consuming LLM tokens"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B"]
+ignore = ["E501"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
