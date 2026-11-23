@@ -1,0 +1,40 @@
+"""ActionContext — composed bag of dependencies for action functions.
+
+Replaces the ``tools=tools_instance`` parameter that action functions
+previously received.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from llama_index.core.llms.llm import LLM
+    from mobilerun.core.devices import Device
+    from mobilerun.core.state.base import StateProvider
+    from mobilerun.core.state.ui_state import UIState
+    from mobilerun.macro.recorder import MacroRecorder
+
+    from mobilerun.agents.workflows.droid.state import MobileAgentState
+
+
+class ActionContext:
+    """Everything an action function needs to interact with the device."""
+
+    def __init__(
+        self,
+        driver: "Device",
+        ui: "Optional[UIState]",
+        shared_state: "MobileAgentState",
+        state_provider: "StateProvider",
+        app_opener_llm: Optional[LLM] = None,
+        streaming: bool = False,
+        macro_recorder: "Optional[MacroRecorder]" = None,
+    ) -> None:
+        self.driver: Device = driver
+        self.ui: Optional[UIState] = ui  # refreshed each step before tool execution
+        self.shared_state: MobileAgentState = shared_state
+        self.state_provider: StateProvider = state_provider
+        self.app_opener_llm: Optional[LLM] = app_opener_llm
+        self.streaming: bool = streaming
+        self.macro_recorder: Optional[MacroRecorder] = macro_recorder

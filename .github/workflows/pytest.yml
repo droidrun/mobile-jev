@@ -1,0 +1,34 @@
+name: Pytest
+on: [push, pull_request]
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv venv --python ${{ matrix.python }} .venv
+      - run: uv pip install --python .venv/bin/python pytest packaging
+      - run: uv build
+      - run: uv build --wheel --out-dir .build/sdist-wheel dist/*.tar.gz
+      - run: .venv/bin/python -m pytest tests/packaging -q
+      - run: .venv/bin/python -m pytest tests/migration -q -k "not test_external_plugin_discovery_and_loading_from_canonical_package"
+  integration:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python3 scripts/prepare_split_env.py --base-version 0.7.4 --env .venv --extras dev,anthropic,langfuse
+      - run: .venv/bin/python scripts/check_base_api.py
+      - run: .venv/bin/python -m pytest tests -q
