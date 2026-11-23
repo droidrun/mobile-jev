@@ -2,11 +2,11 @@
 
 import ast
 import json
-import re
 from collections import Counter
 from pathlib import Path
 
 import pytest
+from signature_helper import canonical_signature
 
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = json.loads((ROOT / "scripts/source_manifest.json").read_text())
@@ -42,15 +42,13 @@ def test_callable_signatures_preserved(source, target):
     if target.name == "__init__.py":
         pytest.skip("initializer exports are merged or made lazy")
     expected = Counter(
-        (name.rsplit(":", 1)[0], signature)
+        (name.rsplit(":", 1)[0], canonical_signature(signature))
         for name, signature in MANIFEST[source]["signatures"].items()
     )
     actual = Counter(
         (
             node.name,
-            re.sub(
-                r", ctx=(?:Load|Store|Del)\(\)", "", ast.dump(node.args, include_attributes=False)
-            ),
+            canonical_signature(ast.dump(node.args, include_attributes=False)),
         )
         for node in ast.walk(ast.parse(target.read_text()))
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))

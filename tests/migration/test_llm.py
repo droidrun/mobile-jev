@@ -4,6 +4,7 @@ from collections import Counter
 from pathlib import Path
 
 import pytest
+from signature_helper import canonical_signature
 
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = json.loads((ROOT / "scripts/source_manifest.json").read_text())
@@ -33,11 +34,13 @@ def test_copied_signatures_and_literals(old, new):
     entry = MANIFEST[old_path(old)]
     tree = ast.parse(path_for(new).read_text())
     signatures = Counter(
-        ast.dump(n.args, include_attributes=False).replace(", ctx=Load()", "")
+        canonical_signature(ast.dump(n.args, include_attributes=False))
         for n in ast.walk(tree)
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
     )
-    assert signatures == Counter(entry.get("signatures", {}).values())
+    assert signatures == Counter(
+        canonical_signature(s) for s in entry.get("signatures", {}).values()
+    )
     assignments = {}
     for n in ast.walk(tree):
         if isinstance(n, (ast.Assign, ast.AnnAssign)):

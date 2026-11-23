@@ -6,6 +6,7 @@ from collections import Counter
 from pathlib import Path
 
 import pytest
+from signature_helper import canonical_signature
 
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = json.loads((ROOT / "scripts/source_manifest.json").read_text())
@@ -42,10 +43,11 @@ def test_workflow_signatures_match_source_manifest(source, target):
         pytest.skip("package exports may become lazy")
     tree = ast.parse(target.read_text())
     expected = Counter(
-        (key.rsplit(":", 1)[0], value) for key, value in MANIFEST[source]["signatures"].items()
+        (key.rsplit(":", 1)[0], canonical_signature(value))
+        for key, value in MANIFEST[source]["signatures"].items()
     )
     actual = Counter(
-        (node.name, ast.dump(node.args, include_attributes=False).replace(", ctx=Load()", ""))
+        (node.name, canonical_signature(ast.dump(node.args, include_attributes=False)))
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     )

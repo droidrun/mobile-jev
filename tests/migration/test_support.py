@@ -3,9 +3,10 @@
 import ast
 import hashlib
 import json
-import re
 from collections import Counter
 from pathlib import Path
+
+from signature_helper import canonical_signature
 
 ROOT = Path(__file__).resolve().parents[2]
 DEST = ROOT / "src/mobilerun/agents"
@@ -40,12 +41,13 @@ def test_all_support_modules_and_signatures_are_preserved():
             continue  # package exports may be made lazy
         tree = ast.parse(dest.read_text())
         actual = Counter(
-            (n.name, re.sub(r"(?:, )?ctx=Load\(\)", "", ast.dump(n.args, include_attributes=False)))
+            (n.name, canonical_signature(ast.dump(n.args, include_attributes=False)))
             for n in ast.walk(tree)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         )
         expected = Counter(
-            (key.rsplit(":", 1)[0], value) for key, value in data["signatures"].items()
+            (key.rsplit(":", 1)[0], canonical_signature(value))
+            for key, value in data["signatures"].items()
         )
         assert actual == expected, path
 
