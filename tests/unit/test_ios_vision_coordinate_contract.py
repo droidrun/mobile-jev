@@ -14,7 +14,8 @@ from mobilerun.core.state.base import _should_resize_model_screenshot
 from mobilerun.core.state.ios import IOSStateProvider
 from PIL import Image
 
-from mobilerun.agents.tools.actions import _convert_action_point
+from mobilerun_agents.agent.tools.helpers import check_point
+from tests.unit.device_fixtures import tool_run
 
 POINTS_W, POINTS_H = 440, 956
 PIXELS_W, PIXELS_H = 1320, 2868  # 3x physical screenshot
@@ -81,61 +82,23 @@ def test_resize_flag_pairs_with_agent_gating():
     )
 
 
-def test_convert_action_point_validates_ios_model_space():
+def test_check_point_validates_ios_device_space():
     driver = FakeIOSDriver(screenshot_bytes=_png(PIXELS_W, PIXELS_H))
     provider = IOSStateProvider(driver, vision_enabled=True)
     state = _state(provider)
     ctx = SimpleNamespace(ui=state, state_provider=provider)
 
     # display-space coordinates convert to points
-    assert _convert_action_point(471, 1024, ctx=ctx) == (220, 478)
+    assert check_point(220, 478, ctx=ctx) == (220, 478)
 
     # raw physical-pixel coordinates (the pre-contract failure mode) are
     # outside the 943x2048 display space and get rejected
     try:
-        _convert_action_point(1200, 2500, ctx=ctx)
+        check_point(1200, 2500, ctx=ctx)
     except ValueError as e:
-        assert "943x2048" in str(e)
+        assert "440x956" in str(e)
     else:
         raise AssertionError("expected ValueError for image-space point")
-
-
-def test_click_at_auto_unmasks_with_vision_contract():
-    from mobilerun.agents.config.user_config import (
-        DEFAULT_DISABLED_TOOLS,
-    )
-    from mobilerun.agents.workflows.droid.droid_agent import _effective_disabled_tools
-
-    driver = FakeIOSDriver(screenshot_bytes=_png(PIXELS_W, PIXELS_H))
-
-    # vision + contract -> click_at auto-enabled
-    provider = IOSStateProvider(driver, vision_enabled=True)
-    effective = _effective_disabled_tools(
-        list(DEFAULT_DISABLED_TOOLS), provider, vision_enabled=True, explicit=False
-    )
-    assert "click_at" not in effective
-    assert "click_area" in effective  # only click_at auto-unmasks
-
-    # no vision -> stays masked
-    provider = IOSStateProvider(driver)
-    effective = _effective_disabled_tools(
-        list(DEFAULT_DISABLED_TOOLS), provider, vision_enabled=False, explicit=False
-    )
-    assert "click_at" in effective
-
-    # normalized mode + vision -> 0-1000 maps to points, click_at auto-enabled
-    provider = IOSStateProvider(driver, use_normalized=True, vision_enabled=True)
-    effective = _effective_disabled_tools(
-        list(DEFAULT_DISABLED_TOOLS), provider, vision_enabled=True, explicit=False
-    )
-    assert "click_at" not in effective
-
-    # explicit user list is honored verbatim
-    provider = IOSStateProvider(driver, vision_enabled=True)
-    effective = _effective_disabled_tools(
-        ["click_at"], provider, vision_enabled=True, explicit=True
-    )
-    assert "click_at" in effective
 
 
 def test_coordinate_actions_refused_when_contract_drops_for_a_step():
@@ -159,13 +122,13 @@ def test_coordinate_actions_refused_when_contract_drops_for_a_step():
     import pytest
 
     with pytest.raises(ValueError, match="unavailable for this step"):
-        _convert_action_point(100, 200, ctx=ctx)
+        check_point(100, 200, ctx=ctx)
 
     # Next step recovers the contract -> coordinate actions work again.
     state2 = _state(provider)
     assert provider.resize_model_screenshot is True
     ctx2 = SimpleNamespace(ui=state2, state_provider=provider)
-    assert _convert_action_point(471, 1024, ctx=ctx2) == (220, 478)
+    assert check_point(220, 478, ctx=ctx2) == (220, 478)
 
 
 def test_active_contract_state_allows_coordinate_actions():
@@ -175,7 +138,7 @@ def test_active_contract_state_allows_coordinate_actions():
     ctx = SimpleNamespace(ui=state, state_provider=provider)
 
     # contract active -> converts, no refusal
-    assert _convert_action_point(471, 1024, ctx=ctx) == (220, 478)
+    assert check_point(220, 478, ctx=ctx) == (220, 478)
 
 
 def test_non_vision_ios_does_not_require_contract():
@@ -187,7 +150,7 @@ def test_non_vision_ios_does_not_require_contract():
     ctx = SimpleNamespace(ui=state, state_provider=provider)
 
     assert provider.requires_active_contract_for_coords is False
-    assert _convert_action_point(100, 200, ctx=ctx) == (100, 200)
+    assert check_point(100, 200, ctx=ctx) == (100, 200)
 
 
 def test_guard_reads_snapshot_not_mutable_provider_flag():
@@ -204,7 +167,7 @@ def test_guard_reads_snapshot_not_mutable_provider_flag():
     # provider flag flipped False by a hypothetical macro re-probe -> the tap
     # still uses `good`, so it must NOT be spuriously refused.
     provider.resize_model_screenshot = False
-    assert _convert_action_point(471, 1024, ctx=ctx) == (220, 478)
+    assert check_point(220, 478, ctx=ctx) == (220, 478)
 
     # Inverse: a fallback snapshot must be refused even if the provider flag
     # currently reads True (re-probe succeeded after the step's snapshot).
@@ -216,51 +179,54 @@ def test_guard_reads_snapshot_not_mutable_provider_flag():
     import pytest
 
     with pytest.raises(ValueError, match="unavailable for this step"):
-        _convert_action_point(
-            100, 200, ctx=SimpleNamespace(ui=fallback, state_provider=drop_provider)
-        )
+        check_point(100, 200, ctx=SimpleNamespace(ui=fallback, state_provider=drop_provider))
 
 
 def test_swipe_refused_on_dropped_contract_step():
     """swipe (default-enabled) routes through the same guard."""
 
-    from mobilerun.agents.tools.actions import swipe
+    from mobilerun_agents.agent.tools.registry import build_registry
+    from tests.unit.device_fixtures import MemoryDevice
 
-    driver = FakeIOSDriver(screenshot_error=RuntimeError("probe failed"))
+    class Phone(FakeIOSDriver, MemoryDevice):
+        def __init__(self):
+            MemoryDevice.__init__(self, supported_operations=frozenset({"swipe"}))
+            FakeIOSDriver.__init__(self, screenshot_error=RuntimeError("probe failed"))
+
+    driver = Phone()
     provider = IOSStateProvider(driver, vision_enabled=True)
     state = _state(provider)
-    ctx = SimpleNamespace(ui=state, state_provider=provider, driver=driver, macro_recorder=None)
+    ctx = tool_run(ui=state, state_provider=provider, driver=driver, macro_recorder=None)
 
-    result = asyncio.run(swipe([100, 200], [100, 600], ctx=ctx))
+    result = asyncio.run(
+        build_registry(ctx, [], None).by_name["swipe"].acall(x1=100, y1=200, x2=100, y2=600)
+    ).raw_output
     assert result.success is False
     assert "unavailable for this step" in result.summary
 
 
-def test_click_at_end_to_end_refused_then_works(monkeypatch):
-    """End-to-end through the async click_at wrapper: refused on a dropped
+def test_tap_end_to_end_refused_then_works():
+    """End-to-end through the registry: refused on a dropped
     contract, taps on an active one. Taps are stubbed to avoid a real driver."""
     taps = []
 
-    class _Driver(FakeIOSDriver):
-        @property
-        def actions(self):
-            async def call(name, args, *, audience):
-                assert name == "device.tap" and audience == "operator"
-                return await self.tap(args["x"], args["y"])
+    from mobilerun_agents.agent.tools.registry import build_registry
+    from tests.unit.device_fixtures import MemoryDevice
 
-            return SimpleNamespace(call=call)
+    class _Driver(FakeIOSDriver, MemoryDevice):
+        def __init__(self, **kwargs):
+            MemoryDevice.__init__(self, supported_operations=frozenset({"tap"}))
+            FakeIOSDriver.__init__(self, **kwargs)
 
-        async def tap(self, x, y):
+        async def tap(self, x: int, y: int) -> None:
             taps.append((x, y))
 
     # active contract -> taps in points
     driver = _Driver(screenshot_bytes=_png(PIXELS_W, PIXELS_H))
     provider = IOSStateProvider(driver, vision_enabled=True)
     state = _state(provider)
-    from mobilerun.agents.tools.actions import click_at
-
-    ctx = SimpleNamespace(ui=state, state_provider=provider, driver=driver, macro_recorder=None)
-    ok = asyncio.run(click_at(471, 1024, ctx=ctx))
+    ctx = tool_run(ui=state, state_provider=provider, driver=driver, macro_recorder=None)
+    ok = asyncio.run(build_registry(ctx, [], None).by_name["tap"].acall(x=220, y=478)).raw_output
     assert ok.success and taps == [(220, 478)]
 
     # dropped contract -> refused, no tap
@@ -268,10 +234,10 @@ def test_click_at_end_to_end_refused_then_works(monkeypatch):
     drop = _Driver(screenshot_error=RuntimeError("probe failed"))
     drop_provider = IOSStateProvider(drop, vision_enabled=True)
     drop_state = _state(drop_provider)
-    ctx2 = SimpleNamespace(
-        ui=drop_state, state_provider=drop_provider, driver=drop, macro_recorder=None
-    )
-    refused = asyncio.run(click_at(100, 200, ctx=ctx2))
+    ctx2 = tool_run(ui=drop_state, state_provider=drop_provider, driver=drop, macro_recorder=None)
+    refused = asyncio.run(
+        build_registry(ctx2, [], None).by_name["tap"].acall(x=100, y=200)
+    ).raw_output
     assert refused.success is False and taps == []
 
 
@@ -287,7 +253,7 @@ def test_empty_state_from_ui_tree_failure_refuses_coordinate_actions():
 
     assert state.coordinate_contract_active is False
     with pytest.raises(ValueError, match="unavailable for this step"):
-        _convert_action_point(10, 20, ctx=SimpleNamespace(ui=state, state_provider=provider))
+        check_point(10, 20, ctx=SimpleNamespace(ui=state, state_provider=provider))
 
 
 def test_normalized_mode_shows_normalized_bounds_and_taps_points():
@@ -305,7 +271,7 @@ def test_normalized_mode_shows_normalized_bounds_and_taps_points():
     assert state.get_element_coords(element["index"]) == (220, 222)
     # the displayed center fed back through a coordinate action lands inside
     ctx = SimpleNamespace(ui=state, state_provider=provider)
-    x, y = _convert_action_point(499, 232, ctx=ctx)
+    x, y = check_point(220, 222, ctx=ctx)
     assert 20 <= x < 420 and 200 <= y < 244
     assert driver.screenshot_calls == 0
 
@@ -318,8 +284,8 @@ def test_normalized_mode_refuses_coordinates_on_a_failed_tree_read():
     failed = _state(provider)
 
     ctx = SimpleNamespace(ui=ok, state_provider=provider)
-    assert _convert_action_point(500, 500, ctx=ctx) == (220, 478)
+    assert check_point(220, 478, ctx=ctx) == (220, 478)
     import pytest
 
     with pytest.raises(ValueError, match="unavailable for this step"):
-        _convert_action_point(500, 500, ctx=SimpleNamespace(ui=failed, state_provider=provider))
+        check_point(220, 478, ctx=SimpleNamespace(ui=failed, state_provider=provider))

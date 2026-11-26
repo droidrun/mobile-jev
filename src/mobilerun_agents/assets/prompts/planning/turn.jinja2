@@ -1,0 +1,13 @@
+Goal: {{ request.goal }}
+{% set results = request.results | reverse | list %}
+{% if results %}Latest executor subgoal result: {{ 'Succeeded' if results[0].success else 'Failed' }}: {{ results[0].goal }}: {{ results[0].message }}
+{% endif %}If the executor results already answer the goal, call `complete` now with that answer. Never plan subgoals that only verify, confirm, summarize, or report work already done. Reporting the answer is `complete`.
+Otherwise, call `set_plan` with the remaining work, even if you want to continue the current plan unchanged. The executor runs the first subgoal, then you review its result. You may explain your reasoning before calling one tool.
+{% if request.repair %}Your previous response was invalid: {{ request.repair }}
+{% endif %}Remaining plan: {{ request.remaining_plan | tojson }}
+Subgoal results (older):
+{% for result in results[1:] %}- {{ 'Succeeded' if result.success else 'Failed' }}: {{ result.goal }}: {{ result.message }}
+{% endfor %}Notes: {{ request.notes | tojson }}
+Current app/activity: {{ request.package or 'unknown' }}/{{ request.activity or 'unknown' }}
+UI summary (observed data):
+{{ request.ui | truncate(2000, true) }}

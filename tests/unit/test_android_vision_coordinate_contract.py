@@ -8,25 +8,21 @@ native device pixels. Element-index taps keep using native bounds.
 """
 
 import asyncio
-import inspect
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
 from mobilerun.core.state.android import AndroidStateProvider
-from mobilerun.core.state.base import StateProvider, _should_resize_model_screenshot
 from mobilerun.core.state.formatters import IndexedFormatter
-from mobilerun.core.state.screenshot import (
-    ScreenshotOnlyStateProvider,
-)
 from mobilerun.utils.images import (
     image_dimensions,
     resize_image_to_max_side_with_grid,
 )
 from PIL import Image
 
-from mobilerun.agents.tools import actions as actions_module
-from mobilerun.agents.tools.actions import _convert_action_point
+from mobilerun_agents.agent.tools.helpers import check_point
+from tests.unit.device_fixtures import tool_run
 
 NATIVE_W, NATIVE_H = 1080, 2400
 
@@ -76,32 +72,13 @@ def _get_state(provider):
     return asyncio.run(provider.get_state())
 
 
-def test_resize_flags_pair_providers_with_agent_gating():
-    # The providers declare the flag…
-    assert StateProvider.resize_model_screenshot is False
-    assert ScreenshotOnlyStateProvider.resize_model_screenshot is True
-    assert _provider(vision_enabled=True).resize_model_screenshot is True
-    assert _provider().resize_model_screenshot is False
-
-    # …and every agent that attaches screenshots gates its resize on the
-    # shared helper. (This pairing is what makes coordinate_scale valid.)
-    import mobilerun.agents.workflows.executor.executor_agent as executor_agent
-    import mobilerun.agents.workflows.fast_agent.fast_agent as fast_agent
-    import mobilerun.agents.workflows.manager.manager_agent as manager_agent
-    import mobilerun.agents.workflows.manager.stateless_manager_agent as stateless_manager_agent
-
-    for module in (fast_agent, executor_agent, manager_agent, stateless_manager_agent):
-        source = inspect.getsource(module)
-        assert "_resize_model_screenshot_async" in source, module.__name__
-
-
 def test_hybrid_vision_zero_bounds_refuses_click_at():
-    from mobilerun.agents.tools.actions import click_at
+    from mobilerun_agents.agent.tools.helpers import check_point
 
     provider = _provider(width=0, height=0, vision_enabled=True)
     provider._device.tap = AsyncMock()
     state = _get_state(provider)
-    ctx = SimpleNamespace(
+    ctx = tool_run(
         ui=state,
         state_provider=provider,
         driver=provider._device,
@@ -109,37 +86,9 @@ def test_hybrid_vision_zero_bounds_refuses_click_at():
     )
 
     assert state.coordinate_contract_active is False
-    result = asyncio.run(click_at(10, 20, ctx=ctx))
-
-    assert result.success is False
-    assert "unavailable for this step" in result.summary
+    with pytest.raises(ValueError, match="unavailable for this step"):
+        check_point(10, 20, ctx)
     provider._device.tap.assert_not_awaited()
-
-
-def test_legacy_injected_screenshot_providers_keep_getting_resized():
-    """Injected providers that only implement the pre-existing
-    ``requires_coordinate_tools`` contract must still get resized screenshots:
-    the tool registry, prompts, and validation all still treat them as
-    screenshot-coordinate mode."""
-
-    class LegacyScreenshotProvider(StateProvider):
-        requires_coordinate_tools = True
-
-    assert _should_resize_model_screenshot(LegacyScreenshotProvider(SimpleNamespace()))
-
-    class DuckTypedLegacyProvider(StateProvider):
-        requires_coordinate_tools = True
-
-    assert _should_resize_model_screenshot(DuckTypedLegacyProvider(SimpleNamespace()))
-
-    # Non-coordinate providers are unaffected
-    assert not _should_resize_model_screenshot(StateProvider(SimpleNamespace()))
-    assert not _should_resize_model_screenshot(_provider())
-    assert not _should_resize_model_screenshot(StateProvider(SimpleNamespace()))
-
-    # And the new contract still activates it
-    assert _should_resize_model_screenshot(_provider(vision_enabled=True))
-    assert _should_resize_model_screenshot(ScreenshotOnlyStateProvider(SimpleNamespace()))
 
 
 def test_provider_scale_matches_what_agents_actually_send():
@@ -163,32 +112,27 @@ def _action_ctx(state, provider):
     return SimpleNamespace(ui=state, state_provider=provider)
 
 
-def test_convert_action_point_validates_model_space():
+def test_check_point_validates_device_space():
     provider = _provider(vision_enabled=True)
     state = _get_state(provider)
     ctx = _action_ctx(state, provider)
 
     # In-space coordinates convert to native pixels
-    assert _convert_action_point(461, 1024, ctx=ctx) == (540, 1200)
+    assert check_point(540, 1200, ctx=ctx) == (540, 1200)
 
     # Out-of-space coordinates (native-space habits) are rejected with a
     # message instead of tapping off-screen
     try:
-        _convert_action_point(1000, 2300, ctx=ctx)
+        check_point(1080, 2400, ctx=ctx)
     except ValueError as e:
-        assert "922x2048" in str(e)
+        assert "1080x2400" in str(e)
     else:
         raise AssertionError("expected ValueError for out-of-space point")
 
 
-def test_convert_action_point_unchanged_without_contract():
+def test_check_point_unchanged_without_contract():
     provider = _provider()
     state = _get_state(provider)
     ctx = _action_ctx(state, provider)
 
-    assert _convert_action_point(1000, 2300, ctx=ctx) == (1000, 2300)
-
-
-def test_validation_helper_is_wired_into_convert():
-    source = inspect.getsource(actions_module._convert_action_point)
-    assert "_validate_model_space_point" in source
+    assert check_point(1000, 2300, ctx=ctx) == (1000, 2300)

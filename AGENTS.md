@@ -1,11 +1,8 @@
 # Agent contributor rules
 
-Mobilerun Agents is the optional LLM-backed add-on for Mobilerun. Use Python 3.11–3.13. Implementation lives in `src/mobilerun/agents/`; base owns devices, shared APIs, and CLI dispatch. Keep the base checkout read-only.
-
-## Development and tests
-
-Use installed wheels in a fresh split environment, never editable installs or a checkout added to `PYTHONPATH`. Follow [CONTRIBUTING.md](CONTRIBUTING.md) for the harness and checks. Run the harness using a Python outside the target environment. It removes the base wheel's bundled agents before installing the add-on and recreates the selected environment; do not point it at an environment with data to keep.
-
-Keep normal CI and unit tests fake-only: no provider calls, OAuth logins, cloud resources, or real devices. Isolate credentials and configuration; never print or commit secrets. Smoke tests are opt-in. Get explicit consent before live or paid tests, review costs, clean up created resources, and report costs and resource IDs.
-
-Use type hints, small focused modules, and tests for behavior changes. Preserve public imports and legacy shims. Update relevant documentation when interfaces change.
+- Implement the add-on in `src/mobilerun_agents/`. Base owns devices, extension registration, macro playback and CLI dispatch. Leave the base checkout read-only.
+- Imports go down: CLI/public exports → `macro_agent/` → `agent/operators/` → `agent/workflows/` → services (`action_selector/`, `memory/`, `tools/`, `checkpoints/`, `analytics/`, `logs/` under `agent/`) → `agent/run.py` → `agent/workflows/core/` contracts → `agent/auth/` → `config/`, `errors/`. Inside `agent/tools/`, imports go from `registry` to `atomic` to `helpers`; selectors can also use `helpers`. The agent must not import macro replay.
+- Use specific types. Do not dispatch via `isinstance`, `getattr`, `hasattr` or `cast`. Keep model-facing prompts in `assets/prompts/`, tunables in typed configuration, and device actions and run tools in one run-local registry.
+- No legacy paths, aliases, shims, subscription logins or unused helpers. Update examples and fake-only tests alongside an API change.
+- Test installed wheels on Python 3.11–3.13. From the repo root, with an external Python: `python3 scripts/prepare_split_env.py --base-source ../mobilerun --env .venv --extras dev,langfuse`. The harness recreates `.venv`; never use editable installs or inject the source tree via `PYTHONPATH`.
+- Never print credentials. Unit tests must not use real models, cloud services or devices. Get consent before live tests, clean up resources and report costs. See [CONTRIBUTING.md](CONTRIBUTING.md) for checks.

@@ -72,10 +72,6 @@ _real_secrets = RealEnv(
         if key.endswith(("_API_KEY", "_TOKEN", "_SECRET_KEY")) or key == "LANGFUSE_PUBLIC_KEY"
     }
 )
-_real_config_dir = Path(
-    os.environ.get("MOBILERUN_USER_CONFIG_DIR")
-    or (Path.home() / "Library/Application Support/droidrun")
-)
 _real_android_sdk = (
     os.environ.get("ANDROID_HOME")
     or os.environ.get("ANDROID_SDK_ROOT")
@@ -110,19 +106,6 @@ def real_env(monkeypatch, isolate_user_configuration, request):
 @pytest.fixture
 def real_android_sdk():
     return _real_android_sdk
-
-
-@pytest.fixture
-def copied_auth_profiles(tmp_path, isolate_user_configuration):
-    import shutil
-
-    source = _real_config_dir / "credentials" / "auth-profiles.json"
-    destination = tmp_path / "config" / "credentials" / "auth-profiles.json"
-    if source.is_file():
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, destination)
-        destination.chmod(0o600)
-    return destination
 
 
 # Test modules can import application code during collection, before fixtures run.

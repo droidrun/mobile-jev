@@ -1,0 +1,18 @@
+Given the following list of installed apps and a user's description, determine which app package name to open.
+
+Installed Apps:
+{{ apps_list }}
+
+User's Request: "{{ app_description }}"
+
+Return ONLY a JSON object with the following structure:
+{
+    "package": "com.example.package"
+}
+
+If no app matches the user's request, return:
+{
+    "package": null
+}
+
+Choose the most appropriate app based on the description. Return the package name of the best match, or null if no app matches.

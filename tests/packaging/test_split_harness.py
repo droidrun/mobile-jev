@@ -8,23 +8,23 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_strip_only_selected_venv(tmp_path):
-    script = ROOT / "scripts/prepare_split_env.py"
-    assert script.exists()
-    spec = importlib.util.spec_from_file_location("split_harness", script)
+def test_stage_skills_index_uses_only_tracked_names_and_snapshot_contents(tmp_path):
+    spec = importlib.util.spec_from_file_location(
+        "split_harness", ROOT / "scripts/prepare_split_env.py"
+    )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    env = tmp_path / "venv"
-    purelib = env / "lib/python3.13/site-packages"
-    agents = purelib / "mobilerun/agents"
-    agents.mkdir(parents=True)
-    (agents / "sentinel").write_text("stale")
-    mod.strip_agents(env, purelib)
-    assert not agents.exists()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    with pytest.raises(ValueError):
-        mod.strip_agents(env, outside)
+    checkout = tmp_path / "checkout"
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    (checkout / "SKILL.md").write_text("checkout")
+    subprocess.run(["git", "add", "SKILL.md"], cwd=checkout, check=True)
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    (staged / "SKILL.md").write_text("snapshot")
+    (staged / "untracked.md").write_text("not part of release")
+    mod.stage_skills_index(checkout, staged)
+    assert subprocess.check_output(["git", "ls-files"], cwd=staged, text=True) == "SKILL.md\n"
+    assert (staged / "SKILL.md").read_text() == "snapshot"
 
 
 def test_wheel_metadata_dependencies(tmp_path):
@@ -39,7 +39,7 @@ def test_wheel_metadata_dependencies(tmp_path):
     with ZipFile(wheel, "w") as archive:
         archive.writestr(
             "mobilerun_agents-0.1.0.dist-info/METADATA",
-            'Metadata-Version: 2.3\nName: mobilerun-agents\nVersion: 0.1.0\nRequires-Dist: mobilerun>=0.7.4\nRequires-Dist: alpha>=1\nRequires-Dist: beta>=2; extra == "dev"\nRequires-Dist: gamma; extra == "anthropic"\n\n',
+            'Metadata-Version: 2.3\nName: mobilerun-agents\nVersion: 0.1.0\nRequires-Dist: mobilerun>=0.7.4\nRequires-Dist: alpha>=1\nRequires-Dist: beta>=2; extra == "dev"\nRequires-Dist: gamma; extra == "langfuse"\n\n',
         )
     assert mod.wheel_dependencies(wheel, ["dev"]) == ["alpha>=1", "beta>=2"]
 

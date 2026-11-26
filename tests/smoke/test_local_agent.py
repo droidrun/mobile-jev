@@ -8,9 +8,7 @@ import pytest
 
 @pytest.mark.smoke
 @pytest.mark.smoke_llm
-def test_installed_agent_operates_local_device(
-    real_env, android_sdk_for_smoke, copied_auth_profiles
-):
+def test_installed_agent_operates_local_device(real_env, android_sdk_for_smoke, monkeypatch):
     serial = os.environ.get("MOBILERUN_SMOKE_SERIAL")
     provider = os.environ.get("MOBILERUN_SMOKE_LLM_PROVIDER")
     model = os.environ.get("MOBILERUN_SMOKE_LLM_MODEL")
@@ -24,12 +22,12 @@ def test_installed_agent_operates_local_device(
 
     from mobilerun.core.devices import AndroidDevice
 
-    import mobilerun.agents
-    from mobilerun.agents.llm.llm_picker import load_llm
-    from mobilerun.agents.operators.agent import AgentOperator
+    import mobilerun_agents
+    from mobilerun_agents import AgentOperator, MobileConfig
+    from mobilerun_agents.config.user_config import LLMProfile
 
     assert (
-        Path(mobilerun.agents.__file__)
+        Path(mobilerun_agents.__file__)
         .resolve()
         .is_relative_to(Path(sysconfig.get_paths()["purelib"]).resolve())
     )
@@ -40,11 +38,14 @@ def test_installed_agent_operates_local_device(
         try:
             await device.connect()
             connected = True
+            config = MobileConfig()
+            config.llm_profiles[config.agent.selector] = LLMProfile(provider=provider, model=model)
+            monkeypatch.setattr("mobilerun_agents.config.loader.ConfigLoader.load", lambda: config)
             result = await device.do(
                 "Open the Settings app",
                 max_steps=3,
                 timeout=120,
-                operator=AgentOperator(llms=load_llm(provider, model)),
+                operator=AgentOperator(),
             )
             assert result.success, result
         finally:

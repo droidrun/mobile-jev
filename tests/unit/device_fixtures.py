@@ -6,13 +6,13 @@ from mobilerun.core.devices.base import Device
 class MemoryDevice(Device):
     def __init__(
         self,
-        *,
         identifier: str = "memory",
         cloud_id: str | None = None,
         platform: str = "android",
         supported_operations: frozenset[str] = frozenset(),
+        **device_options,
     ) -> None:
-        super().__init__()
+        super().__init__(**device_options)
         self._identifier = identifier
         self._cloud_id = cloud_id
         self._platform = platform
@@ -46,3 +46,78 @@ class MemoryDevice(Device):
     ) -> bool:
         self.inputs.append(text)
         return True
+
+
+def fake_tools(*names):
+    """Real compiled Action metadata, without binding or contacting a device."""
+    from dataclasses import replace
+
+    from mobilerun.core.extensions import Action
+    from mobilerun.core.extensions.actions import Declaration
+
+    from mobilerun_agents.agent.tools.base import ActionMetadata, RegistryTool
+
+    async def noop() -> None:
+        return None
+
+    async def complete(output: dict[str, object] | None = None) -> None:
+        return None
+
+    async def indexed(index: int) -> None:
+        return None
+
+    async def coordinates(x: int, y: int) -> None:
+        return None
+
+    entries = []
+    for name in names:
+        device = name in {"tap", "tap_element"}
+        fn = {"complete": complete, "tap_element": indexed, "tap": coordinates}.get(name, noop)
+        action = replace(
+            Action.compile("device" if device else "run", name, fn, Declaration()), name=name
+        )
+        entries.append(
+            RegistryTool(
+                ActionMetadata(
+                    name=name,
+                    description=action.description,
+                    fn_schema=action._arguments,
+                    ui_indexed=name == "tap_element",
+                ),
+                fn,
+                action,
+            )
+        )
+    return tuple(entries)
+
+
+def tool_run(driver=None, ui=None, state_provider=None, config=None, macro_recorder=None):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, NonCallableMock
+
+    from mobilerun.core.state.base import StateProvider
+
+    from mobilerun_agents import Run
+    from mobilerun_agents.config.user_config import ToolsConfig
+
+    provider = state_provider or NonCallableMock(spec=StateProvider)
+    device = driver or MemoryDevice()
+    if isinstance(device, MemoryDevice) or hasattr(device, "_set_state_provider"):
+        device._set_state_provider(provider)
+    else:
+        device.state = SimpleNamespace(
+            _resolved_provider=provider, refresh=getattr(provider, "get_state", AsyncMock())
+        )
+    from llama_index.core.memory import Memory
+
+    from mobilerun_agents.config.user_config import AgentConfig
+
+    run = Run(
+        device=device,
+        tool_config=config or ToolsConfig(),
+        macro_recorder=macro_recorder,
+        config=AgentConfig(),
+        memory=NonCallableMock(spec=Memory),
+    )
+    run.ui = ui
+    return run

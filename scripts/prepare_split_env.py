@@ -24,20 +24,6 @@ def capture(*args, cwd=ROOT):
     return subprocess.check_output([str(x) for x in args], cwd=cwd, text=True).strip()
 
 
-def strip_agents(env, purelib):
-    env = Path(env).resolve()
-    purelib = Path(purelib).resolve()
-    if not purelib.is_relative_to(env):
-        raise ValueError("site-packages is outside selected environment")
-    target = purelib / "mobilerun" / "agents"
-    if not target.resolve().is_relative_to(purelib):
-        raise ValueError("agents directory escapes site-packages")
-    if target.is_symlink():
-        raise ValueError("refusing symlinked agents directory")
-    if target.exists():
-        shutil.rmtree(target)
-
-
 def validate_wheel(wheel):
     with zipfile.ZipFile(wheel) as archive:
         names = archive.namelist()
@@ -47,13 +33,13 @@ def validate_wheel(wheel):
             ".." in name.split("/")
             or name.startswith("/")
             or not (
-                name.startswith("mobilerun/agents/")
+                name.startswith("mobilerun_agents/")
                 or re.fullmatch(r"mobilerun_agents-[^/]+\.dist-info", first)
                 and "/" in name
             )
         ):
             raise ValueError(f"wheel contains unexpected path: {name}")
-    if not any(name.startswith("mobilerun/agents/") for name in names):
+    if not any(name.startswith("mobilerun_agents/") for name in names):
         raise ValueError("wheel is missing agents files")
     return names
 
@@ -93,6 +79,20 @@ def stage_base_source(source_dir, staged):
             shutil.copytree(src, staged / name, ignore=staging_ignore, symlinks=False)
         else:
             shutil.copy2(src, staged / name)
+
+
+def stage_skills_index(checkout, staged):
+    """Give the base build hook a local tracked-file index, never a link to the source Git repo."""
+    if not (checkout / ".git").exists():
+        raise ValueError("skills Git metadata missing: supply the matching --skills-checkout")
+    entries = subprocess.check_output(["git", "ls-files", "--stage", "-z"], cwd=checkout)
+    run("git", "init", "-q", staged)
+    subprocess.run(
+        ["git", "update-index", "--info-only", "-z", "--index-info"],
+        input=entries,
+        cwd=staged,
+        check=True,
+    )
 
 
 def wheel_dependencies(wheel, extras):
@@ -159,6 +159,11 @@ def main():
     source.add_argument("--base-source", type=Path)
     source.add_argument("--base-wheel", type=Path)
     source.add_argument("--base-version")
+    parser.add_argument(
+        "--skills-checkout",
+        type=Path,
+        help="Skills Git checkout for a Git-free base source snapshot (index only)",
+    )
     parser.add_argument("--env", required=True, type=Path)
     parser.add_argument("--extras", default="")
     parser.add_argument("--without-extras", action="store_true")
@@ -179,7 +184,7 @@ def main():
         if staged.exists():
             shutil.rmtree(staged)
         stage_base_source(source_dir, staged)
-        shutil.rmtree(staged / "mobilerun" / "agents", ignore_errors=True)
+        stage_skills_index(args.skills_checkout or source_dir / "skills", staged / "skills")
         out = BUILD / "base-wheel"
         out.mkdir(exist_ok=True)
         run("uv", "build", "--wheel", "--out-dir", out, staged)
@@ -230,16 +235,9 @@ def main():
     purelib = Path(
         capture(python, "-c", "import sysconfig; print(sysconfig.get_path('purelib'))", cwd=empty)
     )
-    strip_agents(env, purelib)
-    run(
-        python,
-        "-c",
-        "import importlib.util; assert importlib.util.find_spec('mobilerun.agents') is None",
-        cwd=empty,
-    )
     extras = [e for e in args.extras.split(",") if e]
     if args.without_extras:
-        extras = [e for e in extras if e not in ("anthropic", "langfuse")]
+        extras = [e for e in extras if e != "langfuse"]
     dependency_code = (
         "import importlib.util,json,sys; "
         "s=importlib.util.spec_from_file_location('harness',sys.argv[1]); "
@@ -259,11 +257,10 @@ def main():
         )
         == version
     )
-    assert not (purelib / "mobilerun" / "agents" / "sentinel").exists()
     location = capture(
         python,
         "-c",
-        "import importlib.util; s=importlib.util.find_spec('mobilerun.agents'); print(s.origin if s else 'missing')",
+        "import mobilerun_agents; print(mobilerun_agents.__file__)",
         cwd=empty,
     )
     report = {

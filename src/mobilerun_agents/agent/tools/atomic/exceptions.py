@@ -1,0 +1,75 @@
+"""Expand atomic choices for indexed taps, swipes and app launches."""
+
+from collections.abc import Awaitable, Callable
+
+from mobilerun_agents.config.prompts import render_selector_prompt
+
+from ..helpers import device_dimensions, element_targets
+from .schema import AtomicTool, Turn
+
+
+def _dimensions(turn: Turn) -> tuple[int, int] | None:
+    ui = turn.run.ui
+    if ui is None or not ui.screen_width or not ui.screen_height:
+        return None
+    provider = turn.run.state_provider
+    if provider.requires_active_contract_for_coords and not ui.coordinate_contract_active:
+        return None
+    width, height = device_dimensions(ui, provider.requires_coordinate_tools)
+    return (width, height) if min(width, height) >= 4 else None
+
+
+async def _elements(turn: Turn) -> list[AtomicTool]:
+    if turn.vision == "only" or turn.run.ui is None:
+        return []
+    return [
+        AtomicTool("tap_element", {"index": index}, label)
+        for index, label in element_targets(turn.run.ui, turn.config)
+    ]
+
+
+async def _apps(turn: Turn) -> list[AtomicTool]:
+    goal = turn.run.state.goal.casefold()
+    return [
+        AtomicTool(
+            "start_app",
+            {"package": app.identifier},
+            render_selector_prompt(
+                turn.config.candidate_prompt, kind="app", label=app.label, identifier=app.identifier
+            ),
+        )
+        for app in sorted(
+            await turn.run.installed_apps(),
+            key=lambda a: not (len(a.label) > 1 and a.label.casefold() in goal),
+        )
+    ]
+
+
+async def _scrolls(turn: Turn) -> list[AtomicTool]:
+    if (space := _dimensions(turn)) is None:
+        return []
+    width, height = space
+    config = turn.run.tool_config
+    return [
+        AtomicTool(
+            "swipe",
+            {
+                "x1": round((width - 1) * start[0]),
+                "y1": round((height - 1) * start[1]),
+                "x2": round((width - 1) * end[0]),
+                "y2": round((height - 1) * end[1]),
+                "duration_ms": config.swipe_duration * 1000,
+            },
+            render_selector_prompt(
+                turn.config.candidate_prompt, kind="scroll", direction=direction
+            ),
+        )
+        for direction, (start, end) in config.swipe_paths.items()
+    ]
+
+
+ATOMIC_EXCEPTIONS: dict[str, Callable[[Turn], Awaitable[list[AtomicTool]]]] = {
+    "tap_element": _elements,
+    "start_app": _apps,
+    "swipe": _scrolls,
+}

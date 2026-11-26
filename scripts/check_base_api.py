@@ -19,11 +19,7 @@ def required_modules(root):
                 names = [alias.name for alias in node.names]
             else:
                 continue
-            modules.update(
-                name
-                for name in names
-                if name.startswith("mobilerun.") and not name.startswith("mobilerun.agents")
-            )
+            modules.update(name for name in names if name.startswith("mobilerun."))
     return modules
 
 
@@ -53,5 +49,5 @@ if __name__ == "__main__":
     except importlib.metadata.PackageNotFoundError:
         version = "not installed"
     sys.exit(
-        check_modules(required_modules(ROOT / "src/mobilerun/agents"), module_available, version)
+        check_modules(required_modules(ROOT / "src/mobilerun_agents"), module_available, version)
     )

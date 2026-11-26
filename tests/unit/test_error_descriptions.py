@@ -1,4 +1,3 @@
-import asyncio
 import logging
 
 import httpx
@@ -6,8 +5,7 @@ import openai
 import pytest
 import requests
 
-from mobilerun.agents.llm.inference import acall_with_retries
-from mobilerun.agents.logs.error_descriptions import describe_error
+from mobilerun_agents.errors.descriptions import describe_error
 
 CLOUDFLARE_PAGE = (
     "<html>\n  <head>\n    <title>Just a moment...</title>\n"
@@ -73,32 +71,6 @@ def test_empty_messages_fall_back_to_the_error_type() -> None:
     assert describe_error(httpx.ConnectTimeout("")) == "ConnectTimeout"
 
 
-@pytest.fixture
-def mobilerun_caplog(caplog):
-    """caplog wired to the non-propagating "mobilerun" logger."""
-    logger = logging.getLogger("mobilerun")
-    previous = logger.propagate
-    logger.propagate = True
-    caplog.set_level(logging.WARNING, logger="mobilerun")
-    yield caplog
-    logger.propagate = previous
-
-
-def test_retry_warning_does_not_print_the_html_page(mobilerun_caplog) -> None:
-    class FailingLLM:
-        async def achat(self, messages):
-            raise _openai_error(CLOUDFLARE_PAGE)
-
-    with pytest.raises(openai.PermissionDeniedError):
-        asyncio.run(acall_with_retries(FailingLLM(), [], retries=1, delay=0))
-
-    [record] = [r for r in mobilerun_caplog.records if "Attempt 1 failed" in r.getMessage()]
-    assert record.getMessage() == (
-        "Attempt 1 failed with error: PermissionDeniedError: "
-        f"HTTP 403 HTML error page 'Just a moment...' from {CODEX_URL}"
-    )
-
-
 @pytest.mark.parametrize(
     "message",
     [
@@ -148,7 +120,7 @@ def test_title_search_stays_fast_on_malformed_pages() -> None:
 
 
 def test_retry_log_filter_summarizes_html_pages() -> None:
-    from mobilerun.agents.logs.error_descriptions import HtmlErrorPageFilter
+    from mobilerun_agents.errors.descriptions import HtmlErrorPageFilter
 
     record = logging.LogRecord(
         "llama_index.llms.openai.utils",
@@ -164,37 +136,6 @@ def test_retry_log_filter_summarizes_html_pages() -> None:
     assert record.getMessage() == (
         "Retrying OpenAI._achat in 0.5 seconds as it raised InternalServerError: "
         "HTML error page 'Just a moment...'"
-    )
-
-
-@pytest.mark.parametrize(
-    "logger_name",
-    ["llama_index.llms.openai.utils", "llama_index.llms.google_genai.utils"],
-)
-def test_retry_log_filter_is_installed_for_llama_index(logger_name: str) -> None:
-    import mobilerun  # noqa: F401
-    from mobilerun.agents.logs.error_descriptions import HtmlErrorPageFilter
-
-    logger = logging.getLogger(logger_name)
-
-    assert any(isinstance(f, HtmlErrorPageFilter) for f in logger.filters)
-
-
-def test_tool_failure_summary_does_not_carry_the_html_page() -> None:
-    from mobilerun.agents.tools.tool_registry import ToolRegistry
-
-    async def open_app(**kwargs):
-        raise _openai_error(CLOUDFLARE_PAGE)
-
-    registry = ToolRegistry()
-    registry.register("open_app", open_app, params={}, description="Open an app")
-
-    result = asyncio.run(registry.execute("open_app", {}, ctx=None))
-
-    assert result.success is False
-    assert result.summary == (
-        "Failed to execute open_app: HTTP 403 HTML error page 'Just a moment...' "
-        f"from {CODEX_URL}"
     )
 
 

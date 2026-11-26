@@ -9,13 +9,12 @@ from typing import get_args
 
 import pytest
 from mobilerun.config.env import Secrets
-from mobilerun.config.settings import Settings, get_settings
+from mobilerun.config.settings import Settings
 from pydantic import SecretStr
 
-from mobilerun.agents.config.env import AgentSecrets, OAuthCredentialPaths
-from mobilerun.agents.config.settings import AgentSettings
+from mobilerun_agents.config.settings import AgentSecrets, AgentSettings
 
-MODELS = (Settings, AgentSettings, Secrets, AgentSecrets, OAuthCredentialPaths)
+MODELS = (AgentSettings, AgentSecrets)
 
 
 @pytest.mark.parametrize(
@@ -46,19 +45,11 @@ def test_exact_documented_environment_field(monkeypatch, model, name):
         raw, expected = "4321", 4321
     elif isinstance(default, float):
         raw, expected = "12.5", 12.5
-    elif name == "MOBILERUN_AGENTS":
-        from mobilerun.config.settings import AgentPaths
-
-        raw = '{"test": {"skills": ["global", "project"], "mcp": null}}'
-        expected = {"test": AgentPaths(skills=("global", "project"), mcp=None)}
-    elif isinstance(default, dict):
-        raw = '{"test": ["global", "project"]}'
-        expected = {"test": ("global", "project")}
     elif isinstance(default, (list, tuple)):
         raw = json.dumps([0.1, 0.2])
         expected = type(default)([0.1, 0.2])
     else:
-        raw = "debug" if name == "MOBILERUN_LOG_LEVEL" else "dummy-value"
+        raw = "dummy-value"
         expected = raw
     monkeypatch.setenv(name, raw)
     assert getattr(model(), name) == expected
@@ -92,28 +83,3 @@ def test_fields_are_single_line_with_attribute_docstrings(model):
                 "default_factory",
             }
             assert node.value.keywords
-
-
-def test_get_settings_reads_environment_on_every_call(monkeypatch):
-    monkeypatch.setenv("MOBILERUN_CLOUD_API_TIMEOUT", "10")
-    first = get_settings()
-    monkeypatch.setenv("MOBILERUN_CLOUD_API_TIMEOUT", "20")
-    assert first.MOBILERUN_CLOUD_API_TIMEOUT == 10
-    assert get_settings().MOBILERUN_CLOUD_API_TIMEOUT == 20
-
-
-def test_local_credentials_path_defaults_to_user_config_dir(monkeypatch, tmp_path):
-    monkeypatch.delenv("MOBILERUN_CREDENTIALS_FILE", raising=False)
-    monkeypatch.setenv("MOBILERUN_USER_CONFIG_DIR", str(tmp_path))
-    assert get_settings().local_credentials_path == tmp_path / "credentials.yaml"
-
-
-def test_local_credentials_path_expands_home_override(monkeypatch):
-    monkeypatch.setenv("MOBILERUN_CREDENTIALS_FILE", "~/custom-credentials.yaml")
-    assert get_settings().local_credentials_path == Path.home() / "custom-credentials.yaml"
-
-
-def test_local_credentials_path_expands_default_directory(monkeypatch):
-    monkeypatch.delenv("MOBILERUN_CREDENTIALS_FILE", raising=False)
-    monkeypatch.setenv("MOBILERUN_USER_CONFIG_DIR", "~/custom-config")
-    assert get_settings().local_credentials_path == Path.home() / "custom-config/credentials.yaml"

@@ -6,34 +6,15 @@ def test_user_paths_are_isolated(tmp_path):
     from mobilerun.config.loader import ConfigLoader
     from mobilerun.config.settings import get_settings
 
-    from mobilerun.agents.config.settings import get_agent_settings
-
     settings = get_settings()
-    agent = get_agent_settings()
     assert settings.MOBILERUN_CONFIG is not None
     for path in (
         settings.MOBILERUN_USER_CONFIG_DIR,
         Path(settings.MOBILERUN_CONFIG),
         ConfigLoader.get_user_config_path(),
         credential_path(),
-        agent.auth_profiles_path,
-        agent.openai_oauth_credential_path,
-        agent.anthropic_oauth_credential_path,
-        agent.gemini_oauth_credential_path,
-        agent.grok_oauth_credential_path,
     ):
         assert path.is_relative_to(tmp_path)
-
-
-def test_default_credential_store_and_lock_are_isolated(tmp_path):
-    from mobilerun.agents.clients.oauth.grok import GrokOAuthCredentialStore
-
-    store = GrokOAuthCredentialStore().profile_store
-    assert store.path.is_relative_to(tmp_path)
-    assert store.lock_path.is_relative_to(tmp_path)
-    store.update_slot("test", {"access": "fake"})
-    assert store.path.is_file()
-    assert store.lock_path.is_file()
 
 
 def test_real_env_snapshot_repr_and_failure_hide_values(request):

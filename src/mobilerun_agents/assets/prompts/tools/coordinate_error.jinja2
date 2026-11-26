@@ -1,0 +1,15 @@
+{% if kind == 'normalized_screenshot' -%}
+Coordinates must be normalized values from 0 to 1000 on both axes in screenshot-only mode. Observe the screenshot and retry with normalized coordinates.
+{%- elif kind == 'sized_screenshot' -%}
+Coordinates must be inside the screenshot size {{ width }}x{{ height }} in screenshot-only mode. Observe the screenshot and retry with pixel coordinates inside the image.
+{%- elif kind == 'screenshot' -%}
+Coordinates must be inside the screenshot bounds in screenshot-only mode. Observe the screenshot and retry with pixel coordinates inside the image.
+{%- elif kind == 'model_numbers' -%}
+Coordinates must be numbers inside the {{ width }}x{{ height }} coordinate space of the provided device state.
+{%- elif kind == 'model_bounds' -%}
+Coordinates ({{ x }}, {{ y }}) are outside the {{ width }}x{{ height }} coordinate space of the provided device state. Use the element bounds and screenshot shown to you and retry with coordinates inside that space.
+{%- elif kind == 'inactive' -%}
+Coordinate actions are unavailable for this step — the screen state could not be captured fully. Use an element index with `click`, or retry to get a fresh screen state.
+{%- elif kind == 'normalized' -%}
+Coordinates ({{ x }}, {{ y }}) are outside the normalized 0-1000 range of the device state. Use the element bounds shown to you and retry.
+{%- endif %}

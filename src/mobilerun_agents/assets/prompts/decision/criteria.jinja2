@@ -1,0 +1,7 @@
+{% if kind == 'abstain' %}
+None of the available actions safely advances the goal.
+{% elif kind == 'complete_success' %}
+The goal is already achieved, as verified by the current state.
+{% else %}
+The goal cannot be achieved with the available capabilities.
+{% endif %}

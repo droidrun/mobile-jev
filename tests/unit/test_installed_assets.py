@@ -13,11 +13,12 @@ EMPTY = ROOT / ".build" / "empty-cwd"
 
 
 def test_installed_assets_resolve_and_render_outside_checkout():
-    manifest = json.loads((ROOT / "scripts/source_manifest.json").read_text())
+    import hashlib
+
+    source = ROOT / "src/mobilerun_agents"
     assets = {
-        name: item["sha256"]
-        for name, item in manifest.items()
-        if name.startswith(("assets/prompts/", "assets/app_cards/"))
+        path.relative_to(source).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (source / "assets").rglob("*.jinja2")
     }
     assert assets
     report_path = ROOT / ".build" / "split-report.json"
@@ -32,32 +33,23 @@ def test_installed_assets_resolve_and_render_outside_checkout():
 import hashlib, json, sys, sysconfig
 from pathlib import Path
 from importlib.resources import files
-from mobilerun.agents.utils.paths import PathResolver
-from mobilerun.config.prompts import PromptLoader
-import mobilerun.agents
+from mobilerun_agents.config.paths import resolve_prompt_path
+import mobilerun_agents
 purelib = Path(sysconfig.get_paths()['purelib']).resolve()
-package = Path(mobilerun.agents.__file__).resolve()
+package = Path(mobilerun_agents.__file__).resolve()
 assert package.is_relative_to(purelib), (package, purelib)
 checkouts = [Path(path).resolve() for path in json.loads(sys.argv[2])]
 assert all(not package.is_relative_to(checkout) for checkout in checkouts)
 assets = json.loads(sys.argv[1])
 for name, digest in assets.items():
-    resolved = PathResolver.resolve(name, must_exist=True).resolve()
-    resource = files('mobilerun.agents').joinpath(name)
+    resolved = resolve_prompt_path(name).resolve()
+    resource = files('mobilerun_agents').joinpath(name)
     assert resolved == Path(str(resource)).resolve(), (name, resolved, resource)
     assert resolved.is_relative_to(purelib)
     assert all(not resolved.is_relative_to(checkout) for checkout in checkouts)
     assert hashlib.sha256(resolved.read_bytes()).hexdigest() == digest, name
-for name in ('fast_agent/system.jinja2', 'manager/system.jinja2', 'executor/system.jinja2', 'agent_macro/extract.jinja2'):
-    path = PathResolver.resolve('assets/prompts/' + name, must_exist=True)
-    rendered = PromptLoader.render_template(path.read_text(), {
-       'instruction': 'TASK_SENTINEL', 'goal': 'TASK_SENTINEL', 'platform': 'android', 'available_tools': [],
-       'tool_descriptions': '', 'available_secrets': [], 'variables': {},
-       'parallel_tools': False, 'vision': True, 'screenshot_only': False,
-       'output_schema': None, 'atomic_actions': {}, 'actions': [], 'macro': [], 'steps': [],
-    })
-    assert rendered.strip(), name
-    assert ('android' if name.startswith('fast_agent/') else 'TASK_SENTINEL') in rendered, name
+from mobilerun_agents.config.prompts import render_selector_prompt
+assert "example.settings" in render_selector_prompt("assets/prompts/tools/choose_app.jinja2", apps_list="example.settings", app_description="open settings")
 """
     result = subprocess.run(
         [
@@ -77,9 +69,10 @@ for name in ('fast_agent/system.jinja2', 'manager/system.jinja2', 'executor/syst
 @pytest.mark.parametrize(
     ("args", "expected"),
     [
-        (["agent", "--help"], ("run", "llm", "replay", "task")),
-        (["agent", "llm", "--help"], ("configure", "login")),
-        (["run", "--help"], ("--device",)),
+        (["agent", "--help"], ("run", "setup", "logout", "task")),
+        (["agent", "setup", "--help"], ("--provider", "--model", "--api-key-stdin", "--vision")),
+        (["agent", "run", "--help"], ("--steps",)),
+        (["macro-agent", "--help"], ("replay",)),
     ],
 )
 def test_installed_cli_help_from_empty_cwd(args, expected, tmp_path):

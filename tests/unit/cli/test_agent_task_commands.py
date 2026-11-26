@@ -12,12 +12,12 @@ from mobilerun_sdk.types import (
     TaskStopResponse,
 )
 
-from mobilerun.agents.cli.agent.group import agent
+from mobilerun_agents.cli.agent.group import agent
 
 
 @pytest.fixture
 def cloud(monkeypatch):
-    from mobilerun.agents.cli.agent import task as module
+    from mobilerun_agents.cli.agent import task as module
 
     @asynccontextmanager
     async def client(*args, **kwargs):
@@ -29,15 +29,14 @@ def cloud(monkeypatch):
 
 
 def test_status_json_and_billing(cloud, monkeypatch):
-    async def status(client, task_id, *, billing):
+    async def status(client, task_id, billing):
         assert task_id == "abc" and billing == Billing.NO_COMMERCE
         return TaskGetStatusResponse(
             status="completed",
+            terminal=True,
             steps=3,
             message="Done",
             output={"ok": True},
-            goal="Open app",
-            device_id="phone",
         )
 
     monkeypatch.setattr(tasks, "status", status)
@@ -45,16 +44,16 @@ def test_status_json_and_billing(cloud, monkeypatch):
     assert result.exit_code == 0, result.output
     data = json.loads(result.output)
     assert data["status"] == "completed" and data["steps"] == 3 and data["output"] == {"ok": True}
-    assert data["goal"] == "Open app" and data["device_id"] == "phone"
+    assert data["terminal"] is True
 
 
 def test_stop_requires_yes_and_handles_finished(cloud, monkeypatch):
     calls = []
 
-    async def status(client, task_id, *, billing):
-        return TaskGetStatusResponse(status="completed")
+    async def status(client, task_id, billing):
+        return TaskGetStatusResponse(status="completed", terminal=True)
 
-    async def stop(client, task_id, *, billing):
+    async def stop(client, task_id, billing):
         calls.append(task_id)
         return TaskStopResponse(cancelled=True)
 
@@ -69,10 +68,10 @@ def test_stop_requires_yes_and_handles_finished(cloud, monkeypatch):
 
 
 def test_stop_running(cloud, monkeypatch):
-    async def status(client, task_id, *, billing):
-        return TaskGetStatusResponse(status="running")
+    async def status(client, task_id, billing):
+        return TaskGetStatusResponse(status="running", terminal=False)
 
-    async def stop(client, task_id, *, billing):
+    async def stop(client, task_id, billing):
         assert task_id == "abc" and billing == Billing.NO_COMMERCE
         return TaskStopResponse(cancelled=True)
 
@@ -83,7 +82,7 @@ def test_stop_running(cloud, monkeypatch):
 
 
 def test_trajectory_json_and_download(cloud, monkeypatch, tmp_path):
-    async def trajectory(client, task_id, *, billing):
+    async def trajectory(client, task_id, billing):
         assert billing == Billing.NO_COMMERCE
         return TaskGetTrajectoryResponse.model_validate(
             {
@@ -124,9 +123,9 @@ def test_task_id_prompt(cloud, monkeypatch):
     monkeypatch.setattr(menu, "is_interactive", lambda: True)
     monkeypatch.setattr(menu, "text_prompt", lambda label: "prompted-id")
 
-    async def status(client, task_id, *, billing):
+    async def status(client, task_id, billing):
         assert task_id == "prompted-id"
-        return TaskGetStatusResponse(status="running", steps=2)
+        return TaskGetStatusResponse(status="running", terminal=False, steps=2)
 
     monkeypatch.setattr(tasks, "status", status)
     result = CliRunner().invoke(agent, ["task", "status"])
@@ -136,7 +135,7 @@ def test_task_id_prompt(cloud, monkeypatch):
 def test_not_logged_in(monkeypatch):
     from mobilerun.errors.cloud import CloudAuthRequired
 
-    from mobilerun.agents.cli.agent import task as module
+    from mobilerun_agents.cli.agent import task as module
 
     def missing(*args, **kwargs):
         raise CloudAuthRequired(code="credentials_required")
@@ -144,12 +143,13 @@ def test_not_logged_in(monkeypatch):
     monkeypatch.setattr(module, "cloud_client", missing)
     result = CliRunner().invoke(agent, ["task", "status", "abc"])
     assert result.exit_code != 0 and "Not logged in" in result.output
+    assert "mobilerun account login" in result.output
 
 
 def test_not_found(cloud, monkeypatch):
     from mobilerun.errors.cloud import CloudResourceNotFound
 
-    async def missing(client, task_id, *, billing):
+    async def missing(client, task_id, billing):
         raise CloudResourceNotFound(operation="Poll cloud task", status=404)
 
     monkeypatch.setattr(tasks, "status", missing)
@@ -158,7 +158,7 @@ def test_not_found(cloud, monkeypatch):
 
 
 def test_trajectory_without_out_does_not_download(cloud, monkeypatch):
-    async def trajectory(client, task_id, *, billing):
+    async def trajectory(client, task_id, billing):
         return TaskGetTrajectoryResponse.model_validate({"trajectory": []})
 
     monkeypatch.setattr(tasks, "trajectory", trajectory)
