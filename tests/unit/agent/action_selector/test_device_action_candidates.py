@@ -1,8 +1,5 @@
 from mobilerun.core.state.ui_state import UIState
 
-from mobilerun_agents.agent.action_selector.decision_model.candidates.formatter import (
-    DecisionFormatter,
-)
 from mobilerun_agents.agent.tools.helpers import element_targets
 
 
@@ -35,38 +32,6 @@ def test_candidate_borrows_row_label():
         ]
     )
     assert [index for index, label in element_targets(ui) if "Battery" in label] == [1]
-
-
-def test_decision_formatter_retains_metadata_through_public_format():
-    formatter = DecisionFormatter()
-    _, _, elements, _ = formatter.format(
-        {
-            "className": "android.widget.EditText",
-            "text": "",
-            "hint": "Email",
-            "isPassword": True,
-            "isEnabled": False,
-            "isVisibleToUser": False,
-            "boundsInScreen": {"left": 0, "top": 0, "right": 100, "bottom": 50},
-            "children": [],
-        },
-        {},
-    )
-    assert elements[0]["details"] == {"hint": "Email", "password": True}
-    assert elements[0]["descendants"] == 0
-    assert elements[0]["isEnabled"] is False
-
-
-def test_decision_formatter_does_not_repeat_masked_secret_details():
-    _, _, elements, _ = DecisionFormatter().format(
-        {
-            "text": "[secret:password]",
-            "hint": "raw secret",
-            "contentDescription": "raw secret",
-        },
-        {},
-    )
-    assert not elements[0].get("details")
 
 
 def test_named_ios_row_and_its_toggle_are_both_offered():

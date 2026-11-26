@@ -1,40 +1,43 @@
-"""Reusable chat selection pipeline with one required transport hook."""
+"""Build the chat request and validate the reply before exposing native calls."""
 
 import asyncio
 import json
 from abc import abstractmethod
-from collections.abc import Mapping
-from time import monotonic
 from typing import Any
+from uuid import uuid4
 
 from llama_index.core.base.llms.types import ChatMessage, ChatResponse, ImageBlock
-from llama_index.core.tools import BaseTool
+from llama_index.core.memory import Memory
+from llama_index.core.tools import ToolSelection
+from mobilerun.core.devices import Device
+from workflows import Context
 
 from mobilerun_agents.agent.action_selector.base import (
-    ActionSelection,
     ActionSelector,
     NativeToolAPI,
-    Vision,
+    Selection,
+    previous_action_feedback,
+    screenshot_bytes,
 )
-from mobilerun_agents.agent.action_selector.llm.parsing import (
+from mobilerun_agents.agent.logs.memory import report_memory
+from mobilerun_agents.agent.memory.messages import text_messages
+from mobilerun_agents.agent.tools.helpers import visual_tool_names
+from mobilerun_agents.agent.tools.registry import ToolRegistry
+from mobilerun_agents.agent.workflows.core.state import AgentState
+from mobilerun_agents.config.loader import ConfigLoader
+from mobilerun_agents.config.prompts import render_prompt
+from mobilerun_agents.config.user_config import AgentConfig, Vision
+
+from .calls import InvalidResponse
+from .image import prepare_image
+from .models import Capabilities
+from .parsing import (
     ToolCallParseResult,
     ToolCallParseStatus,
     coerce_arguments,
-    extract_add_memory,
     parse_native_tool_calls,
     parse_tool_calls_detailed,
 )
-from mobilerun_agents.agent.logs.diagnostics import ModelCall, sink
-from mobilerun_agents.agent.memory.messages import text_messages
-from mobilerun_agents.agent.run import Run
-from mobilerun_agents.agent.tools.base import RegistryTool
-from mobilerun_agents.agent.tools.helpers import visual_tool_names
-from mobilerun_agents.config.prompts import render_prompt
-from mobilerun_agents.config.user_config import DecisionConfig
-
-from .calls import InvalidResponse, Usage, usage_from_response
-from .image import ModelImage, prepare_image
-from .models import Capabilities
 
 
 class LLMSelector(ActionSelector):
@@ -46,158 +49,150 @@ class LLMSelector(ActionSelector):
     def native_tool_api(self) -> NativeToolAPI:
         return "responses"
 
-    abstention_reason = "LLM response is None. This is a critical error."
-
-    def __init__(self, vision: Vision = "on", config: DecisionConfig | None = None) -> None:
+    def __init__(self, vision: Vision = "on", config: AgentConfig | None = None) -> None:
         self.vision = vision
         self._image_limits = Capabilities()
-        self.config = config or DecisionConfig()
+        self._config = config
 
-    async def select(self, run: Run) -> ActionSelection:
-        has_run_tools = bool(run.registry.by_name or run.selection_include)
-        candidates = run.registry.tools(include=run.selection_include)
-        coordinates, indexed = visual_tool_names(candidates)
-        exclude = set(run.selection_exclude)
+    @property
+    def config(self) -> AgentConfig:
+        return self._config if self._config is not None else ConfigLoader.load().agent
+
+    @config.setter
+    def config(self, config: AgentConfig) -> None:
+        self._config = config
+
+    async def select(
+        self, ctx: Context[AgentState], device: Device, memory: Memory, registry: ToolRegistry
+    ) -> Selection:
+        state = await ctx.store.get_state()
+        snapshot = state.current
+        if snapshot is None:
+            raise ValueError("Selection requires a current observation")
+        ui = snapshot.ui
+        coordinates, indexed = visual_tool_names(registry.tools())
+        exclude: set[str] = set()
         if self.vision == "off":
             exclude |= coordinates
-        if self.vision == "only" or not run.ui or not run.ui.elements:
+        if self.vision == "only" or not ui.elements:
             exclude |= indexed
-        tools = run.registry.tools(exclude=exclude, include=run.selection_include)
+        tools = registry.tools(exclude)
         by_name = {member.metadata.get_name(): member for member in tools}
-        data = None if self.vision == "off" else await run.screenshot()
-        image = await asyncio.to_thread(prepare_image, run, self._image_limits, data)
-        messages = await self._build_messages(run, image, by_name)
-        kwargs: dict[str, Any] = {"stream": run.config.streaming, "timeout": self.config.timeout}
-        for tool in tools:
-            match tool:
-                case RegistryTool(action=action) if action and action.sensitive_parameters:
-                    kwargs["log_response"] = False
-                    break
-        if self.supports_native_tool_calls:
-            kwargs.update(
-                tools=tools,
-                allow_parallel_tool_calls=run.config.parallel_tools,
-                tool_required=self.native_tool_api == "responses",
-            )
-        diagnostic = sink.get()
-        usage = Usage()
-        started = monotonic()
-        try:
-            response = await self._achat(messages, **kwargs)
-            if diagnostic and response is not None:
-                usage = usage_from_response(response)
-        except InvalidResponse as exc:
-            usage = exc.usage or usage
-            raise
-        finally:
-            if diagnostic:
-                diagnostic(
-                    ModelCall(
-                        name=self.diagnostic_name,
-                        image=(image.width, image.height) if image.data else None,
-                        seconds=monotonic() - started,
-                        inputs=usage.request_tokens,
-                        outputs=usage.response_tokens,
-                        reasoning=usage.reasoning_tokens,
-                        total=usage.total_tokens,
-                    )
-                )
-        if response is None:
-            return ActionSelection(abstained=True)
-        parsed = self._parse(response)
-        if parsed.parse_result and parsed.parse_result.status == ToolCallParseStatus.MALFORMED:
-            parsed.parse_error = render_prompt(self.config.invalid_arguments_prompt)
-        if has_run_tools and not parsed.parse_error:
-            for call in parsed.actions:
-                member = by_name.get(call.name)
-                try:
-                    if member is None or member.metadata.fn_schema is None or call.error:
-                        raise ValueError
-                    call.parameters = coerce_arguments(
-                        member.metadata.get_parameters_dict(),
-                        call.parameters,
-                        textual=not self.supports_native_tool_calls,
-                    )
-                    if call.parameters.keys() - member.metadata.fn_schema.model_fields.keys():
-                        raise ValueError
-                    member.metadata.fn_schema.model_validate_json(
-                        json.dumps(call.parameters), strict=True
-                    )
-                    image.to_device(call, member.metadata.fn_schema.model_fields.keys())
-                except (KeyError, ValueError, TypeError):
-                    parsed.parse_error = render_prompt(
-                        self.config.invalid_arguments_prompt
-                    )
-                    break
-        # One repair owner: the workflow's Invalid -> Select edge.
-        return self._to_selection(response, parsed)
-
-    async def _build_messages(
-        self, run: Run, image: ModelImage, names: Mapping[str, BaseTool]
-    ) -> list[ChatMessage]:
+        data = None if self.vision == "off" else await screenshot_bytes(ctx, snapshot, device)
+        coordinate_provider = device.state._resolved_provider.requires_coordinate_tools
+        screenshot_only = self.vision == "only" or coordinate_provider
+        image = await asyncio.to_thread(
+            prepare_image, ui, coordinate_provider, self._image_limits, data
+        )
+        config = self.config
+        decision = config.decision
         system = render_prompt(
-            run.config.system_prompt,
-            platform=run.device.platform,
+            config.system_prompt,
+            platform=device.platform,
             native_tools=self.supports_native_tool_calls,
-            parallel_tools=run.config.parallel_tools,
-            screenshot_only=self.vision == "only" or run.state_provider.requires_coordinate_tools,
+            parallel_tools=config.parallel_tools,
+            screenshot_only=screenshot_only,
             vision=image.data is not None,
             tool_descriptions="\n".join(
                 f"{n}: {a.metadata.description} {a.metadata.fn_schema_str}"
-                for n, a in names.items()
+                for n, a in by_name.items()
             ),
-            available_tools=set(names),
-            output_schema=None,
+            available_tools=set(by_name),
         )
-        screen = "" if self.vision == "only" else run.ui.formatted_text
+        screen = "" if self.vision == "only" else ui.formatted_text
         if image.data:
             screen = render_prompt(
                 "assets/prompts/llm/model_screen.jinja2",
                 state=screen,
-                screenshot_only=self.vision == "only"
-                or run.state_provider.requires_coordinate_tools,
+                screenshot_only=screenshot_only,
                 width=image.width,
                 height=image.height,
                 normalized=image.normalized,
             )
-        text = render_prompt(
-            self.config.llm_request_prompt,
-            state=screen,
-        )
-        user = ChatMessage(role="user", content=text or "Current screen unavailable.")
+        text = render_prompt(decision.llm_request_prompt, state=screen)
+        text = text or "Current screen unavailable."
+        if previous := previous_action_feedback(state):
+            text = f"{previous}\n{text}"
+        user = ChatMessage(role="user", content=text)
         if image.data:
             user.blocks.append(ImageBlock(image=image.data))
-        memory = await run.history()
+        raw_history = await memory.aget(snapshot=snapshot, state=state)
+        history = raw_history
         if not self.supports_native_tool_calls or self.native_tool_api == "gemini":
-            # Synthetic tool calls do not have Gemini's provider-issued thought signature.
-            memory = text_messages(memory)
+            # Synthetic tool calls have no Gemini-issued thought signatures.
+            history = text_messages(history)
+        report_memory(ctx, state, memory, raw_history, history, selector="llm")
         system_message = ChatMessage(role="system", content=system)
-        if memory and memory[0].role == "system":
-            system_message.blocks.extend(memory.pop(0).blocks)
-        return [system_message, *memory, user]
+        if history and history[0].role == "system":
+            system_message.blocks.extend(history[0].blocks)
+            history = history[1:]
+        kwargs: dict[str, Any] = {
+            "stream": config.streaming,
+            "timeout": decision.timeout,
+            "log_response": not registry.has_sensitive,
+        }
+        if self.supports_native_tool_calls:
+            kwargs.update(
+                tools=tools,
+                allow_parallel_tool_calls=config.parallel_tools,
+                tool_required=self.native_tool_api == "responses",
+            )
+        response = await self._achat([system_message, *history, user], **kwargs)
+        if response is None:
+            return Selection(abstained=True)
+        parsed = self._parse(response)
+        error = render_prompt(decision.invalid_arguments_prompt)
+        if parsed.status is ToolCallParseStatus.MALFORMED or not parsed.calls:
+            raise InvalidResponse(error)
+        calls: list[ToolSelection] = []
+        for call in parsed.calls:
+            member = by_name.get(call.name)
+            try:
+                if member is None or member.metadata.fn_schema is None or call.error:
+                    raise ValueError
+                schema = member.metadata.fn_schema
+                argument_schema = member.metadata.get_parameters_dict()
+                typed_output = call.name == "complete" and "output" in schema.model_fields
+                if typed_output:
+                    # Decode the container here; the workflow owns validation of its contents.
+                    argument_schema["properties"] = {
+                        **argument_schema["properties"],
+                        "output": {"anyOf": [{"type": "object"}, {"type": "null"}]},
+                    }
+                call.parameters = coerce_arguments(
+                    argument_schema,
+                    call.parameters,
+                    textual=not self.supports_native_tool_calls,
+                )
+                if call.parameters.keys() - schema.model_fields.keys():
+                    raise ValueError
+                dispatch_arguments = (
+                    {name: value for name, value in call.parameters.items() if name != "output"}
+                    if typed_output
+                    else call.parameters
+                )
+                schema.model_validate_json(json.dumps(dispatch_arguments), strict=True)
+                image.to_device(call, schema.model_fields.keys())
+            except (KeyError, ValueError, TypeError):
+                raise InvalidResponse(error) from None
+            calls.append(
+                ToolSelection(
+                    tool_id=call.call_id or f"call_{uuid4().hex}",
+                    tool_name=call.name,
+                    tool_kwargs=call.parameters,
+                )
+            )
+        if not config.parallel_tools and len(calls) != 1:
+            raise InvalidResponse(error)
+        return Selection(calls=calls, thought=parsed.thought or None)
 
     @abstractmethod
     async def _achat(self, messages: list[ChatMessage], **kwargs: Any) -> ChatResponse | None: ...
 
-    def _parse(self, response: ChatResponse) -> ActionSelection:
-        text = response.message.content or ""
-        parsed = (
-            self._native_calls(response)
-            if self.supports_native_tool_calls
-            else parse_tool_calls_detailed(text)
-        )
-        return ActionSelection(
-            actions=parsed.calls,
-            thought=parsed.thought,
-            memory_update=extract_add_memory(parsed.thought),
-            parse_result=parsed,
-            textual_arguments=not self.supports_native_tool_calls,
-        )
+    def _parse(self, response: ChatResponse) -> ToolCallParseResult:
+        if self.supports_native_tool_calls:
+            return self._native_calls(response)
+        return parse_tool_calls_detailed(response.message.content or "")
 
     def _native_calls(self, response: ChatResponse) -> ToolCallParseResult:
         return parse_native_tool_calls(response.message)
-
-    def _to_selection(self, response: ChatResponse, parsed: ActionSelection) -> ActionSelection:
-        parsed.response = response
-        parsed.response_text = response.message.content or ""
-        return parsed

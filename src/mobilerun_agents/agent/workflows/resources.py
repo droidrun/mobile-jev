@@ -1,54 +1,55 @@
-"""The two live dependencies resolved for a workflow invocation."""
+"""Inject prebuilt live inputs through LlamaIndex's ResourceManager.
 
-from collections.abc import Awaitable, Callable, Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
-from typing import Annotated
-from uuid import uuid4
+The operator builds its inputs and passes `resource_manager=await
+run_resources(device, memory, services)` to the workflow constructor, which
+forwards it to `Workflow`. ResourceManager.set binds the cached descriptors by
+name before steps run; no factory needs access to context or ambient state.
+Construct a new workflow and manager for every run and planning child. A child
+gets its own memory; the phone and image store can be passed on explicitly.
+"""
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Annotated
 
 from llama_index.core.memory import Memory
 from mobilerun.core.devices import Device
-from workflows.resource import Resource
+from workflows.resource import Resource, ResourceManager
 
-from mobilerun_agents.agent.memory.blocks.repeat import RepeatBlock
-from mobilerun_agents.agent.memory.blocks.run_notes import RunNotesBlock
-from mobilerun_agents.agent.tools.helpers.images import ImageStore
-
-from .core.state import ActionRecord
-
-active_device: ContextVar[Device] = ContextVar("agent_device")
-active_memory_factory: ContextVar[Callable[[], Memory]] = ContextVar("agent_memory_factory")
-active_images: ContextVar[ImageStore | None] = ContextVar("agent_images", default=None)
-record_action: ContextVar[Callable[[ActionRecord], Awaitable[None]] | None] = ContextVar(
-    "record_action", default=None
-)
-record_offset: ContextVar[int] = ContextVar("record_offset", default=0)
-trace_image: ContextVar[Callable[[bytes], None] | None] = ContextVar("trace_image", default=None)
+if TYPE_CHECKING:
+    from mobilerun_agents.agent.tools.helpers.images import ImageStore
+    from mobilerun_agents.agent.tools.registry import ToolRegistry
 
 
-@contextmanager
-def run_image_scope() -> Iterator[ImageStore | None]:
-    """Give a root workflow an image store unless its operator already owns one."""
-    if active_images.get() is not None:
-        yield None
-        return
-    images = ImageStore(uuid4().hex, keep=False)
-    token = active_images.set(images)
-    try:
-        yield images
-    finally:
-        active_images.reset(token)
+@dataclass(frozen=True)
+class Services:
+    registry: "ToolRegistry"
+    images: "ImageStore"
 
 
-def get_device() -> Device:
-    return active_device.get()
+def _device() -> Device:
+    raise RuntimeError("Bind the run's device with run_resources()")
 
 
-def get_memory() -> Memory:
-    memory = active_memory_factory.get()()
-    memory.memory_blocks.extend([RunNotesBlock(), RepeatBlock()])
-    return memory
+def _memory() -> Memory:
+    raise RuntimeError("Bind the run's memory with run_resources()")
 
 
-DeviceResource = Annotated[Device, Resource(get_device)]
-MemoryResource = Annotated[Memory, Resource(get_memory)]
+def _services() -> Services:
+    raise RuntimeError("Bind the run's services with run_resources()")
+
+
+_device_resource = Resource(_device)
+_memory_resource = Resource(_memory)
+_services_resource = Resource(_services)
+
+DeviceResource = Annotated[Device, _device_resource]
+MemoryResource = Annotated[Memory, _memory_resource]
+ServicesResource = Annotated[Services, _services_resource]
+
+
+async def run_resources(device: Device, memory: Memory, services: Services) -> ResourceManager:
+    manager = ResourceManager()
+    await manager.set(_device_resource.name, device)
+    await manager.set(_memory_resource.name, memory)
+    await manager.set(_services_resource.name, services)
+    return manager

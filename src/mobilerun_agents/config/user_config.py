@@ -185,20 +185,14 @@ class DecisionConfig(Section):
     invalid_arguments_prompt: str = "assets/prompts/llm/invalid_arguments.jinja2"
 
 
-class DelegationConfig(Section):
-    min_confidence: Annotated[float | None, Field(ge=0, le=1)] = 0.7
-    takeover_margin: Annotated[float, Field(ge=0, le=1)] = 0.2
-    invalid_prompt: str = "assets/prompts/delegate/invalid.jinja2"
-
-
 class PlanningConfig(Section):
     subgoal_steps: PositiveInt = 10
     max_planner_turns: PositiveInt = 10
 
 
 class AgentConfig(Section):
-    stuck_exclude_after: PositiveInt = 2
-    stuck_fail_after: PositiveInt = 4
+    repeat_warn_after: PositiveInt = 3
+    stuck_fail_after: PositiveInt = 5
     no_progress_note_after: PositiveInt = 3
     no_progress_fail_after: PositiveInt = 5
     cycle_note_after: PositiveInt = 3
@@ -218,7 +212,6 @@ class AgentConfig(Section):
 class ToolsConfig(Section):
     exclude: list[str] | None = None
     max_schema_combinations: PositiveInt = 18
-    app_open_settle_delay: Annotated[float, Field(ge=0)] = 1
     wait_duration: PositiveFloat = 1
     swipe_duration: PositiveFloat = 0.5
     swipe_paths: Annotated[dict[ScrollDirection, SwipePath], Field(min_length=4)] = {
@@ -277,12 +270,6 @@ class MobileConfig(Section):
             except yaml.YAMLError:
                 raise ValueError("Invalid agents.yaml syntax") from None
         if type(data) is dict:
-            checkpoints = data.get("checkpoints")
-            if type(checkpoints) is dict and "folder" in checkpoints:
-                raise OldConfigKeys(
-                    "Config uses old keys; remove checkpoints.folder and set "
-                    "MOBILERUN_AGENT_RUNS_DIR instead."
-                )
             agent = data.get("agent")
             if {"llm_profiles", "decision_profiles", "default_" + "llm"} & data.keys() or (
                 type(agent) is dict and {"selector", "delegation"} & agent.keys()

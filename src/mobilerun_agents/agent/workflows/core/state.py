@@ -1,51 +1,56 @@
+from llama_index.core.tools import ToolSelection
 from mobilerun.models.context import JSONValue
 from pydantic import BaseModel, Field
 
 from mobilerun_agents.config.settings import DEFAULT_MAX_STEPS
 
-from .result import ScreenVisit
 from .snapshot import StepSnapshot
 
 
-class ActionOutcome(BaseModel):
+class Outcome(BaseModel):
+    success: bool
+    message: str | None = None
+    reason: str
+    output: JSONValue = None
+
+
+class ActionRecord(BaseModel):
     step: int
-    name: str
-    args: dict[str, JSONValue]
+    call: ToolSelection
     ok: bool
-    replayable: bool = True
     summary: str
     thought: str | None = None
+    before: StepSnapshot
     screen_changed: bool | None = None
 
 
-class ActionRecord(ActionOutcome):
-    before: StepSnapshot = Field(repr=False)
-    call_id: str = Field(default_factory=lambda: f"call_{uuid4().hex}", repr=False)
-
-
-class ActionRepeat(BaseModel):
-    name: str
-    signature: str
-    screen: str
-    location: str
-    count: int
-
-
 class AgentState(BaseModel):
-    max_steps: int = DEFAULT_MAX_STEPS
-    notes: list[str] = Field(default_factory=list)
     goal: str = ""
-    step: int = 0
+    notes: list[str] = Field(default_factory=list)
     actions: list[ActionRecord] = Field(default_factory=list)
-    repair_attempts: int = 0
-    output_attempts: int = 0
-    repeat: ActionRepeat | None = None
-    pending_thoughts: list[str] = Field(default_factory=list, repr=False)
-    no_progress: int = 0
-    screens: dict[str, ScreenVisit] = Field(default_factory=dict)
-    discoveries: dict[str, int] = Field(default_factory=dict)
-    cycle_visits: dict[str, int] = Field(default_factory=dict)
-    last_screen: str | None = None
-    answer: str = ""
-    reason: str = ""
-from uuid import uuid4
+    current: StepSnapshot | None = None
+    max_steps: int = DEFAULT_MAX_STEPS
+    repairs: int = 0
+    retry_with_delegate: bool = False
+    delegate_intent: str = ""
+    outcome: Outcome | None = None
+
+
+class SubgoalResult(BaseModel):
+    subgoal: str
+    success: bool
+    message: str | None = None
+    reason: str
+    summary: str = ""
+
+
+class PlanningState(BaseModel):
+    goal: str = ""
+    plan: list[str] = Field(default_factory=list)
+    results: list[SubgoalResult] = Field(default_factory=list)
+    planner_turns: int = 0
+    executor_steps: int = 0
+    actions: list[ActionRecord] = Field(default_factory=list)
+    current: StepSnapshot | None = None
+    notes: list[str] = Field(default_factory=list)
+    max_steps: int = DEFAULT_MAX_STEPS

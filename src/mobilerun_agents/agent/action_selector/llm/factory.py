@@ -15,7 +15,6 @@ from llama_index.llms.openai.responses import OpenAIResponses
 from pydantic import PositiveFloat, TypeAdapter
 
 from mobilerun_agents.agent.auth import resolve
-from mobilerun_agents.agent.logs.diagnostics import protect
 from mobilerun_agents.errors import UnknownModel
 
 from .models import MODELS as MODELS
@@ -72,26 +71,6 @@ def adapter_capabilities(llm: LLM) -> Capabilities:
     return capabilities(provider, model)
 
 
-def llm_diagnostic_name(llm: LLM) -> str:
-    adapter = type(llm)
-    try:
-        adapter_name = llm.class_name()
-        metadata_name = llm.metadata.model_name
-    except Exception:
-        adapter_name = adapter.__name__
-        metadata_name = "unknown"
-    provider = {
-        "openai_responses_llm": "openai",
-        "openai_llm": "openai",
-        "anthropic_llm": "anthropic",
-        "google_genai_llm": "gemini",
-        "openrouter_llm": "openrouter",
-        "openai_like_llm": "openai_like",
-        "ollama_llm": "ollama",
-    }.get(adapter_name.lower(), adapter.__name__)
-    return f"llm:{provider}/{metadata_name}"
-
-
 async def build_llm(
     provider: str, model: str, api_key: str | None = None, **options: object
 ) -> LLM:
@@ -100,7 +79,6 @@ async def build_llm(
     if entry.env_var is not None:
         credential = await resolve(provider, api_key or os.environ.get(entry.env_var))
         kwargs["api_key"] = credential.api_key
-        protect(credential.api_key)
 
     if provider == "gemini":
         # Supplying both limits prevents the adapter from fetching model metadata.

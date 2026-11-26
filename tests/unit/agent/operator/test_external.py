@@ -77,3 +77,22 @@ async def test_external_operator_requires_exactly_one_entry_point(monkeypatch, c
     with pytest.raises(ValueError, match=rf"inventory.*found {count}"):
         await ExternalOperator("inventory").execute(MemoryDevice(), "Count items")
     entry.load.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_device_do_honors_external_operator_device_check(monkeypatch):
+    device = MemoryDevice()
+
+    class Plugin(InventoryOperator):
+        def check(self, checked_device):
+            assert checked_device is device
+            raise ValueError("unsupported fixture device")
+
+    plugin = Plugin()
+    entry = Mock(spec=metadata.EntryPoint)
+    entry.load.return_value = plugin
+    monkeypatch.setattr(metadata, "entry_points", lambda **filters: [entry])
+
+    with pytest.raises(ValueError, match="unsupported fixture device"):
+        await device.do("Count items", operator=ExternalOperator("inventory"))
+    assert not plugin.calls

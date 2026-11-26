@@ -6,13 +6,12 @@
 
 **Contents:**
 
-- `__init__.py` — package entry.
-- `app_cards.py` — app-specific guidance.
+- `__init__.py` — `ObservationBlock` reads live context rather than archived messages.
+- `app_cards.py` — local app-specific guidance for the current platform.
 - `device_context.py` — context published by the device and its extensions.
-- `retriever.py` — relevant material from a LlamaIndex retriever.
 - `repeat.py` — prior action on the current screen and repeat guidance.
-- `run_notes.py` — render the goal and notes without storing them in chat.
+- `notes.py` — render the goal and notes without storing them in chat.
 
-**Examples:** `from mobilerun_agents.agent.memory.blocks.device_context import DeviceContextBlock`; pass `DeviceContextBlock()` in the block list to `build_memory`.
+**Examples:** `await memory.aget(snapshot=state.current, state=state)` renders context for the current screen.
 
 **Depends on / used by:** Blocks use the snapshot and memory block contract; the operator or memory builder composes them for a run.

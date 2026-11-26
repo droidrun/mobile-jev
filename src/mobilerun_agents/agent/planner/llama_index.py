@@ -1,31 +1,22 @@
-"""Ask an LLM for the next subgoals or the final result, without running actions."""
+"""Ask one LLM to plan the next subgoals or complete the overall run."""
 
-from time import monotonic
+from copy import copy
 from typing import Annotated
 
-from llama_index.core.base.llms.types import ImageBlock
 from llama_index.core.llms import LLM, ChatMessage, ChatResponse
 from llama_index.core.tools import FunctionTool
 from mobilerun.models.context import JSONValue
-from mobilerun.utils.images import image_dimensions
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError, create_model
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
+from workflows import Context
 
-from mobilerun_agents.agent.action_selector.llm.calls import (
-    InvalidResponse,
-    Usage,
-    achat,
-    usage_from_response,
-)
-from mobilerun_agents.agent.action_selector.llm.factory import (
-    adapter_capabilities,
-    llm_diagnostic_name,
-)
+from mobilerun_agents.agent.action_selector.llm.calls import InvalidResponse, achat
+from mobilerun_agents.agent.action_selector.llm.factory import adapter_capabilities
 from mobilerun_agents.agent.action_selector.llm.parsing import parse_native_tool_calls
-from mobilerun_agents.agent.logs.diagnostics import Detail, ModelCall, Retry, redact, sink
-from mobilerun_agents.agent.logs.redaction import redact_run_text
+from mobilerun_agents.agent.workflows.core.state import PlanningState
 from mobilerun_agents.config.prompts import render_prompt
+from mobilerun_agents.config.user_config import AgentConfig
 
-from .base import Finish, Plan, Planner, PlanningInput
+from .base import Finish, Plan, Planner
 
 
 class _SetPlan(BaseModel):
@@ -47,87 +38,64 @@ class _Complete(BaseModel):
 
 def _decision(response: ChatResponse, error: str) -> Plan | Finish:
     parsed = parse_native_tool_calls(response.message)
-    if (diagnostic := sink.get()) and (thought := redact(redact_run_text(parsed.thought))[:290]):
-        diagnostic(Detail(section="planning", text=f"reasoning: {thought}"))
-    if len(parsed.calls) != 1:
-        raise InvalidResponse(error)
-    call = parsed.calls[0]
-    if call.error:
-        raise InvalidResponse(call.error)
-    try:
-        match call.name:
-            case "set_plan":
-                args = _SetPlan.model_validate(call.parameters, strict=True)
-                return Plan(tuple(args.subgoals))
-            case "complete":
-                answer = _Complete.model_validate(call.parameters, strict=True)
-                return Finish(
-                    answer.success, answer.message, answer.output if answer.success else None
-                )
-    except ValidationError:
-        raise InvalidResponse(error) from None
+    if len(parsed.calls) == 1:
+        call = parsed.calls[0]
+        if call.error:
+            raise InvalidResponse(call.error)
+        try:
+            match call.name:
+                case "set_plan":
+                    plan = _SetPlan.model_validate(call.parameters, strict=True)
+                    return Plan(tuple(plan.subgoals))
+                case "complete":
+                    answer = _Complete.model_validate(call.parameters, strict=True)
+                    return Finish(
+                        answer.success, answer.message, answer.output if answer.success else None
+                    )
+        except ValidationError:
+            raise InvalidResponse(error) from None
     raise InvalidResponse(error)
 
 
-async def _request(
-    llm: LLM,
-    request: PlanningInput,
-    messages: list[ChatMessage],
-    tools: list[FunctionTool],
-    image: tuple[int, int] | None,
-) -> ChatResponse:
-    diagnostic = sink.get()
-    started = monotonic()
-    usage = Usage(requests=0)
-    try:
-        response = await achat(
-            llm,
-            messages,
-            timeout=request.config.decision.timeout,
-            stream=request.config.streaming,
-            tools=tools,
-            allow_parallel_tool_calls=False,
-            tool_required=True,
-        )
-        usage = usage_from_response(response)
-        return response
-    except InvalidResponse as exc:
-        usage = exc.usage or usage
-        raise
-    finally:
-        if diagnostic:
-            diagnostic(
-                ModelCall(
-                    name=llm_diagnostic_name(llm),
-                    image=image,
-                    seconds=monotonic() - started,
-                    inputs=usage.request_tokens,
-                    outputs=usage.response_tokens,
-                    reasoning=usage.reasoning_tokens,
-                    total=usage.total_tokens,
-                )
-            )
-
-
 class LlamaIndexPlanner(Planner):
-    def __init__(self, llm: LLM) -> None:
+    def __init__(self, llm: LLM, config: AgentConfig | None = None) -> None:
         self.llm = llm
+        self.config = config or AgentConfig()
+        self._output_schema: dict[str, JSONValue] | None = None
+        self._repair: str | None = None
+        self._observe_screen = False
 
-    @property
-    def supports_images(self) -> bool:
-        return adapter_capabilities(self.llm).vision
+    def bind(
+        self, output_schema: dict[str, JSONValue] | None, repair: str | None, observe_screen: bool
+    ) -> "LlamaIndexPlanner":
+        planner = copy(self)
+        planner._output_schema = output_schema
+        planner._repair = repair
+        planner._observe_screen = observe_screen
+        return planner
 
-    async def plan(self, request: PlanningInput) -> Plan | Finish:
-        config = request.config.decision
-        completion = (
-            create_model(
-                "CompletionArguments",
-                __base__=_Complete,
-                output=(request.output | None, None),  # type: ignore[arg-type]  # Runtime output type.
-            )
-            if request.output
-            else _Complete
+    async def plan(self, ctx: Context[PlanningState]) -> Plan | Finish:
+        state = await ctx.store.get_state()
+        ui = state.current.ui if state.current else None
+        message = ChatMessage(
+            role="user",
+            content=render_prompt(
+                "assets/prompts/planning/turn.jinja2",
+                state=state,
+                observe_screen=self._observe_screen,
+                repair=self._repair,
+                package=ui.phone_state.get("packageName") if ui else None,
+                activity=ui.phone_state.get("activityName") if ui else None,
+                ui=ui.formatted_text if ui else "",
+            ),
         )
+        if (
+            self._observe_screen
+            and state.current
+            and state.current.screenshot
+            and adapter_capabilities(self.llm).vision
+        ):
+            message.blocks.append(state.current.screenshot)
         tools = [
             FunctionTool.from_defaults(
                 _SetPlan,
@@ -136,46 +104,38 @@ class LlamaIndexPlanner(Planner):
                 description=render_prompt("assets/prompts/planning/set_plan.jinja2"),
             ),
             FunctionTool.from_defaults(
-                completion,
+                _Complete,
                 name="complete",
-                fn_schema=completion,
+                fn_schema=_Complete,
                 description=render_prompt(
-                    "assets/prompts/complete/description.jinja2",
-                    output_schema=request.output.model_json_schema() if request.output else None,
+                    "assets/prompts/complete/description.jinja2", output_schema=self._output_schema
                 ),
             ),
         ]
-        messages = [
-            ChatMessage(
-                role="user",
-                content=render_prompt(
-                    "assets/prompts/planning/turn.jinja2",
-                    request=request,
-                ),
-            )
-        ]
-        diagnostic = sink.get()
-        image = None
-        if request.screenshot and self.supports_images:
-            messages[0].blocks.append(ImageBlock(image=request.screenshot))
-            if diagnostic:
-                image = image_dimensions(request.screenshot)
+        config = self.config.decision
         error = render_prompt(config.invalid_arguments_prompt)
-        for attempt in range(1, config.max_response_repair_attempts + 1):
+        messages = [message]
+        for attempt in range(config.max_response_repair_attempts):
             try:
-                return _decision(await _request(self.llm, request, messages, tools, image), error)
+                response = await achat(
+                    self.llm,
+                    messages,
+                    timeout=config.timeout,
+                    stream=self.config.streaming,
+                    tools=tools,
+                    allow_parallel_tool_calls=False,
+                    tool_required=True,
+                )
+                return _decision(response, error)
             except InvalidResponse as exc:
-                if attempt == config.max_response_repair_attempts:
+                if attempt + 1 == config.max_response_repair_attempts:
                     raise
-                if diagnostic:
-                    diagnostic(Retry(attempt=attempt + 1, reason="Invalid planner tool call"))
                 messages = [
-                    messages[0],
+                    message,
                     ChatMessage(
                         role="user",
                         content=render_prompt(
-                            "assets/prompts/providers/repair.jinja2",
-                            error=str(exc),
+                            "assets/prompts/providers/repair.jinja2", error=str(exc)
                         ),
                     ),
                 ]

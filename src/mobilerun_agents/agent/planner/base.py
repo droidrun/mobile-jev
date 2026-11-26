@@ -1,37 +1,12 @@
 """Planner contract and decisions applied by the planning workflow."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from mobilerun.models.context import JSONValue
-from pydantic import BaseModel
+from workflows import Context
 
-from mobilerun_agents.agent.workflows.core.result import FailureSummary
-from mobilerun_agents.config.user_config import AgentConfig
-
-
-class SubgoalResult(BaseModel):
-    goal: str
-    success: bool
-    message: str
-    steps: int
-    failure: FailureSummary | None = None
-
-
-@dataclass(frozen=True)
-class PlanningInput:
-    goal: str
-    config: AgentConfig
-    remaining_plan: tuple[str, ...] = ()
-    results: tuple[SubgoalResult, ...] = ()
-    notes: tuple[str, ...] = ()
-    package: str | None = None
-    activity: str | None = None
-    ui: str = ""
-    output: type[BaseModel] | None = None
-    repair: str | None = None
-    observe_screen: bool = False
-    screenshot: bytes | None = field(default=None, repr=False)
+from mobilerun_agents.agent.workflows.core.state import PlanningState
 
 
 @dataclass(frozen=True)
@@ -47,10 +22,12 @@ class Finish:
 
 
 class Planner(ABC):
-    @property
-    def supports_images(self) -> bool:
-        return False
+    def bind(
+        self, output_schema: dict[str, JSONValue] | None, repair: str | None, observe_screen: bool
+    ) -> "Planner":
+        """Bind optional prompt inputs for a turn; custom planners can just read the context."""
+        return self
 
     @abstractmethod
-    async def plan(self, request: PlanningInput) -> Plan | Finish:
+    async def plan(self, ctx: Context[PlanningState]) -> Plan | Finish:
         """Return subgoals or a final result without modifying workflow state."""

@@ -1,20 +1,21 @@
 # Choosing an action
 
-**Purpose:** Turn a workflow observation and the available actions into a selection, without touching the device.
+**Purpose:** Turn a workflow observation and available actions into a selection, without executing actions.
 
 **What belongs here / what doesn't:** Compose selection and handoff policies here. Executing an action or retrying a tap belongs to neither selector.
 
 **Contents:**
 
 - `__init__.py` — selector exports.
-- `base.py` — the `select(run)` contract, candidates and returned selections.
-- `delegating.py` — hand off explicit delegation or low confidence.
-- `fallback.py` — try another selector after an unusable selection.
+- `base.py` — the `select(ctx, device, memory, registry)` contract and native tool selections.
+- `delegating.py` — hand off an explicit request or typed completion to the LLM and route retries for that step.
 - `loader.py` — resolve a setup into a selector or planner and executor, with optional Jev delegation.
 - `llm/`, `decision_model/` — chat-based and choice-based implementations.
 
-**Examples:** `DelegatingSelector(DecisionSelector(TypeSafeDecisionModel(), vision="off", exclude={"press_button"}), LlamaIndexLLMSelector(llm, vision="on"))` pairs tree-only Jev with an LLM that requests a screenshot only when called, while excluding system-button choices. Pass it as `AgentOperator(selector=selector)`.
+**Examples:** `DelegatingSelector(DecisionSelector(TypeSafeDecisionModel(), vision="off", exclude={"press_button"}), LlamaIndexLLMSelector(llm, vision="on"))` pairs tree-only Jev with an LLM that consumes the observation's screenshot when called, while excluding system-button choices. Pass it as `AgentOperator(selector=selector)`. The workflow passes the run's registry into every selection call.
 
-Each selector sets its own `vision` mode: `off` sends the tree without direct coordinate tools; `on` sends tree and image; `only` sends the image and omits indexed tools. Indexed tools are only offered when there are elements. The registry has no vision policy: selectors build their own exclusions for `vision="off"`, `"on"` or `"only"`. Jev is `DecisionSelector(model, vision="on", exclude=())`; a located tap is offered only with `vision="only"`. A Jev selector with a delegate does not abstain.
+Each selector sets its own `vision` mode: `off` sends the tree without direct coordinate tools; `on` sends tree and image; `only` sends the image and omits indexed tools. Indexed tools are only offered when there are elements. The registry has no vision policy: selectors build their own exclusions for `vision="off"`, `"on"` or `"only"`. A located tap is offered only with `vision="only"`.
+
+Set Jev's confidence cutoff with `DecisionSelector(model, vision="on", exclude=(), min_confidence=0.7)`. When the score is below that cutoff, Jev abstains and the workflow retries the selection. `DelegatingSelector(primary, delegate)` calls the LLM when Jev selects `delegate` or chooses successful completion in a run that requires typed output. Retries for that step stay with the LLM. The `delegate` option is never registered as an executable tool.
 
 **Depends on / used by:** Workflows call the selector service. It uses the registry, authentication and config; it does not drive the workflow.

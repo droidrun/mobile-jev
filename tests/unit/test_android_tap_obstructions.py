@@ -1,17 +1,14 @@
 """Regression coverage through raw Portal data, formatting, and real actions."""
 
 import asyncio
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
 from mobilerun.core.state.android import AndroidStateProvider
 from mobilerun.core.state.filters import ConciseFilter
 from mobilerun.core.state.formatters import IndexedFormatter
 
-from mobilerun_agents.agent.tools.registry import build_registry
-from mobilerun_agents.config.user_config import ToolsConfig
-from tests.unit.device_fixtures import MemoryDevice, tool_run
+from tests.unit.device_fixtures import MemoryDevice, device_turn, execute_tool
 
 
 def node(text, bounds=(0, 0, 1000, 400), children=(), **properties):
@@ -45,19 +42,15 @@ def context(children, screen=(1000, 2000), **provider_kwargs):
     driver.tap_mock = AsyncMock()
     provider = AndroidStateProvider(driver, ConciseFilter(), IndexedFormatter(), **provider_kwargs)
     ui = asyncio.run(provider.get_state())
-    return tool_run(
-        config=ToolsConfig(), ui=ui, driver=driver, state_provider=provider, macro_recorder=None
-    )
+    return device_turn(driver, ui, provider)
 
 
 def element(ctx, text):
-    return next(e for e in ctx.ui.elements if e["text"] == text)
+    return next(e for e in ctx.state.current.ui.elements if e["text"] == text)
 
 
 async def click(ctx, index):
-    return (
-        await build_registry(ctx, [], None).by_name["tap_element"].acall(index=index)
-    ).raw_output
+    return await execute_tool(ctx, "tap_element", index=index)
 
 
 def test_indexed_actions_avoid_later_touchable_sibling():
@@ -102,8 +95,8 @@ def test_child_filled_container_remains_clickable_and_children_keep_indices():
     result = asyncio.run(click(ctx, element(ctx, "row")["index"]))
     assert result.success
     ctx.device.tap_mock.assert_awaited_once_with(500, 200)
-    assert [e["index"] for e in ctx.ui.elements] == [1, 2, 3, 4]
-    assert all(e["children"] == [] for e in ctx.ui.elements)
+    assert [e["index"] for e in ctx.state.current.ui.elements] == [1, 2, 3, 4]
+    assert all(e["children"] == [] for e in ctx.state.current.ui.elements)
 
 
 def test_independent_child_and_parent_keep_their_own_tap_targets():
@@ -147,7 +140,7 @@ def test_normalized_indexed_actions_tap_device_pixels(stealth):
         use_normalized=True,
         stealth=stealth,
     )
-    assert "(861,895,972,945)" in ctx.ui.formatted_text
+    assert "(861,895,972,945)" in ctx.state.current.ui.formatted_text
     index = element(ctx, "send")["index"]
     result = asyncio.run(click(ctx, index))
     assert result.success
@@ -158,12 +151,26 @@ def test_normalized_indexed_actions_tap_device_pixels(stealth):
 
 
 def test_normalized_macro_records_device_pixels():
+    from llama_index.core.tools import ToolSelection
+
+    from mobilerun_agents.agent.checkpoints.macro_export import macro_data
+    from mobilerun_agents.agent.workflows.core.state import ActionRecord
+
     ctx = context(
         [node("send", (930, 2150, 1050, 2270))],
         screen=(1080, 2400),
         use_normalized=True,
     )
-    ctx.macro_recorder = SimpleNamespace(record_action=Mock())
-    asyncio.run(click(ctx, element(ctx, "send")["index"]))
-    action = ctx.macro_recorder.record_action.call_args.args[0]
-    assert action == {"action_type": "tap", "x": 990, "y": 2210}
+    call = ToolSelection(
+        tool_id="tap", tool_name="tap_element", tool_kwargs={"index": element(ctx, "send")["index"]}
+    )
+    result = asyncio.run(ctx.registry.execute(call, ctx.ctx))
+    record = ActionRecord(
+        step=1,
+        call=ctx.registry.resolve(call),
+        ok=result.success,
+        summary=result.summary,
+        before=ctx.state.current,
+    )
+    [action] = macro_data("Send", [record], ctx.registry.redactor)["actions"]
+    assert (action["action_type"], action["x"], action["y"]) == ("tap", 990, 2210)

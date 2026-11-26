@@ -49,7 +49,7 @@ for name, digest in assets.items():
     assert all(not resolved.is_relative_to(checkout) for checkout in checkouts)
     assert hashlib.sha256(resolved.read_bytes()).hexdigest() == digest, name
 from mobilerun_agents.config.prompts import render_prompt
-assert "example.settings" in render_prompt("assets/prompts/tools/choose_app.jinja2", apps_list="example.settings", app_description="open settings")
+assert "Read the battery" in render_prompt("assets/prompts/llm/selection_request.jinja2", state="Read the battery")
 """
     result = subprocess.run(
         [

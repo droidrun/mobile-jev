@@ -6,6 +6,7 @@ from typing import Any
 
 import click
 from mobilerun.cli.devices.base.options import DeviceTarget, device_command
+from mobilerun.core.operator import Operator
 from mobilerun.errors import CloudAuthRequired
 from mobilerun.models.results import ExecutionResult
 from pydantic import BaseModel
@@ -68,9 +69,7 @@ def run(
         raise click.exceptions.Exit(130) from None
 
 
-async def _execute(
-    operator: AgentOperator | PlanningOperator, target: DeviceTarget, goal: str, steps: int | None
-) -> None:
+async def _execute(operator: Operator, target: DeviceTarget, goal: str, steps: int | None) -> None:
     async with target.open() as device:
         if device is None:
             raise click.UsageError("A device is required.")

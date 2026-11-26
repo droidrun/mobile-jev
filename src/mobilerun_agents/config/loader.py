@@ -1,12 +1,13 @@
 """Load agent settings without rewriting the shared device configuration."""
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 import yaml
+from filelock import FileLock
 from mobilerun.config.settings import get_settings
 
 from .user_config import MobileConfig
@@ -37,9 +38,25 @@ class ConfigLoader:
         return MobileConfig.from_yaml(path) if config_path or path.exists() else MobileConfig()
 
     @classmethod
-    def save(cls, config: MobileConfig) -> Path:
+    def update(cls, edit: Callable[[MobileConfig], None]) -> Path:
+        """Read and edit the on-disk user config under one interprocess lock."""
         path = cls.get_user_config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
+        with FileLock(str(path) + ".lock"):
+            config = cls.load(str(path)) if path.exists() else MobileConfig()
+            edit(config)
+            return cls._save(path, config)
+
+    @classmethod
+    def save(cls, config: MobileConfig) -> Path:
+        """Replace the user config; use update for edits to existing settings."""
+        path = cls.get_user_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with FileLock(str(path) + ".lock"):
+            return cls._save(path, config)
+
+    @staticmethod
+    def _save(path: Path, config: MobileConfig) -> Path:
         with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as file:
             temp = Path(file.name)
             try:

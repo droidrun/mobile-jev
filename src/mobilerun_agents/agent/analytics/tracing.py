@@ -36,6 +36,7 @@ from mobilerun_agents.config.settings import (
 if TYPE_CHECKING:
     from langfuse import Langfuse
 
+# OpenInference installs one root LlamaIndex dispatcher handler; task-local sampling isolates runs on its shared pipeline.
 _active = ContextVar("agent_tracing_enabled", default=False)
 _lock = Lock()
 _log = logging.getLogger(__name__)

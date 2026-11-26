@@ -17,6 +17,8 @@
 
 **Examples:** `llm = await build_llm("openai", "gpt-4.1-mini")` (from `.factory`); `LlamaIndexLLMSelector(llm)` uses it for selection. Native chat passes LlamaIndex tools to the provider adapter. For an explicitly native Anthropic or Gemini adapter, use `supports_native=True`. Their adapters extract tool calls; OpenAI paths keep the strict parser because partial JSON is not an executable action. XML models read the same tool metadata.
 
+Without an explicit `AgentConfig`, the selector loads the effective agent config at selection time. The typed output schema is advertised by `complete`; the workflow validates the contents of `output` during execution. Remove any `output_schema` references from custom `agent.system_prompt` templates: that variable is no longer passed.
+
 **Depends on / used by:** Uses LlamaIndex, selector types, API keys and typed config. The profile loader builds these selectors.
 
 `MODELS` maps provider names to four fields:

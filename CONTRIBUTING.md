@@ -20,7 +20,7 @@ Tests use fakes and isolated configuration. Never commit secrets or call provide
 
 ## Layout and import direction
 
-Imports go down: CLI/public exports → `macro_agent/` → `agent/operators/` → `agent/workflows/` → services (including `agent/planner/` and `agent/tools/`) → `agent/run.py` → `agent/workflows/core/` → `agent/auth/` → `config/` and `errors/`. Within `agent/tools/`, imports go from registry to atomic to helpers; selectors may use helpers. Replay may call the agent, never the reverse. Base owns device operations, extensions and macro playback.
+Imports go down: CLI/public exports → `macro_agent/` → `agent/operators/` → `agent/workflows/` → services (including `agent/planner/` and `agent/tools/`) → `agent/events.py` → `agent/workflows/core/` → `agent/auth/` → `config/` and `errors/`. Within `agent/tools/`, imports go from registry to atomic to helpers; selectors may use helpers. Replay may call the agent, never the reverse. Base owns device operations, extensions and macro playback.
 
 ## Adding a selector
 

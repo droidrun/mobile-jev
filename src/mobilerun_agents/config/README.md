@@ -9,7 +9,7 @@
 - `__init__.py` — Package marker.
 - `README.md` — Module overview.
 - `user_config.py` — Typed agent, model profile, tool, memory, analytics, tracing and checkpoint settings.
-- `loader.py` — Read `agents.yaml` in the Mobilerun config directory, or an explicit path. Setup saves only non-default choices, including edits inside nested sections. Unset options follow the installed version's defaults. Writes are atomic and leave the base device config alone.
+- `loader.py` — Read `agents.yaml` in the Mobilerun config directory, or an explicit path. Saves store only non-default choices. `ConfigLoader.update(edit)` holds a file lock from load through atomic replacement and leaves the base device config alone.
 - `settings.py` — Runtime defaults, environment-backed settings and masked Langfuse keys.
 - `paths.py` — Packaged asset and caller-relative path resolution.
 - `prompts.py` — Resolves templates and renders them in an immutable sandbox. Missing variables raise an error.

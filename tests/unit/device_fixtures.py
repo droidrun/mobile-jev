@@ -91,33 +91,16 @@ def fake_tools(*names):
     return tuple(entries)
 
 
-def tool_run(driver=None, ui=None, state_provider=None, config=None, macro_recorder=None):
-    from types import SimpleNamespace
-    from unittest.mock import AsyncMock, NonCallableMock
+def device_turn(driver, ui, state_provider):
+    from tests.unit.agent.action_selector.fixtures import Turn
 
-    from mobilerun.core.state.base import StateProvider
+    driver._set_state_provider(state_provider)
+    return Turn(device=driver, ui=ui)
 
-    from mobilerun_agents import Run
-    from mobilerun_agents.config.user_config import ToolsConfig
 
-    provider = state_provider or NonCallableMock(spec=StateProvider)
-    device = driver or MemoryDevice()
-    if isinstance(device, MemoryDevice) or hasattr(device, "_set_state_provider"):
-        device._set_state_provider(provider)
-    else:
-        device.state = SimpleNamespace(
-            _resolved_provider=provider, refresh=getattr(provider, "get_state", AsyncMock())
-        )
-    from llama_index.core.memory import Memory
+async def execute_tool(turn, name, **arguments):
+    from llama_index.core.tools import ToolSelection
 
-    from mobilerun_agents.config.user_config import AgentConfig
-
-    run = Run(
-        device=device,
-        tool_config=config or ToolsConfig(),
-        macro_recorder=macro_recorder,
-        config=AgentConfig(),
-        memory=NonCallableMock(spec=Memory),
+    return await turn.registry.execute(
+        ToolSelection(tool_id="test", tool_name=name, tool_kwargs=arguments), turn.ctx
     )
-    run.ui = ui
-    return run

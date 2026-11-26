@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from importlib import import_module
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -12,12 +13,16 @@ from mobilerun_agents.agent.action_selector import loader
 from mobilerun_agents.agent.action_selector.decision_model.base import DecisionSelector
 from mobilerun_agents.agent.action_selector.delegating import DelegatingSelector
 from mobilerun_agents.agent.action_selector.llm.llama_index import LlamaIndexLLMSelector
-from mobilerun_agents.cli.agent.run import run
 from mobilerun_agents.config.loader import ConfigLoader
 from tests.unit.device_fixtures import MemoryDevice
 
 
-def test_keyboard_interrupt_exits_with_130_without_traceback(monkeypatch):
+@pytest.fixture
+def run():
+    return import_module("mobilerun_agents.cli.agent.run").run
+
+
+def test_keyboard_interrupt_exits_with_130_without_traceback(monkeypatch, run):
     class InterruptedRunner:
         def __enter__(self):
             raise KeyboardInterrupt
@@ -31,8 +36,27 @@ def test_keyboard_interrupt_exits_with_130_without_traceback(monkeypatch):
     assert "Traceback" not in result.output
 
 
+def test_failed_operator_result_exits_one(monkeypatch, run):
+    module = import_module("mobilerun_agents.cli.agent.run")
+    monkeypatch.setattr(module, "build_setup", AsyncMock(return_value=Mock(planner=None)))
+
+    @asynccontextmanager
+    async def opened(target):
+        yield MemoryDevice()
+
+    monkeypatch.setattr(DeviceTarget, "open", opened)
+    monkeypatch.setattr(
+        AgentOperator,
+        "execute",
+        AsyncMock(return_value=ExecutionResult(success=False, answer="failed", device="memory")),
+    )
+    result = CliRunner().invoke(run, ["goal", "serial"])
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+
+
 @pytest.mark.parametrize("args", [[], ["phone-id", "--cloud"], ["phone-id", "--setup", "missing"]])
-def test_setup_error_precedes_device_discovery_consent_and_open(monkeypatch, args):
+def test_setup_error_precedes_device_discovery_consent_and_open(monkeypatch, args, run):
     forbidden = Mock(side_effect=AssertionError("device accessed before model resolution"))
     monkeypatch.setattr("mobilerun.cli.devices.base.options.discover_devices", forbidden)
     monkeypatch.setattr(DeviceTarget, "open", forbidden)
@@ -42,8 +66,8 @@ def test_setup_error_precedes_device_discovery_consent_and_open(monkeypatch, arg
     forbidden.assert_not_called()
 
 
-@pytest.mark.parametrize("name", ["fast", "deep", "jev-only"])
-def test_run_selects_setup_and_overrides_vision_without_writing(monkeypatch, name):
+@pytest.mark.parametrize("name", [None, "fast", "deep", "jev-only"])
+def test_run_selects_setup_and_overrides_vision_without_writing(monkeypatch, name, run):
     monkeypatch.setenv("TYPESAFE_API_KEY", "fake-key")
     path = ConfigLoader.get_user_config_path()
     path.parent.mkdir(parents=True)
@@ -74,8 +98,9 @@ def test_run_selects_setup_and_overrides_vision_without_writing(monkeypatch, nam
     monkeypatch.setattr(DeviceTarget, "open", opened)
     monkeypatch.setattr(AgentOperator, "execute", execute)
     monkeypatch.setattr(PlanningOperator, "execute", execute)
+    setup_args = [] if name is None else ["--setup", name]
     result = CliRunner().invoke(
-        run, ["count things", "emulator-5554", "--setup", name, "--vision", "only", "--steps", "2"]
+        run, ["count things", "emulator-5554", *setup_args, "--vision", "only", "--steps", "2"]
     )
     assert result.exit_code == 0, result.output
     [(op, device, goal, options)] = calls
@@ -86,7 +111,7 @@ def test_run_selects_setup_and_overrides_vision_without_writing(monkeypatch, nam
         assert op._executor.primary.vision == op._executor.delegate.vision == "only"
         assert [call.args[1] for call in build.await_args_list] == ["planner", "local"]
     else:
-        expected = LlamaIndexLLMSelector if name == "fast" else DecisionSelector
+        expected = DecisionSelector if name == "jev-only" else LlamaIndexLLMSelector
         assert type(op) is AgentOperator and type(op._selector) is expected
         assert op._selector.vision == "only"
     assert path.read_bytes() == saved

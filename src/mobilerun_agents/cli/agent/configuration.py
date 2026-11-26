@@ -1,5 +1,7 @@
 """Shared presentation and persistence for agent configuration commands."""
 
+from collections.abc import Callable
+
 import click
 from mobilerun.cli.base import prompts
 from mobilerun.cli.base.prompts import SelectChoice
@@ -35,10 +37,10 @@ def load_config(path: str | None = None) -> MobileConfig:
         raise click.ClickException(str(exc)) from None
 
 
-def save_config(config: MobileConfig) -> None:
+def update_config(edit: Callable[[MobileConfig], None]) -> None:
     try:
-        ConfigLoader.save(config)
+        ConfigLoader.update(edit)
     except ValidationError as exc:
         raise click.UsageError(profile_validation_message(exc) or str(exc)) from None
-    except OSError:
-        raise click.ClickException("Could not save agents.yaml.") from None
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from None

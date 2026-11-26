@@ -6,25 +6,17 @@ from llama_index.core.base.llms.types import ChatMessage, ChatResponse
 from llama_index.core.llms.function_calling import FunctionCallingLLM
 from llama_index.core.llms.llm import LLM
 
-from mobilerun_agents.agent.action_selector.base import (
-    ActionSelection,
-    NativeToolAPI,
-    Vision,
-)
+from mobilerun_agents.agent.action_selector.base import NativeToolAPI
 from mobilerun_agents.agent.action_selector.llm.base import LLMSelector
-from mobilerun_agents.config.user_config import DecisionConfig
+from mobilerun_agents.config.user_config import AgentConfig, Vision
 
-from .calls import achat, usage_from_response
-from .factory import adapter_capabilities, llm_diagnostic_name
+from .calls import achat
+from .factory import adapter_capabilities
 from .models import Capabilities
 from .parsing import ToolCall, ToolCallParseResult, ToolCallParseStatus
 
 
 class LlamaIndexLLMSelector(LLMSelector):
-    @property
-    def diagnostic_name(self) -> str:
-        return llm_diagnostic_name(self.llm)
-
     def __init__(
         self,
         llm: LLM,
@@ -32,7 +24,7 @@ class LlamaIndexLLMSelector(LLMSelector):
         supports_native: bool | None = None,
         native_tool_api: NativeToolAPI | None = None,
         image_limits: Capabilities | None = None,
-        config: DecisionConfig | None = None,
+        config: AgentConfig | None = None,
     ) -> None:
         super().__init__(vision, config)
         self.llm = llm
@@ -61,10 +53,6 @@ class LlamaIndexLLMSelector(LLMSelector):
     def native_tool_api(self) -> NativeToolAPI:
         return self._native_tool_api
 
-    @property
-    def shared_llm(self) -> LLM:
-        return self.llm
-
     async def _achat(self, messages: list[ChatMessage], **kwargs: Any) -> ChatResponse | None:
         return await achat(self.llm, messages, **kwargs)
 
@@ -84,8 +72,3 @@ class LlamaIndexLLMSelector(LLMSelector):
                 )
             case _:
                 raise TypeError("Native extraction requires a function-calling adapter")
-
-    def _to_selection(self, response: ChatResponse, parsed: ActionSelection) -> ActionSelection:
-        selection = super()._to_selection(response, parsed)
-        selection.usage = usage_from_response(response)
-        return selection

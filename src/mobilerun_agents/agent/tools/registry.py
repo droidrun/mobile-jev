@@ -2,29 +2,41 @@
 
 import hashlib
 import inspect
+import json
 import re
 from collections.abc import Collection, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 
-from llama_index.core.tools import BaseTool
+from llama_index.core.tools import BaseTool, ToolSelection
 from mobilerun.core.devices.base import Device
-from mobilerun.core.devices.recording import RecordingDevice
+from mobilerun.core.devices.components.wrapper import DeviceWrapper
 from mobilerun.core.extensions import Action
 from mobilerun.core.extensions.actions import Declaration
+from mobilerun.core.mailbox import Mailbox
+from mobilerun.core.phone_number import PhoneNumber
+from mobilerun.core.state.ui_state import UIState
 from mobilerun.utils.redaction import secret_scope
-from pydantic import BaseModel, ConfigDict, create_model
+from pydantic import BaseModel, ConfigDict, ValidationError, create_model
+from workflows import Context
 
-from mobilerun_agents.agent.logs.redaction import observe_secret_inputs
-from mobilerun_agents.agent.run import Run
+from mobilerun_agents.agent.logs.redaction import Redactor, observe_vault
+from mobilerun_agents.agent.workflows.core.state import AgentState
+from mobilerun_agents.agent.workflows.core.targets import (
+    ActionTarget,
+    action_target,
+    element_label,
+)
 from mobilerun_agents.config.prompts import render_prompt
-from mobilerun_agents.errors.descriptions import describe_error
+from mobilerun_agents.config.user_config import DecisionConfig, ToolsConfig
 
 from .atomic import AtomicTool, expand_atomic_tools
 from .base import ActionMetadata, ActionResult, RegistryTool, Source, Tool, complete, tool
 from .helpers import check_point, coordinate_pairs
+from .helpers.coordinates import CoordinateError
+from .helpers.errors import tool_error_summary
 
 DEVICE_TOOL_DENYLIST = frozenset(
     {
@@ -55,6 +67,19 @@ DEVICE_TOOL_DENYLIST = frozenset(
 # The cloud driver forwards the base float unchanged to this integer wire field.
 # Keep the device's model-facing schema; normalize only at the cloud boundary.
 _CLOUD_INTEGER_MINIMUMS = {"swipe": {"duration_ms": 10}}
+# Base extracts a standalone run of 4–8 digits; any such run may be the code.
+_SMS_CODE = re.compile(r"(?<!\d)\d{4,8}(?!\d)")
+_ACTION_VERBS = {
+    "tap": "tapped",
+    "tap_element": "tapped",
+    "long_press": "long-pressed",
+    "long_press_at": "long-pressed",
+    "long_press_element": "long-pressed",
+    "input_text": "typed into",
+    "input_text_element": "typed into",
+    "input_text_on_element": "typed into",
+    "type_secret": "typed into",
+}
 
 
 def model_name(action: Action) -> str:
@@ -118,75 +143,114 @@ def _cloud_arguments(name: str, validated: dict[str, Any]) -> str | None:
     return None
 
 
-async def _invoke_device(run: Run, action: Action, arguments: dict[str, Any]) -> ActionResult:
+async def _invoke_device(
+    device: Device,
+    ui: UIState | None,
+    action: Action,
+    arguments: dict[str, Any],
+    redactor: Redactor,
+) -> ActionResult:
     name = model_name(action)
     try:
         validated = action.validate(arguments)
-        if action.owner == "device" and run.device._is_cloud:
+        if action.owner == "device" and device._is_cloud:
             if issue := _cloud_arguments(name, validated):
                 return ActionResult(False, issue)
+        provider = device.state._resolved_provider
         for x, y in coordinate_pairs(validated):
             if validated[x] is not None and validated[y] is not None:
+                if ui is None:
+                    return ActionResult(False, "Current screen unavailable")
                 try:
-                    validated[x], validated[y] = check_point(validated[x], validated[y], run)
-                except ValueError as exc:
-                    detail = (
-                        type(exc).__name__ if action.sensitive_parameters else describe_error(exc)
-                    )
-                    return ActionResult(False, detail)
+                    check_point(validated[x], validated[y], ui, provider)
+                except CoordinateError as error:
+                    return ActionResult(False, f"ValueError: {error}")
 
-        # RecordingDevice owns a separate state view. Refreshing the original
-        # view for macro guards cannot retarget a pinned index on this view.
         sensitive = action.sensitive_parameters
         # Base primitive recorders do not honor the extension sensitivity flag.
         # Bypass caller-owned recording facades for sensitive native arguments.
-        device = run.device._unwrap() if sensitive and action.owner == "device" else run.device
-        view = RecordingDevice(device, state_provider=run.state_provider)
-        view._extension_state.observers.remove(view._record_extension)
-        view.state._current = run.ui
-        recorder = run.macro_recorder
-        pre_ui = run.ui
-        if recorder is not None and not sensitive:
-            try:
-                pre_ui = await run.device.state.refresh()
-            except Exception:
-                pass
-
+        target = device._unwrap() if sensitive and action.owner == "device" else device
+        view = DeviceWrapper(target, state_provider=provider)
+        view.state._current = ui
+        resolved = action_target(action.name, validated, ui)
+        cached = _cached_ui(view, target, target._unwrap()) if resolved else ()
         if action.owner == "device":
-            method = next(vars(cls)[name] for cls in type(view).__mro__ if name in vars(cls))
             with secret_scope(*(str(validated[key]) for key in sensitive)):
-                result = action.validate_result(await method.__get__(view)(**validated))
-            if recorder is not None and not sensitive and result is not False:
-                for primitive in view.recorded_actions:
-                    recorder.record_action(dict(primitive), pre_ui=pre_ui)
+                result = action.validate_result(await getattr(view, name)(**validated))
         else:
             result = await view.actions.call(action.name, validated, audience="operator")
-            if recorder is not None and not sensitive:
-                recorder.record_action(
-                    {
-                        "action_type": "extension_call",
-                        "name": action.name,
-                        "arguments": arguments,
-                        "ok": result is not False,
-                    },
-                    pre_ui=pre_ui,
-                )
-        return ActionResult(result is not False, f"{name} {arguments} → {result!r}")
-    except Exception as exc:
-        return ActionResult(False, type(exc).__name__)
+            _protect_extension_result(view, action, result, redactor)
+        if resolved is not None and result is not False:
+            summary = _target_summary(name, resolved, cached, redactor)
+        else:
+            summary = f"{name} {arguments}" if arguments else name
+        if result is not None:
+            summary += f" → {result!r}"
+        return ActionResult(result is not False, summary)
+    except Exception as error:
+        return ActionResult(False, tool_error_summary(error))
 
 
-@tool
-async def wait(run: Run) -> ActionResult:
-    """Wait for the configured duration."""
-    action = run.device.actions.get("device.wait")
-    return await _invoke_device(run, action, {"seconds": run.tool_config.wait_duration})
+def _protect_extension_result(
+    device: Device, action: Action, result: object, redactor: Redactor
+) -> None:
+    # Base declares sensitive inputs, but the mailbox and number result schemas
+    # use ordinary strings. Register these values without altering model memory.
+    extension = device.extensions.get(action.owner)
+    method = action.name.rsplit(".", 1)[-1]
+    match extension, method, result:
+        case (Mailbox() | PhoneNumber()), "wait_for_code", str() as code:
+            redactor.add(code)
+        case PhoneNumber(), "messages", _:
+            match action.serialize(result):
+                case list() as messages:
+                    for message in messages:
+                        match message:
+                            case {"body": str() as body}:
+                                redactor.add(body)
+                                for code in _SMS_CODE.findall(body):
+                                    redactor.add(code)
+
+
+def _cached_ui(*devices: Device) -> tuple[tuple[Device, UIState | None], ...]:
+    return tuple((device, device.state._current) for device in dict.fromkeys(devices))
+
+
+def _target_summary(
+    name: str,
+    target: ActionTarget,
+    cached: tuple[tuple[Device, UIState | None], ...],
+    redactor: Redactor,
+) -> str:
+    verb = _ACTION_VERBS.get(name.rsplit("__", 1)[-1], name.replace("_", " "))
+    label = target.label(mask=redactor.text)
+    if target.index is not None:
+        label = f"[{target.index}] {label}"
+    elif target.node is not None:
+        label = f"{target.point} {label}"
+    summary = f"{verb} {label}"
+    for device, previous in cached:
+        current = device.state._current
+        if current is not None and current is not previous:
+            match current.phone_state.get("focusedElement"):
+                case dict() as focused if focused:
+                    return f"{summary} · focused: {element_label(focused, mask=redactor.text, focus=focused)}"
+    return summary
 
 
 def build_registry(
-    run: Run, tools: Sequence[Tool], output_model: type[BaseModel] | None
+    device: Device,
+    tools: Sequence[Tool],
+    tool_config: ToolsConfig,
+    output_model: type[BaseModel] | None = None,
+    decision_config: DecisionConfig | None = None,
 ) -> "ToolRegistry":
-    disabled = set(run.tool_config.exclude or ())
+    disabled = set(tool_config.exclude or ())
+
+    @tool
+    async def wait(phone: Device) -> None:
+        """Wait for the configured duration."""
+        await phone.wait(tool_config.wait_duration)
 
     def project(action: Action) -> Action | None:
         name = model_name(action)
@@ -213,45 +277,66 @@ def build_registry(
             )
         return replace(action, description=description)
 
-    run_tools = [member.compile(run) for member in tools]
-    if not any(action.name == "complete" for action in run_tools):
-        run_tools.append(complete.compile(run))
-    run_tools.append(wait.compile(run))
+    declared = [(member.compile(), member) for member in tools]
+    if not any(action.name == "complete" for action, _ in declared):
+        declared.append((complete.compile(), complete))
+    declared.append((wait.compile(), wait))
     members: list[BaseTool] = []
     seen: set[str] = set()
-    for from_device, actions in (
-        (True, _device_entries(run.device, run.state_provider.capabilities)),
-        (False, run_tools),
-    ):
-        for action in actions:
-            name = model_name(action)
-            if name in seen:
-                raise ValueError(f"Duplicate tool name: {name}")
-            seen.add(name)
-            exposed = project(action)
-            if exposed is not None:
-                members.append(_route(action, exposed, from_device, output_model, run))
-    return ToolRegistry(run, tuple(members))
+    redactor = _ToolRedactor()
+    device_actions = _device_entries(device, device.state._resolved_provider.capabilities)
+    for action, declaration in [*((action, None) for action in device_actions), *declared]:
+        name = model_name(action)
+        if name in seen:
+            raise ValueError(f"Duplicate tool name: {name}")
+        seen.add(name)
+        exposed = project(action)
+        if exposed is not None:
+            members.append(_route(action, exposed, declaration, output_model, device, redactor))
+    return ToolRegistry(
+        device, tool_config, decision_config or DecisionConfig(), tuple(members), redactor=redactor
+    )
 
 
 def _route(
     action: Action,
     exposed: Action,
-    from_device: bool,
+    declaration: Tool | None,
     output: type[BaseModel] | None,
-    run: Run,
+    device: Device,
+    redactor: Redactor,
 ) -> RegistryTool:
-    async def invoke(**args: Any) -> object:
-        with observe_secret_inputs(run.device):
-            if from_device:
-                return await _invoke_device(run, action, args)
-            return action.validate_result(await action._call(**action.validate(args)))
+    async def invoke(ctx: Context[AgentState], args: dict[str, Any]) -> object:
+        if declaration is None:
+            state = await ctx.store.get_state()
+            return await _invoke_device(
+                device, state.current.ui if state.current else None, action, args, redactor
+            )
+        validated = action.validate(args)
+        ui = None
+        if "index" in validated or {"x", "y"} <= validated.keys():
+            state = await ctx.store.get_state()
+            ui = state.current.ui if state.current else None
+        targeted = action_target(action.name, validated, ui)
+        cached = _cached_ui(device, device._unwrap()) if targeted else ()
+        with secret_scope(*(str(validated[key]) for key in action.sensitive_parameters)):
+            result = action.validate_result(await declaration.invoke(ctx, device, validated))
+        if targeted is not None:
+            summary = _target_summary(model_name(action), targeted, cached, redactor)
+            match result:
+                case None:
+                    return ActionResult(True, summary)
+                case ActionResult(success=True, summary=detail):
+                    return replace(result, summary=f"{summary} → {detail}" if detail else summary)
+                case str() as detail:
+                    return ActionResult(True, f"{summary} → {detail}" if detail else summary)
+        return result
 
     schema = action._arguments
     if not issubclass(schema, BaseModel):
         raise TypeError("Action requires a Pydantic arguments model")
     if exposed.name == "complete":
-        fields: dict[str, Any] = {"success": (bool, ...), "message": (str, ...)}
+        fields: dict[str, Any] = {"success": (bool, ...), "message": (str | None, ...)}
         if output:
             fields["output"] = (output | None, None)
         schema = create_model(
@@ -270,8 +355,8 @@ def _route(
             },
         )
     source = (
-        Source.RUN
-        if not from_device
+        Source.AGENT
+        if declaration is not None
         else (Source.DEVICE if action.owner == "device" else f"extension:{action.owner}")
     )
     return RegistryTool(
@@ -287,13 +372,33 @@ def _route(
     )
 
 
+class _ToolRedactor(Redactor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.originals: set[str] = set()
+
+    def add(self, value: object) -> None:
+        # Redactor.add recurses through containers via this same method.
+        match value:
+            case str() | int() | float() | bool() if str(value):
+                self.originals.add(str(value))
+        super().add(value)
+
+
 @dataclass(frozen=True)
 class ToolRegistry:
-    """Run-owned actions with transient selector projections."""
+    """Device and custom actions with model-facing selector projections."""
 
-    run: Run = field(repr=False, compare=False)
+    device: Device = field(repr=False, compare=False)
+    config: ToolsConfig = field(default_factory=ToolsConfig)
+    decision_config: DecisionConfig = field(default_factory=DecisionConfig)
     _members: tuple[BaseTool, ...] = ()
     by_name: Mapping[str, BaseTool] = field(init=False, repr=False)
+    redactor: _ToolRedactor = field(default_factory=_ToolRedactor, repr=False, compare=False)
+
+    @property
+    def protected_values(self) -> frozenset[str]:
+        return frozenset(self.redactor.originals)
 
     def __post_init__(self) -> None:
         names: dict[str, BaseTool] = {}
@@ -321,6 +426,69 @@ class ToolRegistry:
         return tuple(member for name, member in members.items() if name not in exclude)
 
     async def atomic_tools(
-        self, exclude: Collection[str] = (), include: Sequence[BaseTool] = ()
+        self,
+        exclude: Collection[str] = (),
+        ui: UIState | None = None,
+        goal: str = "",
+        include: Sequence[BaseTool] = (),
     ) -> tuple[AtomicTool, ...]:
-        return await expand_atomic_tools(self.tools(exclude, include), self.run)
+        return await expand_atomic_tools(
+            self.tools(exclude, include), self.device, ui, goal, self.config, self.decision_config
+        )
+
+    def validate(self, call: ToolSelection) -> str | None:
+        """Check dispatch arguments without executing the action."""
+        name, arguments = call.tool_name, call.tool_kwargs
+        match self.by_name.get(name):
+            case RegistryTool(action=action) if action is not None:
+                # Typed completion output is checked during execution against its own retry budget.
+                schema = cast(type[BaseModel], action._arguments)
+            case _:
+                return f"Unavailable tool: {name}"
+        if arguments.keys() - schema.model_fields.keys():
+            return f"Unexpected arguments for {name}."
+        try:
+            schema.model_validate_json(json.dumps(arguments), strict=True)
+        except ValidationError as error:
+            return f"Invalid arguments for {name}: {tool_error_summary(error, schema, self.redactor.add)}"
+        except (TypeError, ValueError):
+            return f"Arguments for {name} must be JSON."
+        return None
+
+    def resolve(self, call: ToolSelection) -> ToolSelection:
+        """Keep the call id and record the base identity behind its model-facing name."""
+        match self.by_name.get(call.tool_name):
+            case RegistryTool(action=action) if action is not None:
+                if call.tool_name == "wait":
+                    return call.model_copy(
+                        update={"tool_kwargs": {"seconds": self.config.wait_duration}}
+                    )
+                return call.model_copy(
+                    update={
+                        "tool_name": (
+                            action.name.removeprefix("device.")
+                            if action.owner == "device"
+                            else action.name
+                        )
+                    }
+                )
+            case _:
+                return call
+
+    async def execute(self, call: ToolSelection, ctx: Context[AgentState]) -> object:
+        member = self.by_name.get(call.tool_name)
+        match member:
+            case RegistryTool():
+                self.protect(call)
+                with observe_vault(self.device, self.redactor):
+                    return await member.execute(ctx, call.tool_kwargs)
+            case _:
+                raise ValueError(f"Unknown tool: {call.tool_name}")
+
+    def protect(self, call: ToolSelection) -> None:
+        match self.by_name.get(call.tool_name):
+            case RegistryTool(action=action) if action is not None:
+                for key in action.sensitive_parameters & call.tool_kwargs.keys():
+                    value = call.tool_kwargs[key]
+                    if value is not None and str(value):
+                        self.redactor.add(value)

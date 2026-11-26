@@ -67,18 +67,23 @@ def test_stop_requires_yes_and_handles_finished(cloud, monkeypatch):
     assert not calls
 
 
-def test_stop_running(cloud, monkeypatch):
+@pytest.mark.parametrize(
+    "cancelled,exit_code,message",
+    [(True, 0, "Stop requested"), (False, 1, "Error: Task abc was not stopped")],
+)
+def test_stop_running(cloud, monkeypatch, cancelled, exit_code, message):
     async def status(client, task_id, billing):
         return TaskGetStatusResponse(status="running", terminal=False)
 
     async def stop(client, task_id, billing):
         assert task_id == "abc" and billing == Billing.NO_COMMERCE
-        return TaskStopResponse(cancelled=True)
+        return TaskStopResponse(cancelled=cancelled)
 
     monkeypatch.setattr(tasks, "status", status)
     monkeypatch.setattr(tasks, "stop", stop)
     result = CliRunner().invoke(agent, ["task", "stop", "abc", "--yes"])
-    assert result.exit_code == 0 and "stop" in result.output.lower()
+    assert result.exit_code == exit_code, result.output
+    assert message in result.output
 
 
 def test_trajectory_json_and_download(cloud, monkeypatch, tmp_path):

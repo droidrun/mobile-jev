@@ -6,7 +6,7 @@ from typing import Unpack
 import click
 from mobilerun.macro.cli.replay import ReplayOptions, replay_options, run_replay
 
-from mobilerun_agents.config.loader import ConfigLoader
+from mobilerun_agents.cli.agent.configuration import load_config
 from mobilerun_agents.config.user_config import LLMProfile
 from mobilerun_agents.macro_agent import MacroAgentOperator
 from mobilerun_agents.macro_agent.paths import resolve_macro_target
@@ -38,7 +38,10 @@ def replay_handoff(
     """Also used by base's `macro replay --on-mismatch agent` plugin hook."""
     if bool(provider) != bool(model):
         raise click.UsageError("Provide both --provider and --model, or neither")
-    config = ConfigLoader.load()
+    if options["dry_run"]:
+        run_replay(MacroAgentOperator, **options)
+        return
+    config = load_config()
     if provider and model:
         config = config.model_copy(deep=True)
         config.default_setup = None

@@ -4,8 +4,10 @@ from unittest.mock import Mock
 
 import pytest
 from click.testing import CliRunner
+from mobilerun.cli.devices.base.options import DeviceTarget
 
 from mobilerun_agents.cli.macro_agent.group import macro_agent
+from mobilerun_agents.config.loader import ConfigLoader
 from mobilerun_agents.macro_agent import MacroAgentOperator
 
 
@@ -51,3 +53,28 @@ def test_dry_run_resolves_bare_run_id(tmp_path, monkeypatch):
     result = CliRunner().invoke(macro_agent, ["replay", "run-example", "--dry-run"])
     assert result.exit_code == 0, result.exception
     assert result.output == "1: wait duration=0\n"
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_invalid_agent_config_only_blocks_live_replay(tmp_path, monkeypatch, dry_run):
+    monkeypatch.setattr(DeviceTarget, "open", lambda target: pytest.fail("device opened"))
+    config = ConfigLoader.get_user_config_path()
+    config.parent.mkdir(parents=True)
+    config.write_text("profiles: [", encoding="utf-8")
+    macro = tmp_path / "macro.json"
+    macro.write_text(
+        json.dumps(
+            {"macro_schema_version": "2.0", "actions": [{"action_type": "wait", "duration": 0}]}
+        ),
+        encoding="utf-8",
+    )
+
+    args = [str(macro), "--dry-run"] if dry_run else [str(macro), "emulator-5554"]
+    result = CliRunner().invoke(macro_agent, ["replay", *args])
+
+    if dry_run:
+        assert result.exit_code == 0, result.exception
+        assert result.output == "1: wait duration=0\n"
+    else:
+        assert result.exit_code == 1
+        assert result.output == "Error: Invalid agents.yaml syntax\n"

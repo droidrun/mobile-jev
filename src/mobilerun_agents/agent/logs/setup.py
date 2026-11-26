@@ -7,14 +7,14 @@ from contextlib import ExitStack
 import click
 from mobilerun.logs.handlers import CLILogHandler
 
-from .diagnostics import private_values
-
 
 class _AgentHandler(CLILogHandler):
     def emit(self, record: logging.LogRecord) -> None:
         if record.__dict__.get("agent_result"):
             # Keep just the final answer on stdout for shell callers.
             click.echo(self.format(record))
+        elif record.__dict__.get("agent_memory"):
+            self.console.print(self.format(record), soft_wrap=True, highlight=False, markup=False)
         else:
             super().emit(record)
 
@@ -29,8 +29,6 @@ def _shared_log(record: logging.LogRecord) -> bool:
 def configure_cli_logging(debug: bool) -> None:
     """Enable agent progress, independently of base transport verbosity."""
     restore = ExitStack()
-    token = private_values.set(set() if debug else None)
-    restore.callback(private_values.reset, token)
     context = click.get_current_context(silent=True)
     if context:
         context.call_on_close(restore.close)

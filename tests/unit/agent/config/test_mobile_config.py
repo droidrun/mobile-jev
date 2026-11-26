@@ -5,7 +5,7 @@ from pydantic import ValidationError
 
 from mobilerun_agents.agent.action_selector.llm.models import MODELS
 from mobilerun_agents.config.loader import ConfigLoader
-from mobilerun_agents.config.user_config import PROVIDER_KINDS, MobileConfig, OldConfigKeys
+from mobilerun_agents.config.user_config import PROVIDER_KINDS, MobileConfig
 
 
 def test_llm_profiles_validate_the_same_providers_the_loader_supports():
@@ -22,15 +22,6 @@ def test_clean_config_round_trip(tmp_path):
     assert config.checkpoints.enabled
     assert config.profiles == {} and config.setups == {} and config.default_setup is None
     assert MobileConfig.model_validate(config.model_dump(mode="json")) == config
-
-
-def test_rejects_removed_checkpoints_folder_with_replacement(tmp_path):
-    path = tmp_path / "agents.yaml"
-    path.write_text("checkpoints: {enabled: true, folder: old-runs}\n")
-    with pytest.raises(
-        OldConfigKeys, match=r"old keys.*checkpoints\.folder.*MOBILERUN_AGENT_RUNS_DIR"
-    ):
-        ConfigLoader.load(str(path))
 
 
 def test_run_budgets():

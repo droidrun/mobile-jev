@@ -10,6 +10,6 @@
 - `consumer.py` — `RunAnalytics` and product events.
 - `tracing.py` — run-scoped OpenInference tracing and exporters.
 
-**Examples:** `analytics = RunAnalytics(config.analytics, run_id)`; `analytics.on_observe(snapshot)` tracks package and activity changes when enabled.
+**Examples:** `analytics = RunAnalytics(config.analytics, run_id)`; `analytics.on_observe(package, activity, step)` tracks package and activity changes when enabled. End the run with `await analytics.finish(success, steps)`.
 
-**Depends on / used by:** Uses configuration, snapshots and core results. The operator forwards observations and closes telemetry at the end of a run.
+**Depends on / used by:** Uses agent and base telemetry settings. The operator forwards package, activity and step data and closes telemetry at the end of a run.

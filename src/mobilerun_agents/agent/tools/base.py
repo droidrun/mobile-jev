@@ -4,16 +4,17 @@ import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from enum import Enum
-from types import MethodType
-from typing import Any, get_type_hints, overload
+from functools import wraps
+from typing import Any, get_origin, get_type_hints, overload
 
 from llama_index.core.tools import ToolOutput
 from llama_index.core.tools.types import AsyncBaseTool
+from mobilerun.core.devices import Device
 from mobilerun.core.extensions import Action
 from mobilerun.core.extensions.actions import Declaration
+from workflows import Context
 
-from mobilerun_agents.agent.run import Run
-from mobilerun_agents.config.prompts import render_prompt
+from mobilerun_agents.agent.workflows.core.state import AgentState
 
 from .helpers.usage import IndexedToolMetadata
 
@@ -23,12 +24,28 @@ class Tool:
     function: Callable[..., Awaitable[Any]]
     declaration: Declaration
 
-    async def __call__(self, run: Run, *args: Any, **kwargs: Any) -> Any:
-        return await self.function(run, *args, **kwargs)
+    injected: dict[str, str]
 
-    def compile(self, run: Run) -> Action:
+    async def invoke(
+        self, ctx: Context[AgentState], device: Device, arguments: dict[str, Any]
+    ) -> Any:
+        resources = {"context": ctx, "device": device}
+        return await self.function(
+            **arguments, **{name: resources[kind] for name, kind in self.injected.items()}
+        )
+
+    def compile(self) -> Action:
         fn = self.function
-        entry = Action.compile("run", fn.__name__, MethodType(fn, run), self.declaration)
+
+        @wraps(fn)
+        async def projected(**kwargs: Any) -> Any:
+            return await fn(**kwargs)
+
+        signature = inspect.signature(fn)
+        projected.__signature__ = signature.replace(  # type: ignore[attr-defined]
+            parameters=[p for p in signature.parameters.values() if p.name not in self.injected]
+        )
+        entry = Action.compile("agent", fn.__name__, projected, self.declaration)
         return replace(entry, name=fn.__name__)
 
 
@@ -48,23 +65,29 @@ def tool(
     fn: Callable[..., Awaitable[Any]] | None = None,
     sensitive_parameters: frozenset[str] = frozenset(),
 ) -> Tool | Callable[[Callable[..., Awaitable[Any]]], Tool]:
-    """Declare an async tool; its first argument is the current run, never model input."""
+    """Declare an async tool; Context and Device annotations are injected on execution."""
 
     def decorate(function: Callable[..., Awaitable[Any]]) -> Tool:
         if not inspect.iscoroutinefunction(function) or not inspect.getdoc(function):
             raise TypeError("Tools must be async functions with a docstring")
-        params = list(inspect.signature(function).parameters.values())
-        if (
-            not params
-            or params[0].name != "run"
-            or params[0].kind
-            not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-            or get_type_hints(function).get("run") is not Run
-        ):
-            raise TypeError("Tools require run: Run as their first parameter")
+        params = inspect.signature(function).parameters.values()
+        hints = get_type_hints(function)
+        injected = {}
+        for p in params:
+            if p.kind not in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY):
+                raise TypeError("Tool parameters must accept named arguments")
+            annotation = hints.get(p.name)
+            if annotation is Context or get_origin(annotation) is Context:
+                injected[p.name] = "context"
+            elif annotation is Device:
+                injected[p.name] = "device"
         if any(p.name in sensitive_parameters and p.default is not p.empty for p in params):
             raise TypeError("Sensitive tool parameters cannot declare a default")
-        return Tool(function, Declaration(sensitive_parameters=frozenset(sensitive_parameters)))
+        if sensitive_parameters & injected.keys():
+            raise TypeError("Injected tool parameters cannot be marked sensitive")
+        return Tool(
+            function, Declaration(sensitive_parameters=frozenset(sensitive_parameters)), injected
+        )
 
     return decorate if fn is None else decorate(fn)
 
@@ -75,7 +98,6 @@ class ActionResult:
 
     success: bool
     summary: str
-    output_rejected: bool = False
 
     def __str__(self) -> str:
         return self.summary
@@ -84,32 +106,26 @@ class ActionResult:
 @dataclass(frozen=True)
 class Completion:
     success: bool
-    message: str
+    message: str | None
     output: dict[str, object] | None
 
 
 @tool
 async def complete(
-    run: Run, success: bool, message: str, output: dict[str, object] | None = None
+    success: bool, message: str | None, output: dict[str, object] | None = None
 ) -> Completion:
     """Mark the task as complete."""
     return Completion(success, message, output)
 
 
-@tool
-async def delegate(run: Run) -> None:
-    """Ask the delegate model to choose the next action when you need its capabilities."""
-    raise RuntimeError(render_prompt("assets/prompts/tools/action_result.jinja2"))
-
-
 class Source(Enum):
     DEVICE = "device"
-    RUN = "run"
+    AGENT = "agent"
 
 
 @dataclass
 class ActionMetadata(IndexedToolMetadata):
-    source: Source | str = Source.RUN
+    source: Source | str = Source.AGENT
 
 
 class RegistryTool(AsyncBaseTool):
@@ -118,7 +134,7 @@ class RegistryTool(AsyncBaseTool):
     def __init__(
         self,
         metadata: ActionMetadata,
-        invoke: Callable[..., Awaitable[object]],
+        invoke: Callable[[Context[AgentState], dict[str, Any]], Awaitable[object]],
         action: Action | None = None,
     ) -> None:
         self._metadata, self._invoke, self.action = metadata, invoke, action
@@ -128,17 +144,10 @@ class RegistryTool(AsyncBaseTool):
         return replace(self._metadata)
 
     def call(self, *args: Any, **kwargs: Any) -> ToolOutput:
-        raise TypeError("Agent tools are async: use acall")
+        raise TypeError("Use ToolRegistry.execute with a workflow context")
 
     async def acall(self, *args: Any, **kwargs: Any) -> ToolOutput:
-        if args:
-            raise TypeError("Tool arguments must be named")
-        result = await self._invoke(**kwargs)
-        return ToolOutput(
-            tool_name=self.metadata.get_name(),
-            raw_input={},
-            raw_output=result,
-            content=(
-                "[REDACTED]" if self.action and self.action.sensitive_parameters else str(result)
-            ),
-        )
+        raise TypeError("Use ToolRegistry.execute with a workflow context")
+
+    async def execute(self, ctx: Context[AgentState], args: dict[str, Any]) -> object:
+        return await self._invoke(ctx, args)

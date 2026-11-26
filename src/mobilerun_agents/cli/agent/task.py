@@ -76,10 +76,9 @@ async def stop(task_id: str, yes: bool) -> None:
             click.echo(f"Task {task_id} is already finished ({state.status}).")
             return
         result = await tasks.stop(client, task_id, billing=Billing.NO_COMMERCE)
-    if result.cancelled:
-        render.success(f"Stop requested for task {task_id}")
-    else:
-        render.warn(f"Task {task_id} was not stopped; check its status.")
+    if not result.cancelled:
+        raise click.ClickException(f"Task {task_id} was not stopped; check its status.")
+    render.success(f"Stop requested for task {task_id}")
 
 
 @task.command()

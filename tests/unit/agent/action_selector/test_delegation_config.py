@@ -41,8 +41,8 @@ def test_typesafe_primary_builds_only_delegate_llm(monkeypatch):
     assert calls == [("openai", "helper-model")]
     assert type(selector) is DelegatingSelector
     assert type(selector.primary) is DecisionSelector
-    assert selector.shared_llm is shared
-    assert selector.min_confidence == 0.8
+    assert selector.delegate.llm is shared
+    assert selector.primary.min_confidence == 0.8
 
 
 def test_unset_default_uses_first_profile_as_straight_agent(monkeypatch):
@@ -95,7 +95,7 @@ def test_default_jev_and_llm_use_profile_vision_or_run_override(monkeypatch, rol
     assert type(selector.primary) is DecisionSelector
     assert type(selector.primary.model) is TypeSafeDecisionModel
     assert type(selector.delegate) is LlamaIndexLLMSelector
-    assert selector.min_confidence == 0.7
+    assert selector.primary.min_confidence == config.agent.decision.min_confidence
     assert (selector.primary.vision, selector.delegate.vision) == (vision or "on", vision or "off")
     assert path.read_bytes() == saved and b"vision:" not in saved
     if role == "executor":

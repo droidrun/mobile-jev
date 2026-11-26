@@ -43,7 +43,7 @@ exclude = ["/src/mobilerun_agents/README.md"]
 sources = ["src"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/pyproject.toml", "/README.md", "/CONTRIBUTING.md", "/AGENTS.md", "/LICENSE", "/docs", "/scripts", "/tests", "/uv.lock"]
+include = ["/src", "/pyproject.toml", "/README.md", "/CONTRIBUTING.md", "/AGENTS.md", "/LICENSE", "/scripts", "/tests", "/uv.lock"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

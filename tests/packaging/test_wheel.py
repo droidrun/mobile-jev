@@ -84,6 +84,7 @@ def test_actual_wheel_and_sdist_resources(tmp_path):
             "errors",
             "assets",
             "__init__.py",
+            "py.typed",
         }
         assert packaged == expected
         assert "mobilerun/__init__.py" not in names

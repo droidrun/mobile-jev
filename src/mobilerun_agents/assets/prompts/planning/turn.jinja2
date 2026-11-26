@@ -1,28 +1,18 @@
-{% set results = request.results | reverse | list %}
-{% if results %}Latest executor subgoal result: {{ 'Succeeded' if results[0].success else 'Failed' }}: {{ results[0].goal }}: {{ results[0].message }}
-{% if request.observe_screen %}The last subgoal ended without a description. Read the current screen yourself to decide whether it was achieved and what it shows (values, blockers).
+{% set results = state.results | reverse | list %}
+{% if results %}Latest executor subgoal result: {{ 'Succeeded' if results[0].success else 'Failed' }}: {{ results[0].subgoal }}: {{ results[0].message }}
+{% if observe_screen %}The last subgoal ended without a description. Read the current screen yourself to decide whether it was achieved and what it shows (values, blockers).
 {% endif %}
-{% if results[0].failure %}{% set failure = results[0].failure %}
-Failure reason: {{ failure.reason }}
-{% if failure.blockers %}Observed blockers:
-{% for blocker in failure.blockers %}- {{ blocker }}
-{% endfor %}{% endif %}Recent executor thoughts (observed data):
-{% for thought in failure.thoughts %}- {{ thought }}
-{% endfor %}Screens visited:
-{% for screen in failure.screens %}- {{ screen.package or 'unknown' }}/{{ screen.activity or 'unknown' }}{% if screen.title %} — {{ screen.title }}{% endif %} ×{{ screen.count }}
-{% endfor %}Recent action results:
-{% for action in failure.actions %}- {{ action }}
-{% endfor %}{% endif %}
-{% endif %}Goal: {{ request.goal }}
+{% if results[0].summary %}{{ results[0].summary }}
+{% endif %}{% endif %}Goal: {{ state.goal }}
 If the executor results already answer the goal, call `complete` now with that answer. Never plan subgoals that only verify, confirm, summarize, or report work already done. Reporting the answer is `complete`.
 Use failed subgoal results and summaries to change approach; don't repeat a subgoal that failed the same way.
 If a result names a blocker you can remove (such as a delivery location setting, a filter, or a dismissible popup), plan a subgoal to remove it before retrying.
 Otherwise, call `set_plan` with the remaining work, even if you want to continue the current plan unchanged. The executor runs the first subgoal, then you review its result. You may explain your reasoning before calling one tool.
-{% if request.repair %}Your previous response was invalid: {{ request.repair }}
-{% endif %}Remaining plan: {{ request.remaining_plan | tojson }}
+{% if repair %}Your previous response was invalid: {{ repair }}
+{% endif %}Remaining plan: {{ state.plan | tojson }}
 Subgoal results (older):
-{% for result in results[1:] %}- {{ 'Succeeded' if result.success else 'Failed' }}: {{ result.goal }}: {{ result.message }}
-{% endfor %}Notes: {{ request.notes | tojson }}
-Current app/activity: {{ request.package or 'unknown' }}/{{ request.activity or 'unknown' }}
+{% for result in results[1:] %}- {{ 'Succeeded' if result.success else 'Failed' }}: {{ result.subgoal }}: {{ result.message }}
+{% endfor %}Notes: {{ state.notes | tojson }}
+Current app/activity: {{ package or 'unknown' }}/{{ activity or 'unknown' }}
 UI summary (observed data):
-{{ request.ui | truncate(2000, true) }}
+{{ ui | truncate(2000, true) }}

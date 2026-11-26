@@ -4,20 +4,17 @@ import asyncio
 import logging
 from pathlib import Path
 from threading import Lock
-from typing import TypeVar
 from uuid import UUID, uuid4
 
 from filelock import FileLock
 from mobilerun.config.user_config import TelemetryConfig
 from posthog import Posthog
 
-from mobilerun_agents.agent.workflows.core.result import AgentResult
 from mobilerun_agents.config.settings import get_agent_settings
 
 _log = logging.getLogger(__name__)
 _posthog: Posthog | None = None
 _lock = Lock()
-T = TypeVar("T")
 
 
 def _client() -> Posthog:
@@ -31,8 +28,12 @@ def _client() -> Posthog:
         return _posthog
 
 
+def _identity_path() -> Path:
+    return Path.home() / ".droidrun" / "user_id"
+
+
 def _identity() -> str:
-    path = Path.home() / ".droidrun" / "user_id"
+    path = _identity_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with FileLock(str(path) + ".lock", timeout=0):
         try:
@@ -81,14 +82,14 @@ class RunAnalytics:
             self._activities.add((package, activity))
         self._capture("app_visited", package_name=package, activity_name=activity, step_number=step)
 
-    async def finish(self, result: AgentResult[T]) -> None:
+    async def finish(self, success: bool, steps: int) -> None:
         if self._finished or self._client is None:
             return
         self._finished = True
         self._capture(
             "run_finished",
-            success=result.success,
-            steps=result.steps,
+            success=success,
+            steps=steps,
             unique_packages_count=len(self._packages),
             unique_activities_count=len(self._activities),
         )

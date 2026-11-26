@@ -2,7 +2,6 @@ import unittest
 
 from mobilerun_agents.agent.action_selector.llm.parsing import (
     ToolCallParseStatus,
-    extract_add_memory,
     parse_tool_calls_detailed,
 )
 
@@ -619,53 +618,6 @@ The task is done.
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].name, "complete")
         self.assertEqual(calls[0].parameters, {"success": "true", "message": "Done"})
-
-    def test_extract_add_memory_basic(self):
-        text = "I see the email.\n<add_memory>Meeting at 3pm Thursday Room 204</add_memory>\nNow I'll click reply."
-        result = extract_add_memory(text)
-        self.assertEqual(result, "Meeting at 3pm Thursday Room 204")
-
-    def test_extract_add_memory_empty(self):
-        text = "Just a thought with no memory tag."
-        result = extract_add_memory(text)
-        self.assertEqual(result, "")
-
-    def test_extract_add_memory_whitespace(self):
-        text = "<add_memory>  spaced content  </add_memory>"
-        result = extract_add_memory(text)
-        self.assertEqual(result, "spaced content")
-
-    def test_extract_add_memory_multiline(self):
-        text = """Some thought here.
-<add_memory>
-Line 1: Meeting at 3pm
-Line 2: Room 204
-</add_memory>
-Tool calls follow."""
-        result = extract_add_memory(text)
-        self.assertIn("Meeting at 3pm", result)
-        self.assertIn("Room 204", result)
-
-    def test_extract_add_memory_with_tool_calls(self):
-        text = """I see the password field.
-<add_memory>Username is admin@test.com</add_memory>
-<function_calls>
-<invoke name="click"><parameter name="index">5</parameter></invoke>
-</function_calls>"""
-        result = parse_tool_calls_detailed(text)
-        thought, calls = result.thought, result.calls
-        memory = extract_add_memory(thought)
-        self.assertEqual(memory, "Username is admin@test.com")
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0].name, "click")
-
-    def test_extract_add_memory_multiple_blocks(self):
-        text = """I found two important things on this screen.
-<add_memory>User email is a@example.com</add_memory>
-<add_memory>Verification code is 123456</add_memory>"""
-        result = extract_add_memory(text)
-        self.assertIn("User email is a@example.com", result)
-        self.assertIn("Verification code is 123456", result)
 
 
 if __name__ == "__main__":

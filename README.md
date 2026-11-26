@@ -47,20 +47,22 @@ Export a no-argument subclass of `mobilerun.core.operator.Operator`, or an alrea
 | Planning total budget | 40 (`agent.planning_max_steps`) |
 | Planning subgoal budget | 10 (`agent.planning.subgoal_steps`) |
 | Planner turns | 10 (`agent.planning.max_planner_turns`) |
-| Stuck guard | Exclude an unchanged-screen repeated action after 2 repeats; fail after 4 (`stuck_exclude_after`, `stuck_fail_after`) |
+| Progress guards | Note after 3 identical calls on the same target in a row and stop after 5; note after 3 unchanged-screen steps and stop after 5; note after 3 returns to an already seen screen and stop after 4 |
 | Vision | Profile/provider-dependent; override with `--vision off|on|only` |
 
 ## Saved data and diagnostics
+
+The agent uses four workflow steps: observe → select → act → finish. Planning uses two: plan → execute a child agent, with a fresh memory for each child. The workflow context holds the run state. The device, LlamaIndex memory, tool registry and image store are live resources, not checkpoint data.
 
 Run data is organized by run ID. Empty directory overrides use the defaults.
 
 | Data | Environment override | Default | Layout |
 |---|---|---|---|
-| Run records and checkpoints | `MOBILERUN_AGENT_RUNS_DIR` | `<MOBILERUN_USER_CONFIG_DIR>/runs` | `<runs>/<run_id>/` |
+| Native workflow checkpoint | `MOBILERUN_AGENT_RUNS_DIR` | `<MOBILERUN_USER_CONFIG_DIR>/runs` | `<runs>/<run_id>/context.json` |
 | Screenshots | `MOBILERUN_AGENT_IMAGES_DIR` | `<MOBILERUN_USER_CONFIG_DIR>/images` | `<images>/<run_id>/NNNN.png` |
 
-The screenshot reference in a step snapshot points to its saved image; only the current turn keeps image bytes in memory. When checkpoints are disabled, the run's image directory is deleted at the end. Macros use the base Mobilerun macro directory. Treat run data, screenshots, UI state and macros as private device data.
+With checkpoints enabled, the operator saves the native LlamaIndex context after each step and at completion. It exports a macro from the saved action history into the base Mobilerun macro directory. Step snapshots point to image files; checkpoints don't embed screenshot bytes. When checkpoints are disabled, the image directory is deleted at the end. Treat checkpoints, screenshots and macros as private device data.
 
-Use `mobilerun agent run --debug` (or the root CLI `--debug`) for selector choices, model-call diagnostics, safe run details and tracebacks. Jev decision sidecars are saved with checkpoints; debug output points to their relative paths. Secret values are masked in outputs, not sent masked to the model. Typed text is not secret by default; vault credentials and explicitly sensitive parameters are protected.
+Use `mobilerun --debug agent run …` for selector choices, model-call diagnostics, safe run details and tracebacks. Secret values are masked in outputs, not in model inputs. Typed text is not secret by default; vault credentials and explicitly sensitive parameters are protected.
 
 See [demo instructions](tests/demo/README.md), [contributing](CONTRIBUTING.md), and [MIT license](LICENSE).

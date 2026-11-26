@@ -7,12 +7,12 @@
 **Contents:**
 
 - `__init__.py` — package entry.
-- `memory.py` — `build_memory` and the observation-aware block base.
-- `messages.py` — native action turns and their text projection.
+- `memory.py` — `build_run_memory` and its private SQLite engine. The owner must call `await memory.aclose()` once the workflow has stopped using it.
+- `messages.py` — `remember(memory, call, record)` appends a native action turn using the model-visible call; `text_messages` projects history for text-only models.
 - `blocks/` — `RepeatBlock`, `DeviceContextBlock`, run notes and optional context sources rendered for the model.
 
-**Examples:** The operator includes the goal, explicit notes, live guard feedback, and device context. Add the bundled app cards with `memory: {blocks: [app_cards]}` in the agent config. No extra blocks are enabled by default. A custom Python memory factory can still supply a `RetrieverBlock` with its own retriever.
+**Examples:** Selectors use `await memory.aget(snapshot=state.current, state=state)` to include explicit notes, live repeat feedback and device context. Add the bundled app cards with `memory: {blocks: [app_cards]}` in the agent config. No extra blocks are enabled by default.
 
-Each invocation, including each planning child, creates fresh `Memory`. Steps are stored as an assistant tool call plus its tool result, with a user boundary marker for turn eviction. No separate history field is part of the memory contract. The current screen and screenshot are not copied into chat history; the snapshot supplies current context through `RepeatBlock`, `DeviceContextBlock` and notes. Optional configured blocks such as `app_cards` extend the context. The chat queue gets 80% of `memory.token_limit` (24,000 of 30,000 tokens by default); each overflow flush targets one twelfth of the total budget and extends to a complete turn. Flushed messages remain in the private in-memory SQLite store for the invocation only. Full action records also live in workflow state. The engine hides SQL parameters from host logs. Runs are not resumed after context restore.
+Each invocation, including each planning child, creates fresh `Memory`. A tool call and result are appended together with a user boundary marker for turn eviction. Whether the screen changed is only known at the next observation, so selectors give that feedback with the current screen instead of storing it with the tool result. `RepeatBlock` reads it directly from the action records. The chat queue gets 80% of `memory.token_limit` (24,000 of 30,000 tokens by default), counting tool arguments. Overflow targets a 2,500-token flush at the default budget and evicts complete turns. Archived messages stay in the private in-memory SQLite store for the invocation only. Full action records remain in workflow state. The SQL engine never sends chat rows or bound arguments to host debug handlers.
 
 **Depends on / used by:** Uses LlamaIndex memory, typed config and action records. The operator supplies memory to workflows; selectors see the assembled context.

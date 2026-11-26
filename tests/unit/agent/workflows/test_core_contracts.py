@@ -1,68 +1,44 @@
+import asyncio
+from unittest.mock import AsyncMock, NonCallableMock
+
+from llama_index.core.llms import ImageBlock
+from llama_index.core.tools import ToolSelection
+from mobilerun.core.state.base import StateProvider
 from mobilerun.core.state.ui_state import UIState
 from pydantic import BaseModel
+from workflows import Context, Workflow, step
+from workflows.events import StartEvent, StopEvent
 
-from mobilerun_agents.agent.action_selector.base import ActionSelection
-from mobilerun_agents.agent.workflows.core.result import AgentResult
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
-from mobilerun_agents.agent.workflows.core.state import ActionRecord, AgentState
-from mobilerun_agents.agent.workflows.events import (
-    Act,
-    Done,
-    Invalid,
-    Observe,
-    Select,
-    StepFinished,
-    UserMessage,
-)
+from mobilerun_agents.agent.workflows.core.state import AgentState
+from mobilerun_agents.config.user_config import ToolsConfig
+
+
+class Probe(Workflow):
+    @step
+    async def start(self, ctx: Context[AgentState], ev: StartEvent) -> StopEvent:
+        return StopEvent()
 
 
 class Answer(BaseModel):
     count: int
 
 
-def test_core_contracts():
-    record = ActionRecord(
-        step=1,
-        name="click",
-        args={"index": 3},
-        ok=True,
-        summary="ok",
-        before=StepSnapshot(
-            goal="count", step=1, ui=UIState([], "", "", {}, 0, 0), device_context=[]
-        ),
-    )
-    state = AgentState(goal="count", actions=[record])
-    assert (
-        AgentState.model_validate_json(state.model_dump_json()).model_dump_json()
-        == state.model_dump_json()
-    )
-    result = AgentResult[Answer](
-        success=True, reason="done", answer="three", output=Answer(count=3), steps=1
-    )
-    assert AgentResult[Answer].model_validate_json(result.model_dump_json()) == result
-    snapshot = StepSnapshot(
-        goal="count",
-        step=1,
-        ui=UIState([], "", "", {}, 0, 0),
-        device_context=[],
-    )
-    assert snapshot.fingerprint[1] == "" and Select() is not None
-    assert Act(selection=ActionSelection()).selection.actions == []
-    assert Done(result=result).result.answer == "three"
-    assert Invalid(error="bad").error == "bad"
-    assert StepFinished(action=record).action == record
-    assert UserMessage(text="stop").text == "stop"
-    assert Observe() is not None
+def test_comparison_distinguishes_changes_from_incompatible_observations():
+    ui = UIState([], "", "", {}, 100, 100)
+    first = StepSnapshot(ui=ui, screenshot=ImageBlock(image=b"A"))
+    second = StepSnapshot(ui=ui, screenshot=ImageBlock(image=b"B"))
+    missing = StepSnapshot(ui=ui)
+    tree = StepSnapshot(ui=UIState([{"text": "Settings"}], "", "", {}, 100, 100))
+    assert first.compare(first) is False
+    assert first.compare(second) is True
+    assert first.compare(missing) is None
+    assert first.compare(tree) is None
 
 
-def test_click_uses_observed_tree_not_macro_prestate():
-    import asyncio
-    from unittest.mock import AsyncMock, Mock, NonCallableMock
-
-    from mobilerun.core.state.ui_state import UIState
-
+def test_click_uses_context_observation_not_newer_live_tree():
     from mobilerun_agents.agent.tools.registry import build_registry
-    from tests.unit.device_fixtures import MemoryDevice, tool_run
+    from tests.unit.device_fixtures import MemoryDevice
 
     def tree(bounds):
         return UIState([{"index": 3, "bounds": bounds}], "", "", {}, 200, 200)
@@ -73,38 +49,34 @@ def test_click_uses_observed_tree_not_macro_prestate():
 
     async def run():
         newer = tree("70,80,90,100")
-        recorder = Mock()
         device = Device(supported_operations=frozenset({"tap"}))
-        ctx = tool_run(
-            driver=device,
-            ui=tree("0,10,20,30"),
-            state_provider=NonCallableMock(
-                capabilities={"element_index"}, get_state=AsyncMock(return_value=newer)
-            ),
-            macro_recorder=recorder,
+        provider = NonCallableMock(
+            spec=StateProvider,
+            capabilities={"element_index"},
+            get_state=AsyncMock(return_value=newer),
         )
-        result = (
-            await build_registry(ctx, [], None).by_name["tap_element"].acall(index=3)
-        ).raw_output
+        device._set_state_provider(provider)
+        ctx = Context(Probe())
+        await ctx.store.set_state(AgentState(current=StepSnapshot(ui=tree("0,10,20,30"))))
+        registry = build_registry(device, [], ToolsConfig())
+        result = await registry.execute(
+            ToolSelection(tool_id="tap-1", tool_name="tap_element", tool_kwargs={"index": 3}), ctx
+        )
         assert result.success, result.summary
-        recorder.record_action.assert_called_once_with(
-            {"action_type": "tap", "x": 10, "y": 20}, pre_ui=newer
-        )
+        provider.get_state.assert_not_awaited()
 
     asyncio.run(run())
 
 
 def test_operator_registry_is_filtered_and_describes_bound_actions():
-    import asyncio
     from contextlib import AsyncExitStack
     from types import SimpleNamespace
 
     from mobilerun.core.extensions import Extension, action
 
-    from mobilerun_agents.agent.tools.base import complete, delegate
+    from mobilerun_agents.agent.tools.base import complete
     from mobilerun_agents.agent.tools.registry import build_registry
-    from mobilerun_agents.config.user_config import ToolsConfig
-    from tests.unit.device_fixtures import MemoryDevice, tool_run
+    from tests.unit.device_fixtures import MemoryDevice
 
     class Extra(Extension):
         default_name = "extra"
@@ -120,21 +92,19 @@ def test_operator_registry_is_filtered_and_describes_bound_actions():
             capabilities={"element_index"}, use_normalized=False, requires_coordinate_tools=False
         )
         async with AsyncExitStack() as stack:
-            run = tool_run(
-                driver=device, state_provider=provider, config=ToolsConfig(exclude=["wait"])
-            )
+            device._set_state_provider(provider)
             ext = await Extra().bind(device)
             stack.push_async_callback(ext.unbind)
-            merged = build_registry(run, [complete, delegate], Answer)
+            merged = build_registry(device, [complete], ToolsConfig(exclude=["wait"]), Answer)
             registry = merged.by_name
             assert {
                 "tap",
                 "tap_element",
                 "complete",
-                "delegate",
                 "extra__ping",
                 "wait",
             } <= registry.keys()
+            assert "delegate" not in registry
             assert all(
                 a.metadata.description.strip()
                 and a.metadata.get_parameters_dict()["type"] == "object"
@@ -143,7 +113,8 @@ def test_operator_registry_is_filtered_and_describes_bound_actions():
             props = registry["complete"].metadata.get_parameters_dict()["properties"]
             assert set(props) == {"success", "message", "output"}
             assert props["output"]["properties"]["count"]["type"] == "integer"
-            result = (await registry["extra__ping"].acall()).raw_output
+            call = ToolSelection(tool_id="ping-1", tool_name="extra__ping", tool_kwargs={})
+            result = await merged.execute(call, Context(Probe()))
             assert result.success and "ready" in result.summary
         assert not device.extensions
 

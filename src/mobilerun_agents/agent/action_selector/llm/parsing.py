@@ -102,20 +102,6 @@ def parse_tool_calls_detailed(text: str) -> ToolCallParseResult:
     )
 
 
-_ADD_MEMORY_RE = re.compile(
-    r"<add_memory(?:\s+[^>]*)?>(.*?)</add_memory>",
-    re.DOTALL,
-)
-
-
-def extract_add_memory(text: str) -> str:
-    """Extract and combine content from all ``<add_memory>`` tags in LLM response text."""
-    matches = _ADD_MEMORY_RE.findall(text)
-    if not matches:
-        return ""
-    return "\n".join(m.strip() for m in matches if m.strip())
-
-
 def _parse_tool_call_block(block: str) -> List[ToolCall]:
     block = _sanitize_param_content(block)
     # Comments and processing instructions are dropped by the XML parser,
@@ -274,7 +260,7 @@ def _wire_argument(
 
 
 def coerce_arguments(
-    schema: Mapping[str, Any], raw: Mapping[str, JSONValue], *, textual: bool = True
+    schema: Mapping[str, Any], raw: Mapping[str, JSONValue], textual: bool = True
 ) -> dict[str, JSONValue]:
     """Decode wire values against this action's advertised argument schema only."""
     properties = schema.get("properties", {})

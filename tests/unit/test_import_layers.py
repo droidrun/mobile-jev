@@ -12,7 +12,7 @@ PREFIX = "mobilerun_agents"
 LAYERS = {
     "agent.operators": 6,
     "agent.workflows.core": 2,
-    "agent.run": 3,
+    "agent.events": 3,
     "agent.workflows": 5,
     **dict.fromkeys(
         (
@@ -62,23 +62,7 @@ def _imports(path):
     module = _module(path)
     package = module if path.name == "__init__.py" else module.rpartition(".")[0]
     tree = ast.parse(path.read_text(), filename=str(path))
-    # Run holds service objects but does not import those services at runtime.
-    type_only = (
-        {
-            descendant
-            for node in tree.body
-            if isinstance(node, ast.If)
-            and isinstance(node.test, ast.Name)
-            and node.test.id == "TYPE_CHECKING"
-            for statement in node.body
-            for descendant in ast.walk(statement)
-        }
-        if module == f"{PREFIX}.agent.run"
-        else set()
-    )
     for node in ast.walk(tree):
-        if node in type_only:
-            continue
         if isinstance(node, ast.Import):
             for alias in node.names:
                 yield node.lineno, alias.name
@@ -150,11 +134,12 @@ def test_external_plugins_have_no_workflow_module():
     "source,code,message",
     [
         ("agent/workflows/core/fake.py", "import mobilerun_agents.agent.memory", "upward import"),
-        ("agent/analytics/fake.py", "from ..workflows.events import Act", "upward import"),
+        ("agent/analytics/fake.py", "from ..workflows.agent import AgentWorkflow", "upward import"),
+        ("agent/action_selector/fake.py", "from ..workflows import resources", "upward import"),
         ("agent/workflows/fake.py", "from ..operators import AgentOperator", "upward import"),
         ("agent/auth/fake.py", "from ..workflows.core import state", "upward import"),
-        ("agent/workflows/core/fake.py", "from ...run import Run", "upward import"),
-        ("agent/run.py", "from .memory.snapshot import StepSnapshot", "upward import"),
+        ("agent/workflows/core/fake.py", "from ...events import Detail", "upward import"),
+        ("agent/events.py", "from .memory import Memory", "upward import"),
         ("agent/tools/atomic/schema.py", "from ..registry import ToolRegistry", "upward import"),
         (
             "agent/tools/atomic/fake.py",
@@ -221,13 +206,14 @@ def test_workflow_can_import_planner_service(tmp_path, monkeypatch):
     [
         ("agent/tools/registry.py", "from .atomic import AtomicTool"),
         ("agent/tools/atomic/schema.py", "from ..helpers import check_point"),
-        ("agent/tools/helpers/coordinates.py", "from ...run import Run"),
+        ("agent/action_selector/base.py", "from ..events import Detail"),
+        ("agent/logs/console.py", "from ..events import Subgoal"),
         ("agent/tools/helpers/elements.py", "from ...workflows.core import state"),
         ("agent/action_selector/base.py", "from ..tools.helpers import coordinate_pairs"),
-        ("agent/run.py", "from .workflows.core import state"),
+        ("agent/events.py", "from .workflows.core import state"),
     ],
 )
-def test_tool_and_run_layers_accept_downward_imports(tmp_path, monkeypatch, source, code):
+def test_service_layers_accept_downward_imports(tmp_path, monkeypatch, source, code):
     path = tmp_path / source
     path.parent.mkdir(parents=True)
     path.write_text(code)

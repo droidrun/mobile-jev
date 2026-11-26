@@ -7,26 +7,20 @@ from jinja2 import StrictUndefined, UndefinedError
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 import mobilerun_agents
-from mobilerun_agents.agent.action_selector import ActionSelector, DelegatingSelector
+from mobilerun_agents.agent.action_selector import DecisionSelector
+from mobilerun_agents.agent.action_selector.decision_model.typesafe import TypeSafeDecisionModel
 from mobilerun_agents.config.prompts import render_prompt
-from mobilerun_agents.config.user_config import DecisionConfig, DelegationConfig
-
-
-class Stub(ActionSelector):
-    async def select(self, run):
-        return None
+from mobilerun_agents.config.user_config import DecisionConfig
 
 
 def test_decision_defaults():
-    assert DelegationConfig().min_confidence == 0.7
     assert DecisionConfig().timeout == 120
     assert DecisionConfig().max_options == 252
 
 
 def test_config_override_changes_threshold():
-    config = DelegationConfig.model_validate({"min_confidence": 0.25})
-    selector = DelegatingSelector(Stub(), Stub(), config=config)
-    assert selector.min_confidence == 0.25
+    config = DecisionConfig.model_validate({"min_confidence": 0.25})
+    assert DecisionSelector(TypeSafeDecisionModel(), config=config).min_confidence == 0.25
 
 
 def test_prompt_loader_rejects_missing_override_variables(tmp_path):
@@ -38,10 +32,10 @@ def test_prompt_loader_rejects_missing_override_variables(tmp_path):
 
 TEMPLATES = {
     "delegate/invalid.jinja2": {"kind": "parameters"},
+    "delegate/option.jinja2": {},
     "decision/system.jinja2": {
         "available_tools": set(),
         "can_type": False,
-        "delegate_can_type": False,
         "can_complete": True,
     },
     "decision/locate.jinja2": {"kind": "instructions"},

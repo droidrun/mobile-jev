@@ -5,6 +5,7 @@ The test names retain the corresponding develop cases where applicable.
 """
 
 import pytest
+from mobilerun.core.state.formatters import IndexedFormatter
 from mobilerun.core.state.ui_state import UIState
 
 from mobilerun_agents.agent.tools.helpers import element_targets
@@ -23,8 +24,7 @@ def node(index, cls, bounds, name="", descendants=None, **extra):
 
 
 def labels(elements):
-    # Public DecisionFormatter supplies counts on every record, including leaves.
-    # Flat legacy fixtures deliberately omit them on every record instead.
+    # Include leaf counts when exercising hierarchical observations.
     if any("descendants" in e for e in elements):
         elements = [{"descendants": 0, **e} for e in elements]
     return [
@@ -77,10 +77,6 @@ def test_empty_field_takes_the_label_beside_it():
 
 
 def test_empty_formatted_field_does_not_report_its_class_as_contents():
-    from mobilerun_agents.agent.action_selector.decision_model.candidates.formatter import (
-        DecisionFormatter,
-    )
-
     tree = {
         "isClickable": False,
         "children": [
@@ -98,7 +94,10 @@ def test_empty_formatted_field_does_not_report_its_class_as_contents():
             },
         ],
     }
-    assert labels(DecisionFormatter().format(tree, {})[2]) == ['Click text field "Name"']
+    choices = labels(IndexedFormatter().format(tree, {})[2])
+    assert [label for label in choices if label.startswith("Click text field")] == [
+        'Click text field "Name"'
+    ]
 
 
 def test_field_keeps_its_label_over_a_cell_with_the_same_bounds():

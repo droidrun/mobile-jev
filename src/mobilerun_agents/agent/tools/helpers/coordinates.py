@@ -2,10 +2,14 @@
 
 from collections.abc import Collection
 
+from mobilerun.core.state.base import StateProvider
 from mobilerun.core.state.ui_state import UIState
 
-from mobilerun_agents.agent.run import Run
 from mobilerun_agents.config.prompts import render_prompt
+
+
+class CoordinateError(ValueError):
+    """A point was rejected by the local, deterministic bounds check."""
 
 
 def coordinate_pairs(fields: Collection[str]) -> tuple[tuple[str, str], ...]:
@@ -24,15 +28,14 @@ def device_dimensions(ui: UIState, screenshot_only: bool) -> tuple[int, int]:
     return ui.screen_width, ui.screen_height
 
 
-def check_point(x: int, y: int, ctx: Run) -> tuple[int, int]:
-    provider = ctx.state_provider
-    if provider.requires_active_contract_for_coords and not ctx.ui.coordinate_contract_active:
-        raise ValueError(
+def check_point(x: int, y: int, ui: UIState, provider: StateProvider) -> tuple[int, int]:
+    if provider.requires_active_contract_for_coords and not ui.coordinate_contract_active:
+        raise CoordinateError(
             render_prompt("assets/prompts/tools/coordinate_error.jinja2", kind="inactive")
         )
-    width, height = device_dimensions(ctx.ui, provider.requires_coordinate_tools)
+    width, height = device_dimensions(ui, provider.requires_coordinate_tools)
     if not (0 <= x < width and 0 <= y < height):
-        raise ValueError(
+        raise CoordinateError(
             render_prompt(
                 "assets/prompts/tools/coordinate_error.jinja2",
                 kind="model_bounds",

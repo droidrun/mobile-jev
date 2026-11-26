@@ -70,15 +70,13 @@ async def _llm_selector(
 ) -> ActionSelector:
     llm = await _profile_llm(config, profile, role, api_key)
     caps = capabilities(profile.provider, profile.model)
-    selector = LlamaIndexLLMSelector(
+    return LlamaIndexLLMSelector(
         llm,
         vision=vision or profile.vision or ("on" if caps.vision else "off"),
         image_limits=caps,
         native_tool_api=caps.tool_call_format,
-        config=config.agent.decision,
+        config=config.agent,
     )
-    selector.debug_label = f"llm:{profile.provider}/{profile.model}"
-    return selector
 
 
 async def _action_selector(
@@ -92,19 +90,16 @@ async def _action_selector(
         case DecisionProfile() as profile:
             await resolve(profile.provider)
             decision = config.agent.decision
-            model = TypeSafeDecisionModel(
-                min_confidence=profile.min_confidence if delegate is None else None, config=decision
+            primary = DecisionSelector(
+                TypeSafeDecisionModel(config=decision),
+                vision or profile.vision or "on",
+                config=decision,
+                min_confidence=profile.min_confidence,
             )
-            primary = DecisionSelector(model, vision or profile.vision or "on", config=decision)
-            primary.debug_label = "jev"
             if delegate is not None:
                 fallback = await _llm_selector(
                     config, _llm_profile(config, delegate), role, vision=vision
                 )
-                if profile.min_confidence is not None:
-                    return DelegatingSelector(
-                        primary, fallback, min_confidence=profile.min_confidence
-                    )
                 return DelegatingSelector(primary, fallback)
             return primary
         case LLMProfile() as profile:
@@ -144,7 +139,7 @@ async def build_setup(name: str | None, vision: Vision | None = None) -> SetupSp
     executor = await _action_selector(
         config, setup.action_profile, "executor", setup.delegate, vision
     )
-    return SetupSpec(planner=LlamaIndexPlanner(llm), executor=executor)
+    return SetupSpec(planner=LlamaIndexPlanner(llm, config.agent), executor=executor)
 
 
 async def default_setup() -> SetupSpec:

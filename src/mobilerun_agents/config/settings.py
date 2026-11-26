@@ -53,18 +53,6 @@ class AgentSettings(_Environment):
     MOBILERUN_FINALIZE_TELEMETRY_SECONDS: float = 10.0
     """Finalize telemetry seconds."""
 
-    MOBILERUN_MACRO_FOCUS_SETTLE_SECONDS: float = 0.5
-    """Macro focus settle seconds."""
-
-    MOBILERUN_MAX_ERROR_CHARS: int = 2000
-    """Max error chars."""
-
-    MOBILERUN_MAX_TITLE_CHARS: int = 100
-    """Max title chars."""
-
-    MOBILERUN_TITLE_SCAN_CHARS: int = 20000
-    """Title scan chars."""
-
     MOBILERUN_OLLAMA_DEFAULT_CONTEXT_WINDOW: int = 32768
     """Ollama default context window."""
 

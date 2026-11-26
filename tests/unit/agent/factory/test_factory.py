@@ -21,13 +21,11 @@ from mobilerun_agents.agent.action_selector.llm.calls import achat
 from mobilerun_agents.agent.action_selector.llm.factory import build_llm, capabilities
 from mobilerun_agents.agent.action_selector.loader import default_setup
 from mobilerun_agents.agent.auth import store
-from mobilerun_agents.agent.tools.base import complete
-from mobilerun_agents.agent.tools.registry import build_registry
 from mobilerun_agents.config.loader import ConfigLoader
 from mobilerun_agents.config.user_config import LLMProfile, MobileConfig, SetupConfig
 from mobilerun_agents.errors import UnknownModel
-from tests.unit.agent.selector_fixtures import selection_run
-from tests.unit.device_fixtures import MemoryDevice, tool_run
+from tests.unit.agent.action_selector.fixtures import Turn
+from tests.unit.device_fixtures import MemoryDevice
 
 
 @pytest.fixture
@@ -79,13 +77,13 @@ async def test_key_order_checks_saved_and_environment(monkeypatch):
         await default_setup()
     assert str(failure.value) == "No model configured. Run: mobilerun agent profiles add --help"
     monkeypatch.setenv("OPENROUTER_API_KEY", "unit-router")
-    assert (await default_setup()).selector.shared_llm.model == "openai/gpt-5-mini"
+    assert (await default_setup()).selector.llm.model == "openai/gpt-5-mini"
     monkeypatch.setenv("GEMINI_API_KEY", "unit-google")
-    assert (await default_setup()).selector.shared_llm.model == "gemini-3.8-flash"
+    assert (await default_setup()).selector.llm.model == "gemini-3.8-flash"
     store.save_key("anthropic", "unit-anthropic")
-    assert (await default_setup()).selector.shared_llm.model == "claude-sonnet-5"
+    assert (await default_setup()).selector.llm.model == "claude-sonnet-5"
     monkeypatch.setenv("OPENAI_API_KEY", "unit-openai")
-    assert (await default_setup()).selector.shared_llm.model == "gpt-5-mini"
+    assert (await default_setup()).selector.llm.model == "gpt-5-mini"
 
 
 @pytest.mark.anyio
@@ -122,8 +120,8 @@ async def test_profile_effort_on_wire(monkeypatch, role, model, override, expect
     built = await default_setup()
     llm = {
         "planner": lambda: built.planner.llm,
-        "agent": lambda: built.selector.shared_llm,
-        "executor": lambda: built.executor.shared_llm,
+        "agent": lambda: built.selector.llm,
+        "executor": lambda: built.executor.llm,
     }[role]()
     await achat(llm, [ChatMessage(content="test")])
     assert captured[0].get("reasoning") == ({"effort": expected} if expected else None)
@@ -152,8 +150,12 @@ async def test_anthropic_without_offline_thinking_capability(monkeypatch):
 
 @pytest.mark.anyio
 async def test_openai_planner_requires_one_native_tool_on_the_wire(monkeypatch):
-    from mobilerun_agents.agent.planner import Plan, PlanningInput
+    from workflows import Context
+
+    from mobilerun_agents.agent.planner import Plan
+    from mobilerun_agents.agent.workflows.core.state import PlanningState
     from mobilerun_agents.config.user_config import AgentConfig
+    from tests.unit.agent.planner.test_llama_index import PlanningProbe
 
     requests = []
 
@@ -172,15 +174,17 @@ async def test_openai_planner_requires_one_native_tool_on_the_wire(monkeypatch):
 
     install_transport(monkeypatch, "openai", respond)
     monkeypatch.setenv("OPENAI_API_KEY", "fake")
-    request = PlanningInput("Check status", AgentConfig(streaming=False))
+    ctx = Context[PlanningState](PlanningProbe())
+    await ctx.store.set_state(PlanningState(goal="Check status"))
     ConfigLoader.save(
         MobileConfig(
+            agent=AgentConfig(streaming=False),
             profiles={"main": LLMProfile(provider="openai", model="gpt-5-mini")},
             setups={"planned": SetupConfig(planner="main", executor="main")},
             default_setup="planned",
         )
     )
-    assert await (await default_setup()).planner.plan(request) == Plan(("Check status",))
+    assert await (await default_setup()).planner.plan(ctx) == Plan(("Check status",))
     [request] = requests
     assert [tool["name"] for tool in request["tools"]] == ["set_plan", "complete"]
     assert request["tool_choice"] == "required" and request["parallel_tool_calls"] is False
@@ -401,23 +405,16 @@ async def test_native_registry_roundtrip(monkeypatch, provider, model, api):
     options = {"max_tokens": 1024, "context_window": 8192} if provider == "gemini" else {}
     llm = await build_llm(provider, model, "fake", temperature=0.2, **options)
     selector = LlamaIndexLLMSelector(llm, native_tool_api=api)
-    run = tool_run(
-        driver=MemoryDevice(
+    turn = Turn(
+        goal="open battery and check status",
+        device=MemoryDevice(
             supported_operations={"tap", "input_text", "swipe", "start_app", "press_button"}
-        )
+        ),
     )
-    run.state_provider.requires_coordinate_tools = False
-    run.state_provider.capabilities = {"element_index", "convert_point"}
-    registry = build_registry(run, [complete], None)
-    result = await selector.select(
-        selection_run(
-            goal="open battery and check status",
-            tools=registry.tools(),
-            parallel_tools=False,
-        )
-    )
-    assert result.parse_error is None and result.actions[0].name == "wait"
-    assert registry.by_name[result.actions[0].name].action.name == "wait"
+    result = await turn.select(selector, parallel_tools=False)
+    [call] = result.calls
+    assert call.tool_name == "wait"
+    assert turn.registry.by_name[call.tool_name].action.name == "wait"
     (body,) = captured
     specs = body["tools"]
     if api == "responses":
@@ -439,7 +436,9 @@ async def test_native_registry_roundtrip(monkeypatch, provider, model, api):
     elif api == "gemini":
         specs = [f for group in specs for f in group["functionDeclarations"]]
     names = {s["name"] for s in specs}
-    assert {"start_app", "press_button", "wait", "complete"} <= names <= registry.by_name.keys()
+    assert (
+        {"start_app", "press_button", "wait", "complete"} <= names <= turn.registry.by_name.keys()
+    )
     assert all(re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", n) for n in names)
     for spec in specs:
         schema = spec.get("parametersJsonSchema") or spec.get("parameters") or spec["input_schema"]
@@ -514,7 +513,7 @@ async def test_gemini_profile_temperature_on_wire(monkeypatch, profile_options):
     )
     with ConfigLoader.override(config):
         selector = (await default_setup()).selector
-    await achat(selector.shared_llm, [ChatMessage(content="test")])
+    await achat(selector.llm, [ChatMessage(content="test")])
     generation = bodies[0]["generationConfig"]
     assert {k: generation[k] for k in generation if k == "temperature"} == profile_options
 

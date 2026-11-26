@@ -7,11 +7,11 @@
 **Contents:**
 
 - `__init__.py` — package marker; import the public API from `mobilerun_agents`.
+- `events.py` — shared raw events written by workflows and selectors and consumed at the output boundary.
 - `operators/` — agent and external plugin operators.
 - `workflows/` — observation, action and completion steps.
 - `action_selector/`, `tools/` — choose an action and dispatch it through the run registry.
-- `run.py` — run-local state, screenshot capture and installed apps, shared by services.
-- `planner/` — the `Planner` contract and the text-only `LlamaIndexPlanner` implementation.
+- `planner/` — the `Planner` contract and `LlamaIndexPlanner` implementation.
 - `memory/`, `checkpoints/` — prompt context and on-disk run evidence.
 - `analytics/`, `logs/`, `auth/` — telemetry, console output and API keys.
 

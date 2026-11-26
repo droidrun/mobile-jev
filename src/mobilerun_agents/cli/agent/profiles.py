@@ -20,13 +20,15 @@ from mobilerun_agents.config.user_config import (
     PROVIDER_KINDS,
     DecisionProfile,
     LLMProfile,
+    MobileConfig,
+    Profile,
     Reasoning,
     Vision,
     profile_validation_message,
 )
 from mobilerun_agents.errors import UnknownModel
 
-from .configuration import PROVIDERS, VISION_MODES, load_config, pick, save_config
+from .configuration import PROVIDERS, VISION_MODES, load_config, pick, update_config
 
 REASONING_LEVELS = ["low", "medium", "high"]
 
@@ -79,7 +81,6 @@ def add(
     min_confidence: float | None,
 ) -> None:
     """Add or replace NAME."""
-    config = load_config()
     if menu.is_interactive() and (
         name is None or provider is None or (PROVIDER_KINDS[provider] == "llm" and model is None)
     ):
@@ -114,13 +115,15 @@ def add(
             return
     if not name or not name.strip() or provider is None:
         raise click.UsageError("Supply NAME and --provider.")
+    profile_name = name
+    profile: Profile
     try:
         if PROVIDER_KINDS[provider] == "decision":
             if model is not None or reasoning is not None or base_url is not None:
                 raise click.UsageError(
                     "Decision model profiles reject --model, --reasoning and --base-url."
                 )
-            config.profiles[name] = DecisionProfile(
+            profile = DecisionProfile(
                 provider=provider, vision=vision, min_confidence=min_confidence
             )
         else:
@@ -132,7 +135,7 @@ def add(
                 # These native adapters use a local model registry. Do not
                 # call providers whose metadata can trigger a network request.
                 asyncio.run(build_llm(provider, model, api_key="offline-validation"))
-            config.profiles[name] = LLMProfile(
+            profile = LLMProfile(
                 provider=provider,
                 model=model,
                 reasoning=reasoning,
@@ -149,8 +152,12 @@ def add(
             raise click.ClickException(message) from None
         field = "HTTP(S) base URL" if base_url is not None else "profile settings"
         raise click.UsageError(f"Invalid {field}.") from None
-    save_config(config)
-    click.echo(f"Profile saved: {name}")
+
+    def edit(config: MobileConfig) -> None:
+        config.profiles[profile_name] = profile
+
+    update_config(edit)
+    click.echo(f"Profile saved: {profile_name}")
 
 
 @profiles.command("list")
@@ -168,9 +175,11 @@ def list_profiles() -> None:
 @click.argument("name")
 def remove(name: str) -> None:
     """Remove NAME; first remove or update setups that reference it."""
-    config = load_config()
-    if name not in config.profiles:
-        raise click.UsageError(f"Unknown profile {name!r}")
-    del config.profiles[name]
-    save_config(config)
+
+    def edit(config: MobileConfig) -> None:
+        if name not in config.profiles:
+            raise click.UsageError(f"Unknown profile {name!r}")
+        del config.profiles[name]
+
+    update_config(edit)
     click.echo(f"Profile removed: {name}")

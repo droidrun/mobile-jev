@@ -2,8 +2,6 @@
 None of the available actions safely advances the goal.
 {% elif kind == 'complete_success' %}
 complete: subgoal done
-{% elif kind == 'delegate' %}
-delegate: hand this step to the LLM (typing text, or nothing listed fits)
 {% else %}
 complete: report failure (blocked or impossible)
 {% endif %}

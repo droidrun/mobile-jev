@@ -3,6 +3,7 @@
 from collections.abc import Collection
 from dataclasses import dataclass
 
+from mobilerun.core.state.ui_state import UIState
 from mobilerun.models.context import JSONValue
 from mobilerun.utils.images import (
     anthropic_resized_size,
@@ -11,7 +12,6 @@ from mobilerun.utils.images import (
     resize_image_to_dimensions_with_grid,
 )
 
-from mobilerun_agents.agent.run import Run
 from mobilerun_agents.agent.tools.helpers import coordinate_pairs, device_dimensions
 
 from .models import Capabilities
@@ -45,9 +45,10 @@ class ModelImage:
                 args[x], args[y] = self.point(args[x], args[y])
 
 
-def prepare_image(run: Run, limits: Capabilities, data: bytes | None) -> ModelImage:
-    ui = run.ui
-    device = device_dimensions(ui, run.state_provider.requires_coordinate_tools)
+def prepare_image(
+    ui: UIState, screenshot_only: bool, limits: Capabilities, data: bytes | None
+) -> ModelImage:
+    device = device_dimensions(ui, screenshot_only)
     if data is None:
         return ModelImage(
             None,

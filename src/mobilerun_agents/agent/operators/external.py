@@ -37,6 +37,9 @@ class ExternalOperator(Operator):
             ) from None
         return operator_class()
 
+    def check(self, device: Device) -> None:
+        self._operator.check(device)
+
     async def execute(
         self,
         device: Device,

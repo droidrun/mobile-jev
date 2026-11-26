@@ -1,102 +1,60 @@
-"""Typed selection contract. Selectors choose actions; they never execute them."""
+"""Selectors choose actions; the workflow alone executes them."""
 
-from __future__ import annotations
-
-import json
+import asyncio
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
-from copy import copy
-from dataclasses import dataclass, field
-from hashlib import blake2b
-from secrets import token_bytes
 from typing import Literal
 
-from llama_index.core.base.llms.types import ChatResponse
-from llama_index.core.llms.llm import LLM
-from mobilerun.models.context import JSONValue
+from llama_index.core.memory import Memory
+from llama_index.core.tools import ToolSelection
+from mobilerun.core.devices import Device
+from pydantic import BaseModel, Field
+from workflows import Context
 
-from mobilerun_agents.agent.action_selector.llm.calls import Usage
-from mobilerun_agents.agent.action_selector.llm.parsing import ToolCall, ToolCallParseResult
-from mobilerun_agents.agent.run import Run
-from mobilerun_agents.config.user_config import Vision as Vision
-
-_SIGNATURE_KEY = token_bytes(32)
-
-
-def action_signature(name: str, args: dict[str, JSONValue]) -> str:
-    """Compare actions without storing their (possibly sensitive) arguments."""
-    data = json.dumps([name, args], sort_keys=True, separators=(",", ":")).encode()
-    return blake2b(data, key=_SIGNATURE_KEY, digest_size=16).hexdigest()
-
-
-def guarded_turn(run: Run, name: str, signature: str) -> Run:
-    turn = copy(run)
-    member = run.registry.by_name.get(name)
-    # A whole tool can be hidden from the LLM only if it has no arguments.
-    if member is not None and not member.metadata.get_parameters_dict().get("properties"):
-        turn.selection_exclude |= {name}
-    turn.avoid_signature = signature
-    return turn
-
+from mobilerun_agents.agent.tools.registry import ToolRegistry
+from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
+from mobilerun_agents.agent.workflows.core.state import AgentState
 
 NativeToolAPI = Literal["responses", "chat_completions", "anthropic", "gemini"]
 
 
-@dataclass
-class ActionCandidate:
-    action: ToolCall
-    description: str
-    point_space: tuple[float, float] | None = None
-    context: str = ""
-
-
-@dataclass
-class ActionSelection:
-    actions: list[ToolCall] = field(default_factory=list)
-    abstained: bool = False
-    thought: str = ""
-    description: str = ""
-    memory_update: str = ""
-    response: ChatResponse | None = None
-    response_text: str = ""
-    usage: Usage | None = None
-    parse_result: ToolCallParseResult | None = None
-    parse_error: str | None = None
-    failure: str | None = None
+class Selection(BaseModel):
+    calls: list[ToolSelection] = Field(default_factory=list)
+    thought: str | None = None
     confidence: float | None = None
-    textual_arguments: bool = False
+    abstained: bool = False
 
 
 class ActionSelector(ABC):
-    debug_label: str = ""
-
-    @property
-    def diagnostic_name(self) -> str:
-        return self.debug_label or type(self).__name__
-
-    abstention_reason: str = "Action selector abstained without a fallback."
-
-    @property
-    def shared_llm(self) -> LLM | None:
-        return None
-
     @abstractmethod
-    async def select(self, run: Run) -> ActionSelection: ...
+    async def select(
+        self, ctx: Context[AgentState], device: Device, memory: Memory, registry: ToolRegistry
+    ) -> Selection: ...
 
 
-def sum_usage(*usages: Usage | None) -> Usage | None:
-    present = [u for u in usages if u is not None]
-    if not present:
+async def screenshot_bytes(
+    ctx: Context[AgentState], snapshot: StepSnapshot, device: Device
+) -> bytes | None:
+    screenshot = snapshot.screenshot
+    if screenshot is None and snapshot.ui.elements:
+        async with ctx.store.edit_state() as state:
+            assert state.current is not None
+            await state.current.capture_screenshot(device)
+            screenshot = state.current.screenshot
+    if screenshot is None:
         return None
 
-    def total(values: Sequence[int | None]) -> int | None:
-        known = [v for v in values if v is not None]
-        return sum(known) if len(known) == len(values) else None
+    def read() -> bytes:
+        assert screenshot is not None
+        with screenshot.resolve_image() as stream:
+            return bytes(stream.read())
 
-    return Usage(
-        request_tokens=total([u.request_tokens for u in present]),
-        response_tokens=total([u.response_tokens for u in present]),
-        total_tokens=total([u.total_tokens for u in present]),
-        reasoning_tokens=total([u.reasoning_tokens for u in present]),
-        requests=sum(u.requests for u in present),
-    )
+    return await asyncio.to_thread(read)
+
+
+def previous_action_feedback(state: AgentState) -> str | None:
+    changed = state.actions[-1].screen_changed if state.actions else None
+    return {
+        True: "Previous action changed the screen",
+        False: "Previous action did not change the screen",
+        None: None,
+    }[changed]

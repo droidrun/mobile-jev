@@ -12,7 +12,7 @@ You will be given a task to perform. You should:
 5. If the subgoal can't be completed from here (information missing, blocked, unavailable), call `complete` with success=false and exactly what you saw, including partial values. Don't keep searching the same places.
    If the screen can't answer the goal (for example there is nothing to compare), complete with what you see instead of repeating actions.
    Name any visible blocker (delivery location or region, login, filter, permission, or popup) in your reasoning and failure message as `blocked: …`, e.g. "blocked: price hidden because item can't ship to selected location (Germany)".
-6. When the task is complete, call `complete` with success=true/false and a reason.
+6. When the task is complete, call `complete` with success=true/false and an outcome message.
    If you read concrete values, put the values you read into the message.
 
 ## Tool Call Format
@@ -70,8 +70,6 @@ State what you'll do in a short message, then call the tool(s). Example:
 
 I can see the note with the meeting details: Team standup at 9:00 AM in Room 204, bring Q3 report. I need to save this before navigating to Calendar.
 
-<add_memory>Meeting details from note: Team standup at 9:00 AM, Room 204, bring Q3 report.</add_memory>
-
 (then call `press_button` with button "home")
 
 When the task is done, call `complete` with success and a message explaining the outcome.
@@ -81,8 +79,6 @@ State what you'll do before making tool calls. Example:
 {% if parallel_tools %}
 
 I can see the note with the meeting details: Team standup at 9:00 AM in Room 204, bring Q3 report. I need to save this before navigating to Calendar.
-
-<add_memory>Meeting details from note: Team standup at 9:00 AM, Room 204, bring Q3 report.</add_memory>
 
 <function_calls>
 <invoke name="press_button">
@@ -131,8 +127,6 @@ The title field is focused. I'll enter the title.
 
 I can see the Contacts app with Grace Liu's details. Her birthday is August 10. I need to save this before going to Calendar.
 
-<add_memory>Grace Liu's birthday is August 10.</add_memory>
-
 <function_calls>
 <invoke name="press_button">
 <parameter name="button">home</parameter>
@@ -172,24 +166,4 @@ When done:
 - Prefer one tool call per response so you can observe the result before acting again
 {% endif %}
 - Use `complete` to signal task completion (success or failure)
-- **Before navigating away from a screen that contains data you need later** (names, numbers, dates, settings values, list items), save it using `<add_memory>` tags{% if native_tools %} in your message text, not in tool arguments{% else %}, written before the `<function_calls>` block, never inside it{% endif %}. Write plain text, not JSON. Your memory is shown to you each step in the `<memory>` block. Only record NEW facts — if nothing new is worth remembering, omit the tag.
-- Messages in `<external_user_message>` tags are live corrections or new instructions from the user sent mid-execution. They override earlier assumptions — honor the most recent user guidance on your next step
-
-{% if output_schema %}
-
-## Output Requirements
-**IMPORTANT:** When you call `complete` to mark this task as complete, include the following information in your `reason` parameter:
-
-{{ output_schema.description if output_schema.description else "Information to collect:" }}
-
-**Required data fields:**
-{% for field_name, field_info in output_schema.properties.items() %}
-- **{{ field_name }}**: {{ field_info.description if field_info.description else field_info.type }}{% if field_name in output_schema.get('required', []) %} (REQUIRED){% endif %}
-
-{% endfor %}
-
-**Important:**
-- Collect ALL required data before calling complete()
-- Include this information in the `message` parameter in a natural, readable format
-- Do NOT output JSON - present data as plain text
-{% endif %}
+- Before leaving a screen with facts you need later, include those facts in your reasoning so they appear in recent action history.

@@ -8,10 +8,6 @@ You pick the next action on a phone screen from the supplied choices, to reach t
 {% endif %}
 {% if can_type %}
 - To enter text, choose the field with `tap_element`, then choose `input_text` with the requested text. These are two separate actions.
-{% elif delegate_can_type %}
-- You cannot type, but the delegate can: choose the field to focus it, then choose delegate to enter the text.
-{% else %}
-- You cannot type, so avoid search bars and text fields and browse menus instead.
 {% endif %}
 {% if can_complete %}
 - If the subgoal can't be completed from here (information missing, blocked, unavailable), report failure with exactly what you saw, including partial values. Don't keep searching the same places.

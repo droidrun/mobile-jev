@@ -1,159 +1,113 @@
-import json
-import socket
+import asyncio
 
 import pytest
-from llama_index.core.base.llms.types import ImageBlock
+from llama_index.core.tools import ToolSelection
 from mobilerun.core.state.ui_state import UIState
 from mobilerun.macro.player import MacroPlayer
 
-from mobilerun_agents.agent.checkpoints.store import RunRecorder
+from mobilerun_agents.agent.checkpoints.macro_export import macro_data
+from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
-from mobilerun_agents.agent.workflows.core.state import ActionRecord, AgentState
+from mobilerun_agents.agent.workflows.core.state import ActionRecord
 from tests.unit.device_fixtures import MemoryDevice
 
 
-def record(step, name, args, **extra):
+def record(name, args, ok=True):
     return ActionRecord(
-        **(
-            dict(
-                step=step,
-                name=name,
-                args=args,
-                ok=True,
-                summary="ok",
-                before=StepSnapshot(
-                    goal="", step=step, ui=UIState([], "", "", {}, 0, 0), device_context=[]
-                ),
-            )
-            | extra
-        )
-    )
-
-
-pytestmark = pytest.mark.anyio
-
-
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
-@pytest.fixture(autouse=True)
-def no_network(monkeypatch):
-    def deny(*args, **kwargs):
-        raise AssertionError("network is disabled")
-
-    monkeypatch.setattr(socket.socket, "connect", deny)
-    monkeypatch.setattr(socket.socket, "connect_ex", deny)
-
-
-async def test_checkpoint_snapshots_event_step_and_exports_recorded_pre_states(tmp_path):
-    folder = tmp_path / "run"
-    macro_path = tmp_path / "macros/run/macro.json"
-    image = b"captured PNG"
-    image_path = tmp_path / "shot.png"
-    image_path.write_bytes(image)
-    nodes = [{"text": "a" * 20000}]
-    snapshot = StepSnapshot(
-        goal="search",
         step=1,
-        ui=UIState(nodes, "", "", {}, 0, 0),
-        device_context=[],
+        call=ToolSelection(tool_id="1", tool_name=name, tool_kwargs=args),
+        ok=ok,
+        summary="output",
+        before=StepSnapshot(ui=UIState([{"text": "Settings"}], "", "", {}, 100, 200)),
     )
-    tap = record(1, "tap", {"x": 3, "y": 4}, before=snapshot)
-    typed = record(
-        1,
-        "input_text",
-        {"text": 'example "text"'},
-        summary='typed example "text"',
-        before=snapshot.model_copy(
-            update={
-                "ui": UIState([{"focused": True}], "", "", {}, 0, 0),
-                "screenshot": ImageBlock(path=image_path),
-            }
-        ),
+
+
+def test_macro_uses_before_ui_and_keeps_only_successful_replayable_calls():
+    macro = macro_data(
+        "open Settings",
+        [
+            record("tap", {"x": 12, "y": 34}),
+            record("tap", {"x": 0, "y": 0}, ok=False),
+            record("note", {"text": "temporary"}),
+            record("type_secret", {"name": "entry", "package": "app", "field": "password"}),
+        ],
+        Redactor(),
     )
-    later = record(2, "wait", {"duration": 0}, ok=False)
-    state = AgentState(goal="search", step=2, actions=[tap, typed, later])
-    recorder = RunRecorder(folder, macro_path=macro_path)
-    assert not folder.exists()
-    await recorder.on_step(tap)
-    await recorder.on_step(typed)
-    checkpoint = folder / "checkpoints/0001.json"
-    assert checkpoint.stat().st_size < 2000
-    saved = json.loads(checkpoint.read_text())
-    entries = saved["actions"]
-    assert saved["step"] == 1
-    assert len(entries) == 2
-    assert entries[1]["args"] == {}
-    assert 'example "text"' not in entries[1]["summary"]
-    assert entries[1]["screenshot"] == str(image_path)
-    assert image_path.read_bytes() == image
-    assert list(folder.rglob("*.png")) == []
-    assert entries[0]["ui_state"] == entries[1]["ui_state"] == "ui_states/0001.json"
-    # Inspection files aren't an input to macro export.
-    (folder / entries[0]["ui_state"]).unlink()
-    await recorder.finish(state)
-    macro = MacroPlayer().load_macro_from_file(macro_path)
-    assert macro["description"] == "search" and macro["total_actions"] == 2
-    tap_action, typed_action = macro["actions"]
-    assert tap_action["action_type"] == "tap" and tap_action["x"] == 3
-    assert tap_action["pre_state"]["nodes"][0]["text"] == nodes[0]["text"]
-    assert typed_action["pre_state"]["nodes"][0]["focused"] is True
-    assert typed_action["text"] == typed.args["text"]
+    assert [a["action_type"] for a in macro["actions"]] == ["tap", "type_secret"]
+    assert macro["actions"][0]["pre_state"]["nodes"][0]["text"] == "Settings"
+    assert macro["actions"][1]["name"] == "entry"
+    assert macro["total_actions"] == 2
 
 
-async def test_player_types_plain_text_and_vault_action_exports_only_reference(tmp_path):
-    typed = record(1, "input_text", {"text": "hello"})
-    secret = record(2, "type_secret", {"name": "demo", "field": "password", "package": "app"})
-    state = AgentState(goal="login", actions=[typed, secret])
-    macro_path = tmp_path / "macros/run/macro.json"
-    await RunRecorder(tmp_path / "run", macro_path=macro_path).finish(state)
-    device = MemoryDevice()
-    player = MacroPlayer(device)
-    macro = player.load_macro_from_file(macro_path)
-    assert await player.replay_macro(macro, max_steps=1)
-    assert device.inputs == ["hello"]
-    assert macro["actions"][1] == {
-        "action_type": "type_secret",
-        **secret.args,
-        "pre_state": macro["actions"][0]["pre_state"],
-    }
+def test_macro_does_not_publish_masked_arguments_or_expanded_credentials():
+    redact = Redactor()
+    redact.add("fixture-sensitive")
+    macro = macro_data(
+        "type fixture-sensitive",
+        [
+            record("input_text", {"text": "fixture-sensitive"}),
+            record("input_text", {"text": "***"}),
+            record("type_secret", {"name": "entry", "text": "fixture-not-a-reference"}),
+        ],
+        redact,
+    )
+    assert macro["description"] == "type ***"
+    assert not macro["actions"]
 
 
-async def test_future_typed_literal_absent_from_every_checkpoint(tmp_path):
-    recorder = RunRecorder(tmp_path, macro_path=tmp_path / "macros/run/macro.json")
-    marker = "fixture-later-input"
-    for step, name, args in [
-        (1, "notes.save", {marker: marker}),
-        (2, "input_text", {"text": marker}),
-    ]:
-        snapshot = StepSnapshot(
-            goal=marker,
-            step=step,
-            ui=UIState([], "", "", {}, 0, 0),
-            device_context=[],
-        )
-        await recorder.on_step(record(step, name, args, summary=marker, before=snapshot))
-        assert marker not in (tmp_path / f"checkpoints/{step:04}.json").read_text()
-    checkpoints = sorted((tmp_path / "checkpoints").glob("*.json"))
-    assert [p.stem for p in checkpoints] == ["0001", "0002"]
-    assert all(marker not in p.read_text() for p in checkpoints)
+def test_base_can_load_the_export(tmp_path):
+    import json
+
+    path = tmp_path / "macro.json"
+    path.write_text(json.dumps(macro_data("wait", [record("wait", {"seconds": 0})], Redactor())))
+    assert MacroPlayer().load_macro_from_file(path)["actions"][0]["duration"] == 0
 
 
-async def test_action_record_requires_observation():
-    with pytest.raises(ValueError, match="before"):
-        ActionRecord(step=1, name="tap", args={"x": 3, "y": 4}, ok=True, summary="ok")
+class GestureDevice(MemoryDevice):
+    def __init__(self):
+        super().__init__()
+        self.gestures = []
+
+    async def swipe(self, x1, y1, x2, y2, duration_ms=1000):
+        self.gestures.append((x1, y1, x2, y2, duration_ms))
+
+    async def drag(self, x1, y1, x2, y2, duration=3.0):
+        self.gestures.append((x1, y1, x2, y2, duration))
 
 
-async def test_expanded_credential_is_rejected_before_publishing_anything(tmp_path):
-    action = record(1, "type_secret", {"name": "demo", "text": "not-a-reference"})
-    state = AgentState(goal="login", actions=[action])
-    macro_path = tmp_path / "macros/run/macro.json"
-    recorder = RunRecorder(tmp_path / "run", macro_path=macro_path)
-    with pytest.raises(ValueError, match="vault reference"):
-        await recorder.on_step(action)
-    with pytest.raises(ValueError, match="vault reference"):
-        await recorder.finish(state)
-    assert not (tmp_path / "run").exists()
-    assert not macro_path.exists()
+@pytest.mark.parametrize(
+    ("name", "timing", "expected_duration"),
+    [
+        ("swipe", {"duration_ms": 650}, 650),
+        ("swipe", {}, 1000),
+        ("drag", {"duration": 1.5}, 1.5),
+        ("drag", {}, 3.0),
+    ],
+)
+def test_exported_gesture_replays_with_the_recorded_coordinates_and_duration(
+    name, timing, expected_duration, monkeypatch
+):
+    async def no_sleep(_):
+        pass
+
+    monkeypatch.setattr("mobilerun.macro.player.asyncio.sleep", no_sleep)
+    args = {"x1": 12, "y1": 34, "x2": 56, "y2": 78, **timing}
+    [action] = macro_data("gesture", [record(name, args)], Redactor())["actions"]
+    device = GestureDevice()
+    assert asyncio.run(MacroPlayer(device).replay_action(action))
+    assert device.gestures == [(12, 34, 56, 78, expected_duration)]
+    assert not action.keys() & {"x1", "x2", "y1", "y2"}
+
+
+def test_input_text_keeps_all_steps_and_omits_unsupported_options():
+    records = [
+        record("input_text", {"text": "normal", "clear": True, "stealth": False, "wpm": 0}),
+        record("input_text", {"text": "stealthy", "stealth": True}),
+        record("input_text", {"text": "paced", "wpm": 50}),
+    ]
+    actions = macro_data("type", records, Redactor())["actions"]
+    assert [{k: v for k, v in action.items() if k != "pre_state"} for action in actions] == [
+        {"action_type": "input_text", "text": "normal", "clear": True},
+        {"action_type": "input_text", "text": "stealthy"},
+        {"action_type": "input_text", "text": "paced"},
+    ]

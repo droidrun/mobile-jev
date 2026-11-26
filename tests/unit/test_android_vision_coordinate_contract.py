@@ -22,7 +22,6 @@ from mobilerun.utils.images import (
 from PIL import Image
 
 from mobilerun_agents.agent.tools.helpers import check_point
-from tests.unit.device_fixtures import tool_run
 
 NATIVE_W, NATIVE_H = 1080, 2400
 
@@ -73,21 +72,12 @@ def _get_state(provider):
 
 
 def test_hybrid_vision_zero_bounds_refuses_click_at():
-    from mobilerun_agents.agent.tools.helpers import check_point
-
     provider = _provider(width=0, height=0, vision_enabled=True)
     provider._device.tap = AsyncMock()
     state = _get_state(provider)
-    ctx = tool_run(
-        ui=state,
-        state_provider=provider,
-        driver=provider._device,
-        macro_recorder=None,
-    )
-
     assert state.coordinate_contract_active is False
     with pytest.raises(ValueError, match="unavailable for this step"):
-        check_point(10, 20, ctx)
+        check_point(10, 20, state, provider)
     provider._device.tap.assert_not_awaited()
 
 
@@ -108,22 +98,17 @@ def test_provider_scale_matches_what_agents_actually_send():
     assert sent_h == round(NATIVE_H / state.coordinate_scale_y)
 
 
-def _action_ctx(state, provider):
-    return SimpleNamespace(ui=state, state_provider=provider)
-
-
 def test_check_point_validates_device_space():
     provider = _provider(vision_enabled=True)
     state = _get_state(provider)
-    ctx = _action_ctx(state, provider)
 
     # In-space coordinates convert to native pixels
-    assert check_point(540, 1200, ctx=ctx) == (540, 1200)
+    assert check_point(540, 1200, state, provider) == (540, 1200)
 
     # Out-of-space coordinates (native-space habits) are rejected with a
     # message instead of tapping off-screen
     try:
-        check_point(1080, 2400, ctx=ctx)
+        check_point(1080, 2400, state, provider)
     except ValueError as e:
         assert "1080x2400" in str(e)
     else:
@@ -133,6 +118,4 @@ def test_check_point_validates_device_space():
 def test_check_point_unchanged_without_contract():
     provider = _provider()
     state = _get_state(provider)
-    ctx = _action_ctx(state, provider)
-
-    assert check_point(1000, 2300, ctx=ctx) == (1000, 2300)
+    assert check_point(1000, 2300, state, provider) == (1000, 2300)

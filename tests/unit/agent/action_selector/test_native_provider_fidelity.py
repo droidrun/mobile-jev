@@ -8,12 +8,13 @@ from llama_index.core.base.llms.types import ToolCallBlock
 from llama_index.core.llms import ChatMessage, ChatResponse, MockLLM
 
 from mobilerun_agents.agent.action_selector import LlamaIndexLLMSelector
+from mobilerun_agents.agent.action_selector.llm.calls import InvalidResponse
 from mobilerun_agents.agent.action_selector.llm.factory import build_llm
 from mobilerun_agents.agent.action_selector.llm.models import MODELS
 from mobilerun_agents.agent.action_selector.loader import default_setup
 from mobilerun_agents.config.loader import ConfigLoader
 from mobilerun_agents.config.user_config import LLMProfile, MobileConfig
-from tests.unit.agent.selector_fixtures import selection_run
+from tests.unit.agent.action_selector.fixtures import Turn
 from tests.unit.device_fixtures import fake_tools
 
 
@@ -105,9 +106,8 @@ def test_direct_gpt6_selector_sends_native_tools_and_keeps_function_call(stream)
     async def select():
         async with httpx.AsyncClient(transport=httpx.MockTransport(send)) as client:
             llm = await build_llm("openai", "gpt-6-luna", api_key="fake", async_http_client=client)
-            return await LlamaIndexLLMSelector(llm, vision="on").select(
-                selection_run(goal="Wait", tools=fake_tools("wait"), stream=stream)
-            )
+            turn = Turn(goal="Wait", tools=fake_tools("wait"))
+            return await turn.select(LlamaIndexLLMSelector(llm, vision="on"), stream=stream)
 
     selection = asyncio.run(select())
     [(path, body)] = requests
@@ -115,17 +115,16 @@ def test_direct_gpt6_selector_sends_native_tools_and_keeps_function_call(stream)
     assert body.get("tool_choice") == "required", {
         "tool_choice": body.get("tool_choice"),
         "tool_count": len(body.get("tools") or []),
-        "selected_actions": len(selection.actions),
+        "selected_actions": len(selection.calls),
         "xml_prompt": "<function_calls>" in json.dumps(body["input"]),
     }
     assert [(tool["type"], tool["name"]) for tool in body["tools"]] == [("function", "wait")]
     assert body["stream"] is stream and body["parallel_tool_calls"] is True
     assert "<function_calls>" not in json.dumps(body["input"])
     assert selection.thought == "Wait for the screen."
-    assert [(action.name, action.call_id) for action in selection.actions] == [
+    assert [(action.tool_name, action.tool_id) for action in selection.calls] == [
         ("wait", "call_unit")
     ]
-    assert selection.usage.reasoning_tokens == 4
 
 
 @pytest.mark.parametrize("provider", ["openai_like", "ollama", "gemini"])
@@ -163,12 +162,10 @@ def test_declared_native_api_controls_wire_shape(provider, model, choice, monkey
         additional_kwargs={"usage": {"input_tokens": 10}},
     )
     transport = AsyncMock(return_value=reply)
-    monkeypatch.setattr(type(selector.shared_llm), "achat_with_tools", transport)
+    monkeypatch.setattr(type(selector.llm), "achat_with_tools", transport)
     actions = fake_tools("wait")
-    result = asyncio.run(selector.select(selection_run(goal="Wait", tools=actions)))
-    assert result.response is reply
-    assert result.actions[0].name == "wait"
-    assert result.usage.request_tokens == 10
+    result = asyncio.run(Turn(goal="Wait", tools=actions).select(selector))
+    assert result.calls[0].tool_name == "wait"
     transport.assert_awaited_once()
     kwargs = transport.await_args.kwargs
     assert tuple(transport.await_args.args[0]) == tuple(actions)
@@ -200,17 +197,18 @@ def test_declared_native_api_controls_wire_shape(provider, model, choice, monkey
 def test_native_adapters_preserve_decoded_arguments_and_reject_invalid_calls(
     provider, model, api, arguments, valid, monkeypatch
 ):
-    from mobilerun_agents import Run, tool
+    from mobilerun_agents import tool
     from mobilerun_agents.agent.tools.registry import build_registry
+    from mobilerun_agents.config.user_config import ToolsConfig
 
     @tool
-    async def choose(run: Run, index: int) -> int:
+    async def choose(index: int) -> int:
         """Choose one index."""
         return index
 
-    run = selection_run(goal="Choose")
-    run.registry = build_registry(run, [choose], None)
-    llm = configured_selector(monkeypatch, provider, model).shared_llm
+    turn = Turn(goal="Choose")
+    turn.registry = build_registry(turn.device, [choose], ToolsConfig())
+    llm = configured_selector(monkeypatch, provider, model).llm
     selector = LlamaIndexLLMSelector(llm, native_tool_api=api)
     message = ChatMessage(
         role="assistant",
@@ -218,12 +216,14 @@ def test_native_adapters_preserve_decoded_arguments_and_reject_invalid_calls(
     )
     transport = AsyncMock(return_value=ChatResponse(message=message))
     monkeypatch.setattr(type(llm), "achat", transport)
-    result = asyncio.run(selector.select(run))
-    transport.assert_awaited_once()
-    assert bool(result.parse_error) is not valid
     if valid:
-        assert result.actions[0].parameters == {"index": 3}
-        assert result.actions[0].call_id == "c"
+        result = asyncio.run(turn.select(selector))
+        assert result.calls[0].tool_kwargs == {"index": 3}
+        assert result.calls[0].tool_id == "c"
+    else:
+        with pytest.raises(InvalidResponse):
+            asyncio.run(turn.select(selector))
+    transport.assert_awaited_once()
 
 
 def test_single_tool_policy_does_not_silently_discard_second_native_call(monkeypatch):
@@ -234,8 +234,8 @@ def test_single_tool_policy_does_not_silently_discard_second_native_call(monkeyp
             blocks=[ToolCallBlock(tool_name="wait", tool_kwargs={}) for _ in range(2)],
         )
     )
-    monkeypatch.setattr(type(selector.shared_llm), "achat", AsyncMock(return_value=reply))
-    result = asyncio.run(
-        selector.select(selection_run(goal="Wait", tools=fake_tools("wait"), parallel_tools=False))
-    )
-    assert len(result.actions) == 2  # the workflow rejects this entire selection before dispatch
+    monkeypatch.setattr(type(selector.llm), "achat", AsyncMock(return_value=reply))
+    with pytest.raises(InvalidResponse):
+        asyncio.run(
+            Turn(goal="Wait", tools=fake_tools("wait")).select(selector, parallel_tools=False)
+        )

@@ -1,313 +1,125 @@
-import asyncio
-import logging
+import os
 
 import click
-import pytest
+from llama_index.core.tools import ToolSelection
+from mobilerun.core.state.ui_state import UIState
 
-from mobilerun_agents.agent.logs import configure_cli_logging
-from mobilerun_agents.agent.logs.console import ConsoleLog
-from mobilerun_agents.agent.logs.diagnostics import (
-    ActionDetail,
-    Detail,
-    ModelCall,
-    Screen,
-    private_values,
-)
-from mobilerun_agents.agent.workflows.core.result import AgentResult
-from mobilerun_agents.agent.workflows.core.state import ActionOutcome
-from mobilerun_agents.errors import SelectorCannotServe, UnknownModel
+from mobilerun_agents.agent.events import Acted, Detail, Observed, Repaired, Subgoal
+from mobilerun_agents.agent.logs import ConsoleLog, configure_cli_logging
+from mobilerun_agents.agent.logs.memory import MemoryDetail
+from mobilerun_agents.agent.logs.redaction import Redactor
+from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
+from mobilerun_agents.agent.workflows.core.state import ActionRecord
 
 
-def test_console_log_formats_event_summary_without_sensitive_fields(caplog):
-    consumer = ConsoleLog()
-    caplog.set_level(logging.INFO, logger="mobilerun_agents.agent.logs.console")
-
-    consumer.on_repair()
-    consumer.on_action(
-        ActionOutcome(
-            step=1,
-            name="type",
-            args={"text": "password"},
-            ok=True,
-            summary="Text entered",
-            screenshot="full-image-data",
-            ui_state=None,
-        )
-    )
-    consumer.on_result(
-        AgentResult[None](success=True, reason="Finished", answer="Done", output=None, steps=1)
-    )
-
-    output = caplog.text
-    assert "Retrying invalid selection" in output
-    assert "1 · type ✓" in output
-    assert "✓ Done (1 step)" in output
-    assert "password" not in output
-    assert "full-image-data" not in output
-    assert "sk-secret" not in output
-
-
-def test_console_progress_order_and_safe_details(caplog):
-    console = ConsoleLog()
-    caplog.set_level(logging.INFO, logger="mobilerun_agents.agent.logs.console")
-
-    def record(step, name, args, summary):
-        return ActionOutcome(
-            step=step,
-            name=name,
-            args=args,
-            summary=summary,
-            ok=True,
-            screenshot="image-data",
-            ui_state="private-tree",
-        )
-
-    console.on_action(record(1, "start_app", {"package": "Settings", "token": "private"}, ""))
-    console.flush_step()
-    console.on_subgoal("Read\nBattery")
-    console.on_action(
-        record(
-            2,
-            "tap_element",
-            {"index": 12},
-            "tap_element {'index': 12} → None",
-        )
-    )
-    console.on_action(record(3, "start_app", {"package": "private"}, "[REDACTED]"))
-    console.flush_step()
-    console.on_repair()
-    console.on_result(
-        AgentResult[None](success=False, reason="Stopped", answer="unused", steps=3, output=None),
-        "runs/123",
-    )
-    assert caplog.messages == [
-        "1 · start_app Settings ✓",
-        "→ subgoal: Read Battery",
-        "2 · tap_element [12] ✓",
-        "3 · start_app *** ✓",
-        "Retrying invalid selection",
-        "✗ Stopped (3 steps · runs/123)",
-    ]
-    assert caplog.records[-2].color == "dim"
-
-
-def test_console_exception_omits_raw_request(caplog):
-    caplog.set_level(logging.INFO, logger="mobilerun_agents.agent.logs.console")
-    ConsoleLog().on_error(RuntimeError("private request"), 0)
-    assert caplog.messages == ["✗ RuntimeError (0 steps)"]
-
-
-def test_console_formats_cancelled_run(caplog):
-    caplog.set_level(logging.INFO, logger="mobilerun_agents.agent.logs.console")
-    ConsoleLog().on_error(asyncio.CancelledError(), 4, "runs/123")
-    assert caplog.messages == ["✗ cancelled (4 steps · runs/123)"]
-
-
-@pytest.mark.parametrize("debug", [False, True])
-def test_console_marks_every_action_in_a_delegated_step(caplog, debug):
-    caplog.set_level(logging.INFO, logger="mobilerun_agents.agent.logs.console")
-    console = ConsoleLog()
-
-    def action(name, args):
-        return ActionOutcome(
-            step=13,
-            name=name,
-            args=args,
-            ok=True,
-            summary="ok",
-            screenshot=None,
-            ui_state=None,
-        )
-
-    token = private_values.set(set() if debug else None)
-    try:
-        console.on_action(action("tap_element", {"index": 16, "label": "Search"}))
-        console.on_action(action("input_text", {"text": "iPhone 15 Pro Max"}), delegated=True)
-        console.on_action(action("tap", {"x": 561, "y": 252}), delegated=True)
-        console.on_action(action("wait", {}).model_copy(update={"step": 14}))
-        console.flush_step()
-    finally:
-        private_values.reset(token)
-
-    assert caplog.messages == [
-        "13 · tap_element [16] Search ✓ · llm",
-        '13 · input_text "iPhone 15 Pro Max" ✓ · llm',
-        "13 · tap (561, 252) ✓ · llm",
-        "14 · wait ✓",
-    ]
-
-
-def test_console_masks_sensitive_typed_text(caplog):
-    caplog.set_level(logging.INFO, logger="mobilerun_agents.agent.logs.console")
-    console = ConsoleLog()
-    console.on_action(
-        ActionOutcome(
-            step=1,
-            name="input_text",
-            args={"text": "***"},
-            ok=True,
-            summary="ok",
-            screenshot=None,
-            ui_state=None,
-        ),
-        delegated=True,
-    )
-    console.flush_step()
-    assert caplog.messages == ['1 · input_text "***" ✓ · llm']
-
-
-@pytest.mark.parametrize(
-    "error",
-    [
-        SelectorCannotServe("Jev can't plan: use an LLM selector as the planner."),
-        UnknownModel("openai", "gpt-6-sol"),
-    ],
-)
-def test_console_shows_own_error_messages(caplog, error):
-    caplog.set_level(logging.INFO, logger="mobilerun_agents.agent.logs.console")
-    ConsoleLog().on_error(error, 0)
-    assert caplog.messages == [f"✗ {error} (0 steps)"]
-
-
-def test_console_debug_renders_missing_image(capsys):
-    with click.Context(click.Command("agent")):
-        configure_cli_logging(True)
-        ConsoleLog().on_event(Detail(section="image", text="no image"))
-        assert capsys.readouterr().err.strip() == "image: no image"
-
-
-def test_first_screen_is_visible_without_an_attempt_header(capsys):
-    with click.Context(click.Command("agent")):
-        configure_cli_logging(True)
-        console = ConsoleLog()
-        console.on_event(Screen(package="app", activity="Main", elements=2))
-        assert capsys.readouterr().err.splitlines() == [
-            "  screen: app/Main · 2 elements",
-        ]
-        console.on_event(
-            Detail(
-                section="thought",
-                text="  Open\n  <add_memory>one</add_memory>   the\tapp. <add_memory>two</add_memory>",
-            )
-        )
-        assert capsys.readouterr().err.strip() == "thought: Open the app."
-        console.on_error(RuntimeError("private"), 0, "runs/123")
-        assert "run folder=runs/123" in capsys.readouterr().err
-
-
-def test_debug_log_format_regressions(capsys):
-    with click.Context(click.Command("agent")):
-        configure_cli_logging(True)
-        console = ConsoleLog()
-        console.on_event(Screen(package="com.android.settings", activity=None, elements=0))
-        console.on_event(Detail(section="thought", text="Open Settings. Open Settings."))
-        console.on_event(Detail(section="planning", text="executor: llm:openai/gpt-5"))
-        console.on_event(Detail(section="planning", text="executor: llm:openai/gpt-5"))
-        console.on_event(
-            ModelCall(
-                name="llm:openai/gpt-5",
-                image=None,
-                seconds=3.445,
-                inputs=1,
-                outputs=1,
-                reasoning=0,
-                total=2,
-            )
-        )
-        console.on_event(
-            ActionDetail(
-                wire="tap_element",
-                registry="tap_element",
-                args={"index": 21},
-                success=True,
-                summary="tap_element {'index': 21} → None",
-                seconds=0.458,
-            )
-        )
-        console.on_action(
-            ActionOutcome(
+def test_console_redacts_event_text_and_arguments(caplog):
+    caplog.set_level("DEBUG", logger="mobilerun_agents.agent.logs.console")
+    redact = Redactor()
+    redact.add("fixture secret")
+    console = ConsoleLog(redact)
+    console.event(Subgoal(text="enter fixture secret"))
+    console.event(Repaired(step=1, attempt=1, reason="fixture secret"))
+    console.event(
+        Acted(
+            action=ActionRecord(
                 step=1,
-                name="tap_element",
-                args={"index": 21},
                 ok=True,
-                summary="Tapped",
-                screenshot=None,
-                ui_state=None,
+                summary="typed fixture secret",
+                call=ToolSelection(
+                    tool_id="1", tool_name="input_text", tool_kwargs={"text": "fixture+secret"}
+                ),
+                before=StepSnapshot(ui=UIState([], "", "", {}, 0, 0)),
             )
         )
-        console.flush_step()
-        lines = capsys.readouterr().err.splitlines()
-        assert lines.count("  thought: Open Settings.") == 1
-        assert "  screen: com.android.settings · 0 elements" in lines
-        assert sum(line == "  planning: executor: llm:openai/gpt-5" for line in lines) == 1
-        assert "  LLM: llm:openai/gpt-5 · 3.445s · input=1 output=1 reasoning=0" in lines
-        assert "  result: success · 0.458s" in lines
+    )
+    console.finish(True, "done with fixture secret", 1)
+    assert "→ subgoal: enter ***" in caplog.messages
+    assert "Retrying invalid selection" in caplog.messages
+    assert "1 · input_text ✓" in caplog.messages
+    assert "✓ done with *** (1 step)" in caplog.messages
+    assert "fixture" not in caplog.text
 
 
-def test_long_thought_deduplicates_before_truncation(capsys):
+def test_cli_routes_debug_to_stderr_and_result_to_stdout(capsys):
     with click.Context(click.Command("agent")):
         configure_cli_logging(True)
-        text = "Amazon returned a unique query product price. " + " ".join(
-            f"detail{index} value{index}" for index in range(50)
-        )
-        repeated_prefix = text[: text.rfind(" ", 0, len(text) // 2)]
-        ConsoleLog().on_event(Detail(section="thought", text=text + " " + repeated_prefix))
-        line = capsys.readouterr().err.strip()
-        assert " ".join(line.split()) == "thought: " + text.strip()[:300] + "…"
+        console = ConsoleLog(Redactor())
+        console.event(Detail(section="image", text="no image"))
+        console.finish(True, "done", 1)
+    output = capsys.readouterr()
+    assert "image: no image" in output.err
+    assert "✓ done (1 step)" in output.out
 
 
-@pytest.mark.parametrize(
-    ("reasoning", "message", "expected"),
-    [
-        (
-            "Amazon's search field is active. Find the price from the results.",
-            "Amazon's search field is active. Find the price from the results.",
-            "Amazon's search field is active. Find the price from the results.",
-        ),
-        (
-            "I'll ensure the search field remains focused before entering the query. The eBay search field is already focused. I'll search",
-            "The eBay search field is already focused. I'll search for the item.",
-            "I'll ensure the search field remains focused before entering the query. The eBay search field is already focused. I'll search for the item.",
-        ),
-    ],
-)
-def test_debug_thought_deduplicates_reasoning_and_message(capsys, reasoning, message, expected):
+def test_memories_share_a_step_file_without_wrapping_console_output(capsys, tmp_path):
     with click.Context(click.Command("agent")):
         configure_cli_logging(True)
-        ConsoleLog().on_event(Detail(section="thought", text=f"{reasoning} {message}"))
-        assert " ".join(capsys.readouterr().err.split()) == "thought: " + expected
+        redact = Redactor()
+        long_secret = "clipped-secret" * 12
+        redact.add(long_secret)
+        console = ConsoleLog(redact, tmp_path)
+        console.event(Observed(step=3))
+        for text in ("x" * 140, long_secret):
+            console.event(
+                MemoryDetail(
+                    section="memory",
+                    text=text,
+                    blocks={"notes": text},
+                    last_steps=[],
+                    counts="1 msg",
+                )
+            )
+        redact.add("x" * 140)
+        console.finish(True, "done", 3)
+    lines = capsys.readouterr().err.splitlines()
+    assert sum("Memory details:" in line for line in lines) == 1
+    previews = [line for line in lines if "notes:" in line]
+    assert previews == [f"    notes: {'x' * 119}…"]
+    assert any("memory (jev): 1 msg" in line for line in lines)
+    assert "clipped-secret" not in "\n".join(lines)
+    assert (tmp_path / "memory/0003.txt").read_text() == "***\n"
+    assert (tmp_path / "memory/0003-jev.txt").read_text() == "***\n"
 
 
-@pytest.mark.parametrize("middle", ["\n\t", "  "])
-def test_thought_deduplicates_whitespace_and_containment(capsys, middle):
-    with click.Context(click.Command("agent")):
-        configure_cli_logging(True)
-        phrase = "Amazon's search field is active. Find the price from the results."
-        full = "First check the app. " + phrase + " Then compare offers."
-        ConsoleLog().on_event(
-            Detail(section="thought", text=full + middle + phrase.replace(" ", "  "))
-        )
-        assert " ".join(capsys.readouterr().err.split()) == "thought: " + full
-
-
-def test_unknown_screen_package_uses_friendly_label(capsys):
-    with click.Context(click.Command("agent")):
-        configure_cli_logging(True)
-        ConsoleLog().on_event(Screen(package=None, activity=None, elements=27))
-        assert capsys.readouterr().err.splitlines() == [
-            "  screen: unknown app · 27 elements",
-        ]
-
-
-def test_failed_completion_redacts_and_caps_answer(caplog):
-    caplog.set_level(logging.INFO, logger="mobilerun_agents.agent.logs.console")
-    ConsoleLog().on_result(
-        AgentResult[None](
-            success=False,
-            reason="complete",
-            answer="token=private " + "x" * 300,
-            output=None,
-            steps=2,
+def test_console_compacts_later_memory_details_and_keeps_separate_files(caplog, tmp_path):
+    caplog.set_level("DEBUG", logger="mobilerun_agents.agent.logs.console")
+    console = ConsoleLog(Redactor(), tmp_path)
+    console.event(Observed(step=2))
+    console.event(
+        MemoryDetail(
+            section="memory",
+            text="first",
+            blocks={"notes": "first"},
+            last_steps=["first step"],
+            counts="6 msgs · 113/30k tokens",
+            selector="jev",
         )
     )
-    assert caplog.messages == ["✗ " + ("token=*** " + "x" * 300)[:200] + "… (2 steps)"]
+    console.event(
+        MemoryDetail(
+            section="memory",
+            text="different",
+            blocks={"notes": "different"},
+            last_steps=["other step"],
+            counts="6 msgs · 166/30k tokens",
+            selector="delegate",
+        )
+    )
+    assert sum("memory: 6 msgs" in message for message in caplog.messages) == 1
+    assert "memory (delegate): 6 msgs · 166/30k tokens" in caplog.text
+    assert "different" not in caplog.text
+    assert (tmp_path / "memory/0002.txt").read_text() == "first\n"
+    assert (tmp_path / "memory/0002-delegate.txt").read_text() == "different\n"
+
+
+def test_memory_files_use_private_mode_independent_of_umask(tmp_path, caplog):
+    caplog.set_level("DEBUG", logger="mobilerun_agents.agent.logs.console")
+    console = ConsoleLog(Redactor(), tmp_path)
+    previous = os.umask(0)
+    try:
+        console.event(
+            MemoryDetail(section="memory", text="full", blocks={}, last_steps=[], counts="counts")
+        )
+    finally:
+        os.umask(previous)
+    assert (tmp_path / "memory/0001.txt").stat().st_mode & 0o777 == 0o600

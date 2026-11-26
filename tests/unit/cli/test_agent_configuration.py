@@ -1,11 +1,16 @@
+from importlib import import_module
+from pathlib import Path
+
 import pytest
 import yaml
 from click.testing import CliRunner
+from filelock import FileLock, Timeout
 from mobilerun.cli.base import menu, prompts
 
 from mobilerun_agents.agent.auth import store
 from mobilerun_agents.cli.agent.group import agent
 from mobilerun_agents.config.loader import ConfigLoader
+from mobilerun_agents.config.user_config import DecisionProfile, LLMProfile
 
 
 def invoke(*args, input=None):
@@ -493,3 +498,216 @@ def test_run_on_old_config_has_one_actionable_error():
     assert result.output.strip() == (
         "Error: Config uses old keys; run: mobilerun agent profiles add … / agent configure …"
     )
+
+
+def test_update_holds_lock_during_read_edit_and_replace(monkeypatch):
+    path = ConfigLoader.get_user_config_path()
+    path.parent.mkdir(parents=True)
+    path.write_text("agent: {max_steps: 12}\n", encoding="utf-8")
+    contender = FileLock(str(path) + ".lock", timeout=0)
+    original_load = ConfigLoader.load
+    original_replace = Path.replace
+    phases = []
+
+    def check_locked(phase):
+        with pytest.raises(Timeout), contender:
+            pytest.fail(f"agents.yaml unlocked during {phase}")
+        phases.append(phase)
+
+    def load(*args, **kwargs):
+        check_locked("load")
+        return original_load(*args, **kwargs)
+
+    def edit(config):
+        check_locked("edit")
+        assert config.agent.max_steps == 12
+        config.agent.max_steps = 18
+
+    def replace(source, target):
+        if target == path:
+            check_locked("replace")
+            assert source.parent == path.parent
+            assert path.read_text(encoding="utf-8") == "agent: {max_steps: 12}\n"
+        return original_replace(source, target)
+
+    monkeypatch.setattr(ConfigLoader, "load", load)
+    monkeypatch.setattr(Path, "replace", replace)
+    ConfigLoader.update(edit)
+
+    assert phases == ["load", "edit", "replace"]
+    with contender:
+        assert original_load().agent.max_steps == 18
+
+
+def test_failed_edit_leaves_original_yaml_untouched():
+    path = ConfigLoader.get_user_config_path()
+    path.parent.mkdir(parents=True)
+    original = b"# keep this comment\nagent: {max_steps: 12}\n"
+    path.write_bytes(original)
+
+    def edit(config):
+        config.agent.max_steps = 18
+        raise RuntimeError("edit failed")
+
+    with pytest.raises(RuntimeError, match="edit failed"):
+        ConfigLoader.update(edit)
+
+    with FileLock(str(path) + ".lock", timeout=0):
+        assert path.read_bytes() == original
+
+
+@pytest.fixture
+def configured():
+    path = ConfigLoader.get_user_config_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "profiles:\n"
+        "  local: {provider: ollama, model: local}\n"
+        "  obsolete: {provider: ollama, model: obsolete}\n"
+        "  jev: {provider: typesafe}\n"
+        "setups:\n"
+        "  current: {selector: local}\n"
+        "  next: {selector: local}\n"
+        "default_setup: current\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.fixture
+def before_config_write(monkeypatch):
+    save = ConfigLoader.save
+    update = ConfigLoader.update
+
+    def intercept(change):
+        def replace_config(config):
+            change()
+            return save(config)
+
+        def apply_edit(edit):
+            change()
+            return update(edit)
+
+        monkeypatch.setattr(ConfigLoader, "save", replace_config)
+        monkeypatch.setattr(ConfigLoader, "update", apply_edit)
+
+    return intercept, save
+
+
+@pytest.mark.parametrize(
+    "args,choices,profiles,setups,default",
+    [
+        (
+            ("configure", "new", "--selector", "jev"),
+            (),
+            "jev local obsolete",
+            "current new next",
+            "current",
+        ),
+        (
+            ("configure", "new"),
+            ("Straight", "jev", "", "No", "Done"),
+            "jev local obsolete",
+            "current new next",
+            "current",
+        ),
+        (("configure", "default", "next"), (), "jev local obsolete", "current next", "next"),
+        (("configure", "default"), ("next",), "jev local obsolete", "current next", "next"),
+        (("configure", "default", "--unset"), (), "jev local obsolete", "current next", None),
+        (("configure", "default"), ("",), "jev local obsolete", "current next", None),
+        (("configure", "remove", "current"), (), "jev local obsolete", "next", None),
+        (
+            ("profiles", "add", "new", "--provider", "openai", "--model", "gpt-4o"),
+            (),
+            "jev local new obsolete",
+            "current next",
+            "current",
+        ),
+        (
+            ("profiles", "add", "new", "--provider", "ollama"),
+            ("other…", "Default", "Default"),
+            "jev local new obsolete",
+            "current next",
+            "current",
+        ),
+        (("profiles", "remove", "obsolete"), (), "jev local", "current next", "current"),
+    ],
+    ids=[
+        "setup-flags",
+        "setup-wizard",
+        "default-name",
+        "default-picker",
+        "default-unset",
+        "default-picker-clear",
+        "setup-remove",
+        "profile-flags",
+        "profile-wizard",
+        "profile-remove",
+    ],
+)
+def test_config_writer_preserves_concurrent_edit(
+    monkeypatch, configured, before_config_write, args, choices, profiles, setups, default
+):
+    configure = import_module("mobilerun_agents.cli.agent.configure")
+    profiles_module = import_module("mobilerun_agents.cli.agent.profiles")
+    pending = iter(choices)
+    contender = FileLock(str(configured) + ".lock", timeout=0)
+
+    def select(title, options):
+        with contender:
+            return next(pending)
+
+    async def resolve(provider):
+        with contender:
+            assert provider == "typesafe"
+
+    async def build_llm(provider, model, api_key):
+        with contender:
+            assert (provider, model) == ("openai", "gpt-4o")
+
+    monkeypatch.setattr(configure, "resolve", resolve)
+    monkeypatch.setattr(profiles_module, "build_llm", build_llm)
+    monkeypatch.setattr(menu, "is_interactive", lambda: bool(choices))
+    monkeypatch.setattr(prompts, "select_prompt", select)
+    monkeypatch.setattr(prompts, "text_prompt", lambda title: "new")
+
+    intercept, save = before_config_write
+
+    def concurrent_edit():
+        assert next(pending, None) is None, "transaction started before prompts finished"
+        config = ConfigLoader.load()
+        config.profiles["parallel"] = LLMProfile(provider="ollama", model="parallel")
+        save(config)
+
+    intercept(concurrent_edit)
+
+    result = invoke(*args)
+
+    assert result.exit_code == 0, result.output or result.exception
+    config = ConfigLoader.load()
+    assert config.profiles["parallel"].model == "parallel"
+    assert set(config.profiles) == {*profiles.split(), "parallel"}
+    assert set(config.setups) == set(setups.split())
+    assert config.default_setup == default
+
+
+def test_setup_does_not_save_if_profile_becomes_unchecked_decision_provider(
+    monkeypatch, configured, before_config_write
+):
+    configure = import_module("mobilerun_agents.cli.agent.configure")
+    intercept, save = before_config_write
+
+    def change_provider():
+        config = ConfigLoader.load()
+        config.profiles["local"] = DecisionProfile(provider="typesafe")
+        return save(config)
+
+    intercept(change_provider)
+    monkeypatch.setattr(configure, "resolve", lambda provider: pytest.fail("unexpected key check"))
+
+    result = invoke("configure", "new", "--selector", "local")
+
+    assert result.exit_code != 0 and "changed" in result.output
+    config = ConfigLoader.load()
+    assert config.profiles["local"].provider == "typesafe"
+    assert "new" not in config.setups

@@ -31,7 +31,7 @@ def test_agent_macro_entry_point_accepts_resolved_target(monkeypatch):
     value = config["project"]["entry-points"]["mobilerun.operators"]["agent_macro"]
     handoff = EntryPoint(name="agent_macro", value=value, group="mobilerun.operators").load()
     loaded_config = MobileConfig()
-    monkeypatch.setattr(replay_module.ConfigLoader, "load", lambda: loaded_config)
+    monkeypatch.setattr(replay_module, "load_config", lambda: loaded_config)
     calls = []
     monkeypatch.setattr(replay_module, "run_replay", lambda *a, **kw: calls.append((a, kw)))
     target = object()

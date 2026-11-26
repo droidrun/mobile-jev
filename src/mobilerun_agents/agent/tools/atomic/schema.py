@@ -7,10 +7,11 @@ from itertools import product
 from math import prod
 
 from llama_index.core.tools import BaseTool
+from mobilerun.core.devices import Device
 from mobilerun.models.context import JSONValue
 
-from mobilerun_agents.agent.run import Run
 from mobilerun_agents.config.prompts import render_prompt
+from mobilerun_agents.config.user_config import DecisionConfig, ToolsConfig
 
 from ..helpers import coordinate_pairs
 
@@ -27,51 +28,44 @@ def _display_value(value: JSONValue) -> str:
     return value if type(value) is str else json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-def from_schema(run: Run, member: BaseTool) -> tuple[list[AtomicTool], str]:
+def from_schema(
+    member: BaseTool, device: Device, tools: ToolsConfig, decision: DecisionConfig
+) -> list[AtomicTool]:
     metadata = member.metadata
     name = metadata.get_name()
     schema = metadata.get_parameters_dict()
     properties = schema.get("properties", {})
     if coordinate_pairs(properties):
-        return [], "coordinates"
+        return []
     domains: dict[str, list[JSONValue]] = {}
-    reasons: list[str] = []
     for key, field in sorted(properties.items()):
         ref = field.get("$ref", "")
         if ref.startswith("#/$defs/"):
             field = schema.get("$defs", {}).get(ref.removeprefix("#/$defs/"), {})
         values: list[JSONValue]
         if name == "press_button" and key == "button":
-            values = list(sorted(run.device.supported_buttons))
-            kind = "Literal"
+            values = list(sorted(device.supported_buttons))
         elif "enum" in field:
             values = field["enum"]
-            kind = "enum" if ref else "Literal"
         elif "const" in field:
             values = [field["const"]]
-            kind = "Literal"
         elif field.get("type") == "boolean":
             values = [False, True]
-            kind = "bool"
         else:
-            kind = {"integer": "int", "number": "float", "string": "str"}.get(
-                field.get("type"), "object"
-            )
-            return [], "element index" if key == "index" else f"free {kind} {key!r}"
+            return []
         if not values:
-            return [], f"no supported values for {key!r}"
-        reasons.append(f"{kind} {key!r}")
+            return []
         domains[key] = sorted(values, key=lambda value: json.dumps(value, sort_keys=True))
     count = prod(map(len, domains.values()))
-    limit = run.tool_config.max_schema_combinations
+    limit = tools.max_schema_combinations
     if count > limit:
-        return [], f"{count} combinations exceed limit {limit}"
+        return []
     return [
         AtomicTool(
             name,
             dict(zip(domains, values, strict=True)),
             render_prompt(
-                run.config.decision.candidate_prompt,
+                decision.candidate_prompt,
                 kind="schema",
                 name=name,
                 arguments=[_display_value(value) for value in values],
@@ -79,14 +73,4 @@ def from_schema(run: Run, member: BaseTool) -> tuple[list[AtomicTool], str]:
             metadata.description,
         )
         for values in product(*domains.values())
-    ], (reasons[0].split(" ", 1)[0] if len(reasons) == 1 else ", ".join(reasons))
-
-
-def schema_summary(options: list[AtomicTool]) -> str:
-    if len(options[0].parameters) == 1 and len(options) <= 8:
-        values = ", ".join(
-            _display_value(next(iter(option.parameters.values()))) for option in options
-        )
-        if len(values) <= 120:
-            return values
-    return f"{len(options)} combinations"
+    ]

@@ -9,9 +9,7 @@ from mobilerun.core.state.screenshot import (
 from mobilerun.core.state.ui_state import UIState
 from PIL import Image
 
-from mobilerun_agents.agent.tools.registry import build_registry
-from mobilerun_agents.config.user_config import ToolsConfig
-from tests.unit.device_fixtures import MemoryDevice, tool_run
+from tests.unit.device_fixtures import MemoryDevice, device_turn, execute_tool
 
 
 def _png(width: int = 1080, height: int = 2400) -> bytes:
@@ -63,28 +61,15 @@ def _normalized_state():
 
 def _ctx():
     driver, provider, state = _normalized_state()
-    return (
-        tool_run(
-            config=ToolsConfig(),
-            driver=driver,
-            ui=state,
-            state_provider=provider,
-            macro_recorder=None,
-        ),
-        driver,
-    )
+    return device_turn(driver, state, provider), driver
 
 
 async def click_at(ctx, x, y):
-    return (await build_registry(ctx, [], None).by_name["tap"].acall(x=x, y=y)).raw_output
+    return await execute_tool(ctx, "tap", x=x, y=y)
 
 
 async def swipe(ctx, start, end):
-    return (
-        await build_registry(ctx, [], None)
-        .by_name["swipe"]
-        .acall(x1=start[0], y1=start[1], x2=end[0], y2=end[1])
-    ).raw_output
+    return await execute_tool(ctx, "swipe", x1=start[0], y1=start[1], x2=end[0], y2=end[1])
 
 
 def test_base_normalization_does_not_rescale_device_actions() -> None:
@@ -102,13 +87,11 @@ def test_pixel_action_summaries_report_device_pixels() -> None:
     driver = _Driver()
     provider = ScreenshotOnlyStateProvider(driver)
     state = asyncio.run(provider.get_state())
-    ctx = tool_run(
-        config=ToolsConfig(), driver=driver, ui=state, state_provider=provider, macro_recorder=None
-    )
+    ctx = device_turn(driver, state, provider)
 
     result = asyncio.run(click_at(ctx, 461, 1024))
 
-    assert "'x': 461, 'y': 1024" in result.summary
+    assert result.summary == "tapped (461, 1024)"
     assert driver.taps[0] == (461, 1024)
 
 
@@ -182,9 +165,7 @@ def _a11y_context(vision: bool, screen=(1080, 2400)):
         vision_enabled=vision,
     )
     ui = asyncio.run(provider.get_state())
-    return tool_run(
-        config=ToolsConfig(), ui=ui, driver=driver, state_provider=provider, macro_recorder=None
-    )
+    return device_turn(driver, ui, provider)
 
 
 def test_normalized_a11y_click_at_rejects_points_outside_device() -> None:
@@ -204,7 +185,7 @@ def test_normalized_a11y_click_at_rejects_points_outside_device() -> None:
 
 def test_normalized_a11y_refuses_coordinates_without_a_screen_size() -> None:
     ctx = _a11y_context(vision=True, screen=(0, 0))
-    assert "(normalized [0-1000])" not in ctx.ui.formatted_text
+    assert "(normalized [0-1000])" not in ctx.state.current.ui.formatted_text
 
     tap = asyncio.run(click_at(ctx, 500, 500))
     drag = asyncio.run(swipe(ctx, [500, 800], [500, 200]))

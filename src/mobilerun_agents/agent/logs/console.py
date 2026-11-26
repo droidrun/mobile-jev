@@ -1,257 +1,138 @@
-"""Human-readable, log-safe output for the agent workflow event stream."""
+"""Render workflow events at the console boundary."""
 
-from __future__ import annotations
-
-import asyncio
-import json
 import logging
-import re
+import os
 from pathlib import Path
-from time import monotonic
-from typing import Any
 
 from workflows.events import Event
 
-from mobilerun_agents.agent.workflows.core.result import AgentResult
-from mobilerun_agents.agent.workflows.core.state import ActionOutcome
-from mobilerun_agents.errors import SelectorCannotServe, UnknownModel
+from mobilerun_agents.agent.events import (
+    Acted,
+    Detail,
+    Observed,
+    Repaired,
+    Selected,
+    Subgoal,
+)
 
-from .diagnostics import ActionDetail, Detail, ModelCall, Retry, Screen, private_values
-from .diagnostics import safe_text as _safe
+from .memory import MemoryDetail
+from .redaction import Redactor
 
-_LOGGER = logging.getLogger(__name__)
-_MEMORY = re.compile(r"<add_memory\b[^>]*>.*?(?:</add_memory\s*>|$)", re.I | re.S)
-
-
-def _distinct_thought(text: str) -> str:
-    normalized = " ".join(text.split())
-    words = normalized.split()
-    if len(words) % 2 == 0 and words[: len(words) // 2] == words[len(words) // 2 :]:
-        return " ".join(words[: len(words) // 2])
-    # Remove the longest repeated phrase without chopping off surrounding text.
-    for length in range(len(words) // 2, 2, -1):
-        for first in range(len(words) - length):
-            phrase = words[first : first + length]
-            for second in range(first + length, len(words) - length + 1):
-                if words[second : second + length] == phrase:
-                    return " ".join(words[:second] + words[second + length :])
-    return normalized
-
-
-def _display_path(path: str | Path) -> str:
-    location = Path(path)
-    home = Path.home()
-    if location.is_relative_to(home):
-        location = Path("~") / location.relative_to(home)
-    return _safe(str(location), limit=None)
-
-
-class ToolDetail(Detail):
-    """A tool expansion message with a stable key across child workflows."""
-
-    key: str
-    count: int
+_log = logging.getLogger(__name__)
 
 
 class ConsoleLog:
-    """Format workflow events without exposing action arguments or screenshots."""
+    def __init__(self, redact: Redactor, folder: Path | None = None) -> None:
+        self._redact = redact
+        self._step = 1
+        self._memory_selectors: dict[int, set[str]] = {}
+        self._memory_folder = (
+            folder / "memory" if folder and _log.isEnabledFor(logging.DEBUG) else None
+        )
+        self._memory_revision = redact.revision
+        if self._memory_folder is not None:
+            self._memory_folder.mkdir(parents=True, mode=0o700, exist_ok=True)
+            _log.debug("Memory details: %s", self._line(str(self._memory_folder)))
 
-    def __init__(self) -> None:
-        self._step: int | None = None
-        self._actions: list[tuple[str, list[str]]] = []
-        self._details: list[str] = []
-        self._delegated = False
-        self._started = monotonic()
-        self._tokens: int | None = 0
-        self._executor: str | None = None
-        self._tools: dict[str, int] = {}
+    def _line(self, text: str) -> str:
+        return " ".join(self._redact.text(text).split())
 
-    def on_event(self, event: Event) -> None:
-        if private_values.get() is None:
-            return
+    def event(self, event: Event) -> None:
         match event:
-            case Retry(attempt=attempt, reason=reason):
-                _LOGGER.debug("  retry %s · %s", attempt, _safe(reason, 300))
-            case Screen():
-                self.flush_step()
-                app = _safe(event.package) if event.package else "unknown app"
-                location = f"{app}/{_safe(event.activity)}" if event.activity else app
-                _LOGGER.debug(
-                    "  screen: %s · %s elements",
-                    location,
-                    event.elements,
+            case Observed(step=step, package=package, activity=activity):
+                self._step = step
+                _log.debug(
+                    "  screen: %s", self._line("/".join(p for p in (package, activity) if p))
                 )
-            case ModelCall():
-                image = f"{event.image[0]}×{event.image[1]}" if event.image else "no image"
-                _LOGGER.debug("  image: %s", image)
-                counts = " ".join(
-                    f"{k}={v if v is not None else '?'}"
-                    for k, v in (
-                        ("input", event.inputs),
-                        ("output", event.outputs),
-                        ("reasoning", event.reasoning),
-                    )
+            case Selected(thought=thought) if thought:
+                _log.debug("  thought: %s", self._line(thought))
+            case Acted(action=action):
+                call = action.call
+                args = self._redact.value(call.tool_kwargs)
+                _log.info(
+                    "%s · %s %s", action.step, self._line(call.tool_name), "✓" if action.ok else "✗"
                 )
-                _LOGGER.debug("  LLM: %s · %.3fs · %s", _safe(event.name), event.seconds, counts)
-                self._tokens = (
-                    self._tokens + event.total
-                    if self._tokens is not None and event.total is not None
-                    else None
-                )
-            case Detail():
-                if type(event) is ToolDetail:
-                    if self._tools.get(event.key) == event.count:
-                        return
-                    self._tools[event.key] = event.count
-                if event.section == "planning":
-                    if event.text.startswith("executor: "):
-                        if self._executor == event.text:
-                            return
-                        self._executor = event.text
-                    else:
-                        self._executor = None
-                text = event.text
-                if event.section == "thought":
-                    text = _safe(_distinct_thought(_MEMORY.sub(" ", text)), 300)
-                elif event.section == "tools":
-                    text = _safe(text, limit=None)
-                else:
-                    text = _safe(text, 300)
-                if text:
-                    _LOGGER.debug("  %s: %s", event.section, text)
-            case ActionDetail():
-                if event.success and event.summary.endswith(" → None"):
-                    self._details.append(f"result: success · {event.seconds:.3f}s")
-                    return
-                args = json.dumps(event.args, ensure_ascii=False)
-                self._details.append(
-                    f"selection: {event.wire} → {event.registry} {_safe(args, 400)}"
-                )
-                self._details.append(
-                    f"result: {'success' if event.success else 'failure'} · {_safe(event.summary)} · {event.seconds:.3f}s"
-                )
+                _log.debug("  arguments: %s · result: %s", args, self._line(action.summary))
+            case Repaired(attempt=attempt, reason=reason):
+                _log.info("Retrying invalid selection")
+                _log.debug("  retry %s · %s", attempt, self._line(reason))
+            case Subgoal(text=text):
+                self._memory_selectors.pop(self._step, None)
+                _log.info("→ subgoal: %s", self._line(text))
+            case MemoryDetail() if _log.isEnabledFor(logging.DEBUG):
+                self._memory(event)
+            case MemoryDetail():
+                pass
+            case Detail(section=section, text=text):
+                _log.debug("  %s: %s", self._line(section), self._line(text))
 
-    def on_repair(self) -> None:
-        if private_values.get() is not None:
+    def _memory(self, detail: MemoryDetail) -> None:
+        selectors = self._memory_selectors.setdefault(self._step, set())
+        later = bool(selectors)
+        selectors.add(detail.selector)
+        if later:
+            _log.debug(
+                "  memory (%s): %s",
+                self._line(detail.selector),
+                self._line(detail.counts),
+                extra={"agent_memory": True},
+            )
+            self._write_memory(detail, detail.selector)
             return
-        self.flush_step()
-        # Parse errors can contain the raw model response and tool parameters.
-        _LOGGER.info("Retrying invalid selection", extra={"color": "dim"})
+        counts = []
+        previews = []
+        for name, text in detail.blocks.items():
+            n = len(text.splitlines())
+            counts.append(f"{name}({n}{' lines' if n > 1 else ''})")
+            # Redact before clipping, so a long secret cannot leak a prefix.
+            first = next(iter(self._redact.text(text).splitlines()), "").strip()
+            if first:
+                preview = first if len(first) <= 120 else first[:119] + "…"
+                previews.append(f"    {self._line(name)}: {preview}")
+        if detail.last_steps:
+            previews.append(f"    last steps: {self._line(' · '.join(detail.last_steps))}")
+        header = f"  memory: {detail.counts} · blocks: {self._line(', '.join(counts) or '(none)')}"
+        _log.debug("%s", "\n".join([header, *previews]), extra={"agent_memory": True})
+        self._write_memory(detail)
 
-    def on_action(self, record: ActionOutcome, delegated: bool = False) -> None:
-        if self._step != record.step:
-            self.flush_step()
-        self._step = record.step
-        detail = ""
-        if record.summary == "[REDACTED]":
-            detail = " ***"
-        elif record.name == "start_app":
-            identifier = record.args.get("package")
-            match identifier:
-                case str():
-                    detail = " " + _safe(identifier)
-        elif record.name == "tap_element":
-            match record.args.get("index"):
-                case int() as index if type(index) is int:
-                    detail = f" [{index}]"
-            label = record.args.get("label")
-            if isinstance(label, str):
-                detail += f" {_safe(label, 40)}"
-        elif record.name == "tap":
-            x, y = record.args.get("x"), record.args.get("y")
-            if isinstance(x, (int, float)) and isinstance(y, (int, float)):
-                detail = f" ({x:g}, {y:g})"
-        elif record.name == "input_text":
-            text = record.args.get("text")
-            if isinstance(text, str):
-                detail = f' "{_safe(text, 40)}"'
-        self._delegated |= delegated
-        status = "✓" if record.ok else "✗"
-        if record.screen_changed is False:
-            status += " · no change"
-        self._actions.append((f"{_safe(record.name)}{detail} {status}", self._details))
-        self._details = []
+    def _write_memory(self, detail: MemoryDetail, selector: str | None = None) -> None:
+        if self._memory_folder is not None:
+            self._refresh_memory_redaction()
+            suffix = f"-{self._line(selector)}" if selector else ""
+            path = self._memory_folder / f"{self._step:04d}{suffix}.txt"
+            if path.exists():
+                index = 2
+                while path.exists():
+                    path = self._memory_folder / f"{self._step:04d}{suffix}-{index}.txt"
+                    index += 1
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            descriptor = os.open(path, flags, 0o600)
+            try:
+                os.fchmod(descriptor, 0o600)
+            except BaseException:
+                os.close(descriptor)
+                raise
+            with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+                file.write(self._redact.text(detail.text) + "\n")
 
-    def on_subgoal(self, text: str) -> None:
-        self.flush_step()
-        _LOGGER.info("→ subgoal: %s", _safe(text))
+    def _refresh_memory_redaction(self) -> None:
+        if self._memory_folder is None or self._memory_revision == self._redact.revision:
+            return
+        for path in self._memory_folder.glob("*.txt"):
+            path.write_text(self._redact.text(path.read_text(encoding="utf-8")), encoding="utf-8")
+        self._memory_revision = self._redact.revision
 
-    def flush_step(self) -> None:
-        marker = " · llm" if self._delegated else ""
-        for action, details in self._actions:
-            _LOGGER.info("%s · %s%s", self._step, action, marker)
-            for detail in details:
-                _LOGGER.debug("  %s", _safe(detail, None))
-        self._actions.clear()
-        self._delegated = False
+    def subgoal_finished(self, success: bool, message: str) -> None:
+        _log.info("%s subgoal: %s", "✓" if success else "✗", self._line(message))
 
-    def _flush_details(self) -> None:
-        for detail in self._details:
-            _LOGGER.debug("  %s", _safe(detail, None))
-        self._details.clear()
-
-    def on_result(
-        self,
-        result: AgentResult[Any],
-        folder: str | None = None,
-        macro_path: Path | None = None,
-        images_folder: Path | None = None,
-    ) -> None:
-        message = result.reason
-        if result.answer and (result.success or result.reason == "complete"):
-            message = result.answer
-        self._finish(
-            result.success,
-            message,
-            result.steps,
-            folder,
-            macro_path=macro_path,
-            images_folder=images_folder,
-        )
-
-    def on_error(self, error: BaseException, steps: int, folder: str | None = None) -> None:
-        # Provider exceptions can include full requests; never log their raw text.
-        message = (
-            "cancelled"
-            if isinstance(error, (KeyboardInterrupt, asyncio.CancelledError))
-            else (
-                str(error)
-                if type(error) in (SelectorCannotServe, UnknownModel)
-                else type(error).__name__
-            )
-        )
-        self._finish(False, message, steps, folder)
-
-    def _finish(
-        self,
-        success: bool,
-        message: str,
-        steps: int,
-        folder: str | None,
-        macro_path: Path | None = None,
-        images_folder: Path | None = None,
-    ) -> None:
-        self.flush_step()
-        display_folder = _display_path(folder) if folder else None
-        debug = private_values.get() is not None
-        if debug:
-            self._flush_details()
-            _LOGGER.debug(
-                "  end: total tokens=%s · total time=%.3fs%s",
-                self._tokens if self._tokens is not None else "?",
-                monotonic() - self._started,
-                f" · run folder={display_folder}" if display_folder else "",
-            )
-            if macro_path is not None:
-                _LOGGER.debug("  macro: %s", _display_path(macro_path))
-            if images_folder is not None:
-                _LOGGER.debug("  images folder: %s", _display_path(images_folder))
-        _LOGGER.info(
+    def finish(self, success: bool, message: str, steps: int, folder: Path | None = None) -> None:
+        self._refresh_memory_redaction()
+        _log.info(
             "%s %s (%s %s%s)",
             "✓" if success else "✗",
-            _safe(message, None if debug else 200),
+            self._line(message),
             steps,
             "step" if steps == 1 else "steps",
-            f" · {display_folder}" if display_folder else "",
+            f" · {self._line(str(folder))}" if folder else "",
             extra={"agent_result": True},
         )

@@ -16,7 +16,7 @@ from mobilerun_agents.config.user_config import (
     SetupConfig,
 )
 
-from .configuration import load_config, pick, pick_choice, save_config
+from .configuration import load_config, pick, pick_choice, update_config
 
 
 class _SetupGroup(click.Group):
@@ -78,11 +78,10 @@ def _edit_setup(
         )
     except ValidationError as exc:
         raise click.UsageError(str(exc)) from None
-    _save_setup(load_config(), name, setup)
+    _save_setup(name, setup)
 
 
 def _save_setup(
-    config: MobileConfig,
     name: str,
     setup: SetupConfig,
     make_default: bool = False,
@@ -90,22 +89,26 @@ def _save_setup(
 ) -> None:
     if not name.strip() or name in {"show", "remove"} or name.startswith("-"):
         raise click.UsageError("Choose a nonempty setup name other than show or remove.")
-    config.setups[name] = setup
-    try:
-        MobileConfig.model_validate(config.model_dump())
-    except ValidationError as exc:
-        raise click.UsageError(str(exc)) from None
-    profile = config.profiles[setup.action_profile]
-    if profile.kind == "decision":
+    profile = load_config().profiles.get(setup.action_profile)
+    checked_provider = None
+    if profile is not None and profile.kind == "decision":
         try:
             asyncio.run(resolve(profile.provider))
         except CredentialMissing as exc:
             raise click.UsageError(str(exc)) from None
-    if make_default:
-        config.default_setup = name
-    elif clear_default:
-        config.default_setup = None
-    save_config(config)
+        checked_provider = profile.provider
+
+    def edit(config: MobileConfig) -> None:
+        action = config.profiles.get(setup.action_profile)
+        if action is not None and action.kind == "decision" and action.provider != checked_provider:
+            raise click.UsageError(f"Profile {setup.action_profile!r} changed; try again.")
+        config.setups[name] = setup
+        if make_default:
+            config.default_setup = name
+        elif clear_default:
+            config.default_setup = None
+
+    update_config(edit)
     click.echo(f"Setup saved: {name}")
     if make_default:
         click.echo(f"Default setup: {name}")
@@ -168,7 +171,6 @@ def _interactive(name: str | None) -> None:
         click.echo("Cancelled.")
         return
     _save_setup(
-        config,
         name,
         SetupConfig(
             selector=None if planning else action,
@@ -217,44 +219,43 @@ def show(name: str | None) -> None:
 @click.option("--unset", "unset_default", is_flag=True, help="Clear the default setup.")
 def default(name: str | None, unset_default: bool) -> None:
     """Use NAME when run does not specify --setup, or clear it with --unset."""
-    config = load_config()
-    if unset_default:
-        if name is not None:
-            raise click.UsageError("NAME cannot be used with --unset.")
-        config.default_setup = None
-        save_config(config)
-        _echo_default_cleared()
-        return
-    if name is None:
+    if unset_default and name is not None:
+        raise click.UsageError("NAME cannot be used with --unset.")
+    if not unset_default and name is None:
         if not menu.is_interactive():
             raise click.UsageError("Supply a setup name, --unset, or open configure in a terminal.")
         choices = [SelectChoice("", "None (no default)")]
-        choices.extend(SelectChoice(key, key) for key in config.setups)
-        name = pick_choice("Default setup", choices)
-        if not name:
-            config.default_setup = None
-            save_config(config)
-            _echo_default_cleared()
-            return
-    if name not in config.setups:
-        raise click.UsageError(f"Unknown setup {name!r}")
-    config.default_setup = name
-    save_config(config)
-    click.echo(f"Default setup: {name}")
+        choices.extend(SelectChoice(key, key) for key in load_config().setups)
+        name = pick_choice("Default setup", choices) or None
+
+    def edit(config: MobileConfig) -> None:
+        if name is not None and name not in config.setups:
+            raise click.UsageError(f"Unknown setup {name!r}")
+        config.default_setup = name
+
+    update_config(edit)
+    if name is None:
+        _echo_default_cleared()
+    else:
+        click.echo(f"Default setup: {name}")
 
 
 @configure.command()
 @click.argument("name")
 def remove(name: str) -> None:
     """Remove a setup without removing its profiles."""
-    config = load_config()
-    if name not in config.setups:
-        raise click.UsageError(f"Unknown setup {name!r}")
-    was_default = config.default_setup == name
-    if was_default:
-        config.default_setup = None
-    del config.setups[name]
-    save_config(config)
+    was_default = False
+
+    def edit(config: MobileConfig) -> None:
+        nonlocal was_default
+        if name not in config.setups:
+            raise click.UsageError(f"Unknown setup {name!r}")
+        was_default = config.default_setup == name
+        if was_default:
+            config.default_setup = None
+        del config.setups[name]
+
+    update_config(edit)
     click.echo(f"Setup removed: {name}")
-    if config.default_setup is None and was_default:
+    if was_default:
         _echo_default_cleared()
