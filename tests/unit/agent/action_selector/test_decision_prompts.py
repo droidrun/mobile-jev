@@ -8,7 +8,13 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 import mobilerun_agents
 from mobilerun_agents.agent.action_selector import DecisionSelector
+from mobilerun_agents.agent.action_selector.decision_model.base import (
+    ActionCandidate,
+    DecisionInput,
+)
 from mobilerun_agents.agent.action_selector.decision_model.typesafe import TypeSafeDecisionModel
+from mobilerun_agents.agent.action_selector.llm.parsing import ToolCall
+from mobilerun_agents.agent.workflows.core.state import JevAbstention, PlanningState, SubgoalResult
 from mobilerun_agents.config.prompts import render_prompt
 from mobilerun_agents.config.user_config import DecisionConfig
 
@@ -80,6 +86,122 @@ def test_candidate_template_branches_render_strict(kind):
         unnamed_class="Switch",
         notes=["state_true", "state_false", "top", "bottom", "selected", "focused", "password"],
     )
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        (
+            "abstain",
+            "Unfinished: stop and hand this subgoal back to the planner because none of the "
+            "available choices can continue it (for example, text must be typed).",
+        ),
+        ("complete_success", "complete: subgoal done"),
+        ("complete_failure", "complete: report failure (blocked or impossible)"),
+    ],
+)
+def test_decision_criteria_distinguish_unfinished_from_completion(kind, expected):
+    assert render_prompt(DecisionConfig().criteria_prompt, kind=kind) == expected
+
+
+@pytest.mark.parametrize(
+    ("choice", "confidence", "target_confidence", "explanation"),
+    [
+        ("abstain", 0.92, None, "It chose 'unfinished'."),
+        ("tap search", 0.84, 0.2, "Its proposed option or target scored below the cutoff."),
+    ],
+)
+def test_planner_turn_explains_jev_abstention(choice, confidence, target_confidence, explanation):
+    prompt = render_prompt(
+        "assets/prompts/planning/turn.jinja2",
+        state=PlanningState(
+            goal="Find a book",
+            results=[
+                SubgoalResult(
+                    subgoal="Search for the book",
+                    success=False,
+                    message="Unfinished: no action was taken.",
+                    reason="abstained",
+                    jev_abstention=JevAbstention(
+                        choice=choice,
+                        confidence=confidence,
+                        target_confidence=target_confidence,
+                        cutoff=0.6,
+                        thought="I don't have a browser",
+                        choices="2 · tap 1, start_app 1 · +abstain",
+                    ),
+                )
+            ],
+        ),
+        repair=None,
+        last_turn=False,
+        summary="",
+        package=None,
+        activity=None,
+        ui="Search field",
+    )
+
+    assert "Latest executor subgoal result: Unfinished: Search for the book:" in prompt
+    assert "Unfinished: no action was taken." in prompt
+    framing = "Jev ended the subgoal unfinished and handed it back without acting."
+    assert framing in prompt
+    assert explanation in prompt
+    assert prompt.index(framing) < prompt.index(explanation) < prompt.index("Jev choice:")
+    assert f"Jev choice: {choice} · confidence: {confidence}" in prompt
+    assert ("target confidence: 0.2" in prompt) == (target_confidence is not None)
+    assert "cutoff: 0.6" in prompt
+    assert "Jev thought: I don't have a browser" in prompt
+    assert "jev choices: 2 · tap 1, start_app 1 · +abstain" in prompt
+
+
+@pytest.mark.parametrize(
+    ("tools", "expected"),
+    [
+        (("input_text", "delegate", "complete"), "type"),
+        (("input_text", "delegate"), "type"),
+        (("input_text", "complete"), "type"),
+        (("input_text",), "type"),
+        (("delegate", "complete"), "delegate"),
+        (("delegate",), "delegate"),
+        (("complete",), "unfinished"),
+        (("tap_element",), "unfinished"),
+    ],
+)
+def test_decision_system_only_shows_typing_guidance_for_available_choices(tools, expected):
+    request = DecisionInput(
+        goal="Find a book",
+        options=tuple(ActionCandidate(ToolCall(name), name) for name in tools),
+    )
+    prompt = render_prompt(
+        DecisionConfig().system_prompt, **request.get_decision_prompt_variables()
+    )
+
+    assert "Choose Unfinished only when no available choice fits." in prompt
+    assert ("Choose `complete` success if the subgoal was achieved" in prompt) == (
+        "complete" in tools
+    )
+    assert ("choose `complete` failure if the subgoal is over but was not achieved" in prompt) == (
+        "complete" in tools
+    )
+    guidance = {
+        "type": "then choose `input_text` with the requested text",
+        "delegate": "requires typing into an input field, choose `delegate`.",
+        "unfinished": "requires typing into an input field, choose Unfinished.",
+    }
+    assert [mode for mode, line in guidance.items() if line in prompt] == [expected]
+
+
+@pytest.mark.parametrize("can_wait", [True, False])
+def test_decision_system_only_suggests_wait_when_available(can_wait):
+    request = DecisionInput(
+        goal="Open the app",
+        options=(ActionCandidate(ToolCall("wait"), "Wait"),) if can_wait else (),
+    )
+    prompt = render_prompt(
+        DecisionConfig().system_prompt, **request.get_decision_prompt_variables()
+    )
+    instruction = "If the screen is still loading (e.g. right after opening an app, no app content is visible yet), choose `wait`."
+    assert (instruction in prompt) == can_wait
 
 
 def test_no_model_facing_prose_in_selector_code():

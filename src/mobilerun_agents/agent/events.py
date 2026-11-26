@@ -10,6 +10,7 @@ class Observed(Event):
     step: int
     package: str | None = None
     activity: str | None = None
+    planner: bool = False
 
 
 class Selected(Event):
@@ -33,6 +34,8 @@ class Repaired(Event):
 class Subgoal(Event):
     text: str
     result: SubgoalResult | None = None
+    step: int | None = None
+    budget: int | None = None
 
 
 class Detail(Event):
@@ -43,3 +46,5 @@ class Detail(Event):
 class Finished(Event):
     outcome: Outcome
     steps: int
+    planner_turns: int | None = None
+    budget: int | None = None

@@ -1,6 +1,7 @@
 """Observe, select, execute and finish one agent invocation."""
 
 import json
+from asyncio import sleep
 from typing import Any, cast
 
 from llama_index.core.base.llms.types import ChatMessage, ImageBlock
@@ -53,7 +54,7 @@ def _step_count(state: AgentState) -> int:
 def _invalid_selection(
     selection: Selection, services: ServicesResource, parallel: bool
 ) -> str | None:
-    if selection.abstained or not selection.calls:
+    if not selection.calls:
         return "No tool selected; choose an available tool."
     if not parallel and len(selection.calls) != 1:
         return "Call exactly one tool."
@@ -92,6 +93,8 @@ class AgentWorkflow(Workflow):
                         max_steps=self.config.max_steps if max_steps is None else max_steps,
                     )
                 )
+            case Observe() if self.config.settle_delay:
+                await sleep(self.config.settle_delay)
         ui = await device.state.refresh()
         snapshot = StepSnapshot(ui=ui, device_context=list(await device.context()))
         if not ui.elements:
@@ -135,6 +138,39 @@ class AgentWorkflow(Workflow):
             selection = await self.selector.select(ctx, device, memory, registry)
             for call in selection.calls:
                 registry.protect(call)
+            if selection.abstained:
+                abstention = selection.jev_abstention
+                if abstention is None:
+                    message = "Unfinished: the selector took no action."
+                elif abstention.choice == "abstain":
+                    message = (
+                        "Unfinished: the decision model handed the subgoal back without acting "
+                        "(it chose 'unfinished')."
+                    )
+                else:
+                    if (
+                        abstention.confidence is not None
+                        and abstention.confidence < abstention.cutoff
+                    ):
+                        score = f"confidence {abstention.confidence}"
+                    else:
+                        score = f"target confidence {abstention.target_confidence}"
+                    message = (
+                        f"Unfinished: the decision model's best choice ({abstention.choice}, {score}) "
+                        f"was below the cutoff {abstention.cutoff}, so no action was taken."
+                    )
+                async with ctx.store.edit_state() as state:
+                    services.images.forget(state, _step_count(state) + 1, registry.protected_values)
+                    if state.current is not None:
+                        state.current.screenshot = None
+                return Done(
+                    outcome=Outcome(
+                        success=False,
+                        message=message,
+                        reason="abstained",
+                        jev_abstention=abstention,
+                    )
+                )
             reason = _invalid_selection(selection, services, self.config.parallel_tools)
         except InvalidResponse as error:
             selection = Selection()
@@ -143,7 +179,9 @@ class AgentWorkflow(Workflow):
         state = await ctx.store.get_state()
         number = _step_count(state) + 1
         if reason is None:
-            ctx.write_event_to_stream(Selected(step=number, **selection.model_dump()))
+            ctx.write_event_to_stream(
+                Selected(step=number, **selection.model_dump(exclude={"jev_abstention"}))
+            )
             return Act(calls=selection.calls, thought="\n".join(thoughts) or None)
 
         async with ctx.store.edit_state() as state:

@@ -175,7 +175,7 @@ class Replies(MockLLM):
         args = {"success": True, "message": "Battery at 80%"}
         if "set_plan" in names and not self._calls:
             tool, args = "set_plan", {"subgoals": ["Read battery"]}
-        elif "repair_attempts" in prompt and "set_plan" in names:
+        elif "Failure reason: abstained" in prompt and "set_plan" in names:
             args = {"success": False, "message": "No reliable action"}
         elif self._inspect and not self._calls:
             tool, args = "tap_element", {"index": 1}
@@ -247,7 +247,6 @@ def test_catalog_runs_with_fakes(demo, monkeypatch, tmp_path, capsys, name):
     phone, history, decisions = Phone(), [], []
     config = MobileConfig()
     config.analytics.enabled = config.tracing.enabled = config.agent.streaming = False
-    config.agent.decision.max_response_repair_attempts = 1
     verification = name in {"phone_number", "mailbox"}
     config.checkpoints.enabled = not verification
     monkeypatch.setitem(demo, "DEBUG", verification)
@@ -328,6 +327,8 @@ def test_catalog_runs_with_fakes(demo, monkeypatch, tmp_path, capsys, name):
         assert {image for _, _, image in history} == ({False} if name == "llm" else {True})
     if name in {"jev", "jev_exclude"}:
         assert not history
+    if name == "planner_jev":
+        assert len(decisions) == 1
     if name == "jev_exclude":
         assert decisions and all("press_button" not in options for options in decisions)
     if name in {"delegation", "planner_delegation"}:

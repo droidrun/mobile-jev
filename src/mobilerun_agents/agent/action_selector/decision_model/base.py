@@ -2,6 +2,7 @@
 
 import asyncio
 import math
+from collections import Counter
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -27,7 +28,7 @@ from mobilerun_agents.agent.memory.messages import text_messages
 from mobilerun_agents.agent.tools.atomic import AtomicTool, has_device_atomic_exception
 from mobilerun_agents.agent.tools.helpers import device_dimensions, visual_tool_names
 from mobilerun_agents.agent.tools.registry import ToolRegistry
-from mobilerun_agents.agent.workflows.core.state import AgentState
+from mobilerun_agents.agent.workflows.core.state import AgentState, JevAbstention
 from mobilerun_agents.config.loader import ConfigLoader
 from mobilerun_agents.config.prompts import render_prompt
 from mobilerun_agents.config.user_config import DecisionConfig, Vision
@@ -54,6 +55,11 @@ class DecisionInput:
     intent: str = field(default="", repr=False)
     detail: Callable[[str, str], None] | None = field(default=None, repr=False)
     previous_action: str | None = None
+
+    def describe_choices(self) -> str:
+        groups = Counter(option.action.name for option in self.options)
+        grouped = ", ".join(f"{name} {count}" for name, count in groups.most_common())
+        return f"{len(self.options)} · {grouped} · +abstain"
 
     def get_decision_prompt_variables(self) -> dict[str, Any]:
         available = {o.action.name for o in self.options}
@@ -257,6 +263,16 @@ class DecisionSelector(ActionSelector):
             return Selection(abstained=True)
         min_confidence = config.min_confidence
         index = decision.option_index
+        if index is not None:
+            if not 0 <= index < len(request.options):
+                raise InvalidResponse(render_prompt(config.invalid_arguments_prompt))
+            option = request.options[index]
+            action = option.action
+            if option.point_space is not None:
+                x, y = self._place(
+                    decision.point, option.point_space, config.invalid_arguments_prompt
+                )
+                action = ToolCall(action.name, {**action.parameters, "x": x, "y": y})
         if index is None or any(
             score is not None and score < min_confidence
             for score in (decision.confidence, decision.target_confidence)
@@ -267,19 +283,22 @@ class DecisionSelector(ActionSelector):
                     ("model chose abstain" if index is None else f"score below {min_confidence:g}"),
                 )
             return Selection(
-                abstained=True, thought=decision.thought or None, confidence=decision.confidence
+                abstained=True,
+                thought=decision.thought or None,
+                confidence=decision.confidence,
+                jev_abstention=JevAbstention(
+                    choice="abstain" if index is None else request.options[index].description,
+                    confidence=decision.confidence,
+                    target_confidence=decision.target_confidence,
+                    cutoff=min_confidence,
+                    thought=decision.thought or None,
+                    choices=request.describe_choices(),
+                ),
             )
-        if not 0 <= index < len(request.options):
-            raise InvalidResponse(render_prompt(config.invalid_arguments_prompt))
-        option = request.options[index]
-        action = option.action
         if action.name == "complete":
             action = ToolCall(
                 action.name, {**action.parameters, "message": decision.message or None}
             )
-        elif option.point_space is not None:
-            x, y = self._place(decision.point, option.point_space, config.invalid_arguments_prompt)
-            action = ToolCall(action.name, {**action.parameters, "x": x, "y": y})
         return Selection(
             calls=[
                 ToolSelection(

@@ -3,26 +3,31 @@ import base64
 from unittest.mock import AsyncMock, NonCallableMock
 
 import pytest
+from llama_index.core.base.llms.types import ImageBlock
 from llama_index.core.memory import Memory
 from llama_index.core.tools import ToolSelection
 from mobilerun.core.state.base import StateProvider
 from mobilerun.core.state.ui_state import UIState
+from mobilerun.errors import DeviceOperationNotSupported
+from mobilerun.models.context import ContextItem
 from pydantic import BaseModel
 from workflows import Context
 from workflows.context.serializers import JsonSerializer
 from workflows.errors import WorkflowCancelledByUser
 
 from mobilerun_agents.agent.action_selector.base import ActionSelector, Selection
+from mobilerun_agents.agent.checkpoints.store import save_context
 from mobilerun_agents.agent.events import Acted, Finished, Observed, Subgoal
 from mobilerun_agents.agent.logs.console import ConsoleLog
 from mobilerun_agents.agent.logs.memory import MemoryDetail
 from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.memory.memory import _RunMemory
 from mobilerun_agents.agent.planner import Finish, Plan, Planner
+from mobilerun_agents.agent.planner.llama_index import _clip, _render_failure
 from mobilerun_agents.agent.tools.base import tool
 from mobilerun_agents.agent.tools.helpers.images import ImageStore
 from mobilerun_agents.agent.tools.registry import build_registry
-from mobilerun_agents.agent.workflows.planning import PlanningWorkflow, _clip
+from mobilerun_agents.agent.workflows.planning import PlanningWorkflow
 from mobilerun_agents.agent.workflows.resources import Services, run_resources
 from mobilerun_agents.config.user_config import AgentConfig, ToolsConfig
 from tests.unit.device_fixtures import MemoryDevice
@@ -34,8 +39,9 @@ class FakePlanner(Planner):
         self.states = []
         self.prompt_inputs = []
 
-    def bind(self, output_schema, repair, observe_screen):
-        self.prompt_inputs.append((output_schema, repair, observe_screen))
+    def bind(self, output_schema, repair, redact):
+        self.redact = redact
+        self.prompt_inputs.append((output_schema, repair))
         return self
 
     async def plan(self, ctx):
@@ -113,13 +119,75 @@ def make_workflow(phone, tmp_path, monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_planner_receives_child_repair_exhaustion_from_jev(make_workflow):
+@pytest.mark.parametrize(
+    ("kind", "setup"),
+    [
+        (
+            "decision",
+            "Executor: Jev, a decision model. It picks one fixed action per step, such as tapping "
+            "a listed element, opening an app, scrolling, pressing a button, waiting, or finishing. "
+            "Jev cannot supply free-form text or write answers itself. "
+            "It ends a subgoal Unfinished when no listed action fits.",
+        ),
+        (
+            "decision_delegate",
+            "Executor: Jev, a decision model. It picks one fixed action per step, such as tapping "
+            "a listed element, opening an app, scrolling, pressing a button, waiting, or finishing. "
+            "Jev cannot supply free-form text or write answers itself. "
+            "It ends a subgoal Unfinished when no listed action fits. "
+            "It can hand a step to an LLM via `delegate`; the LLM can type if the tool is available.",
+        ),
+        ("llm", "Executor: an LLM that can call any available tool, including typing."),
+        ("custom", "Executor: a custom selector."),
+    ],
+)
+async def test_planner_prompt_describes_executor_and_checkpoint_restores_it(
+    make_workflow, tmp_path, kind, setup
+):
+    from mobilerun_agents.agent.action_selector import (
+        DecisionSelector,
+        DelegatingSelector,
+        LlamaIndexLLMSelector,
+    )
+    from mobilerun_agents.agent.planner import LlamaIndexPlanner
+    from tests.unit.agent.action_selector.test_delegating_selector import Model
+    from tests.unit.agent.planner.test_llama_index import Replies
+
+    jev = DecisionSelector(Model(), "off")
+    llm_selector = LlamaIndexLLMSelector(Replies())
+    selector = {
+        "decision": jev,
+        "decision_delegate": DelegatingSelector(jev, llm_selector),
+        "llm": llm_selector,
+        "custom": FakeSelector(),
+    }[kind]
+    llm = Replies()
+    llm._calls = [("complete", {"success": True, "message": "Done"})]
+    flow = await make_workflow(LlamaIndexPlanner(llm), selector)
+    handler = flow.run(goal="Check executor setup")
+    assert (await handler).success
+    messages, _ = llm._requests[0]
+    assert [line for line in messages[0].content.splitlines() if line.startswith("Executor:")] == [
+        setup
+    ]
+
+    saved = await save_context(tmp_path / "context.json", handler.ctx, Redactor())
+    restored = await Context.from_dict(flow, saved).store.get_state()
+    assert restored.executor == kind
+
+
+@pytest.mark.anyio
+async def test_planner_replans_after_jev_abstains(make_workflow):
     from mobilerun_agents.agent.action_selector import DecisionSelector, DelegatingSelector
     from mobilerun_agents.config.user_config import DecisionConfig
     from tests.unit.agent.action_selector.test_delegating_selector import Model, Stub
 
-    planner = FakePlanner(Plan(("Find price",)), Finish(False, "No reliable action"))
-    decision = Model(("wait", 0.2), ("wait", 0.2))
+    planner = FakePlanner(
+        Plan(("Find price",)), Plan(("Try another screen",)), Finish(True, "Price found")
+    )
+    decision = Model(
+        ("complete", 0.2), ("complete", 0.9), ("complete", 0.9), completion_success=True
+    )
     delegate = Stub()
     selector = DelegatingSelector(DecisionSelector(decision, "off", min_confidence=0.7), delegate)
     workflow = await make_workflow(
@@ -128,9 +196,46 @@ async def test_planner_receives_child_repair_exhaustion_from_jev(make_workflow):
         config=AgentConfig(decision=DecisionConfig(max_response_repair_attempts=1)),
     )
     result = await workflow.run(goal="Find price")
-    assert result.message == "No reliable action"
+    assert result.success and result.message == "Price found"
     child = planner.states[1].results[0]
-    assert not child.success and child.reason == "repair_attempts" and not delegate.calls
+    assert not child.success and child.reason == "abstained"
+    assert "Failure reason: abstained" in _render_failure(child, planner.redact)
+    assert planner.states[2].results[-1].subgoal == "Try another screen"
+    assert planner.states[2].results[-1].success
+    assert [state.executor for state in planner.states] == ["decision_delegate"] * 3
+    assert len(decision.requests) == 2 and not delegate.calls
+
+
+@pytest.mark.anyio
+async def test_planner_prompt_includes_raw_jev_abstention(make_workflow):
+    from mobilerun_agents.agent.action_selector import DecisionSelector
+    from mobilerun_agents.agent.action_selector.decision_model.base import Decision
+    from mobilerun_agents.agent.planner import LlamaIndexPlanner
+    from tests.unit.agent.action_selector.test_typesafe_decision_model import Model
+    from tests.unit.agent.planner.test_llama_index import Replies
+
+    def answer(request):
+        index = next(i for i, option in enumerate(request.options) if option.action.name == "tick")
+        return Decision(option_index=index, confidence=0.32, thought="Try the search field.")
+
+    llm = Replies()
+    flow = await make_workflow(
+        LlamaIndexPlanner(llm), DecisionSelector(Model(answer), "off", min_confidence=0.7)
+    )
+    assert (await flow.run(goal="Find the search field")).success
+    messages, _ = llm._requests[-1]
+    prompt = messages[0].content
+    assert (
+        "Latest executor subgoal result: Unfinished: Read battery: "
+        "Unfinished: the decision model's best choice (tick, confidence 0.32) "
+        "was below the cutoff 0.7, so no action was taken." in prompt
+    )
+    assert "Jev ended the subgoal unfinished and handed it back without acting." in prompt
+    assert "choice: tick" in prompt
+    assert "confidence: 0.32" in prompt and "cutoff: 0.7" in prompt
+    assert "Try the search field." in prompt
+    choices = next(line for line in prompt.splitlines() if line.startswith("jev choices: "))
+    assert "tick 1" in choices and "complete 2" in choices and "input_text" not in choices
 
 
 @pytest.mark.anyio
@@ -182,16 +287,17 @@ async def test_planner_reconsiders_each_subgoal_and_saves_one_ordered_action_his
         ("Dismiss sign-in", None),
         ("Dismiss sign-in", "Now visible"),
     ]
-    assert [event.step for event in events if isinstance(event, Observed)] == [1, 2]
+    assert [event.step for event in events if isinstance(event, Observed)] == [0, 1, 2, 2, 4]
     assert selector.goals == ["Look up price", "Dismiss sign-in"]
     assert all(isinstance(memory, Memory) for memory in selector.memories)
     assert selector.memories[0] is not selector.memories[1]
     assert planner.states[1].plan == ["Unused remainder"]
     failed = planner.states[1].results[0]
     assert not failed.success and failed.reason == "complete"
-    assert "Sign-in dialog hides prices." in failed.summary and "shop" in failed.summary
+    summary = _render_failure(failed, planner.redact)
+    assert "Sign-in dialog hides prices." in summary and "shop" in summary
     assert [event.action.step for event in events if isinstance(event, Acted)] == [1, 2]
-    assert [event.steps for event in events if isinstance(event, Finished)] == [2]
+    assert [event.steps for event in events if isinstance(event, Finished)] == [5]
     serializer = JsonSerializer()
     saved = Context.from_dict(
         flow, handler.ctx.to_dict(serializer=serializer), serializer=serializer
@@ -257,20 +363,44 @@ def test_clip_scans_long_screen_once_and_backs_up_across_overlapping_spans():
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("message", "expected"), [("", True), ("Goal achieved.", False), ("Battery at 100%", False)]
-)
-async def test_only_missing_description_requests_observation(
-    make_workflow, phone, message, expected
+@pytest.mark.parametrize("screenshot_supported", [True, False])
+async def test_planner_observes_fresh_ui_images_and_context_for_free(
+    make_workflow, phone, screenshot_supported
 ):
-    planner = FakePlanner(Plan(("Read battery",)), Finish(True, "Done"))
-    flow = await make_workflow(planner, FakeSelector(complete(message)))
-    assert (await flow.run(goal="Check battery")).success
-    state = planner.states[1]
-    observe_screen = planner.prompt_inputs[1][2]
-    assert observe_screen == expected
-    if observe_screen:
-        assert state.current.screenshot.path.read_bytes() == await phone.screenshot()
+    provider = phone._state_provider_override
+    packages = ["initial", "child1", "after1", "child2", "after2"]
+    provider.get_state.side_effect = [
+        UIState([{"text": package}], package, "", {"packageName": package}, 100, 100)
+        for package in packages
+    ]
+    contexts = [ContextItem("test", "screen", {"name": package}) for package in packages]
+    phone.context = AsyncMock(side_effect=[[item] for item in contexts])
+    if not screenshot_supported:
+        phone.screenshot.side_effect = DeviceOperationNotSupported("No camera")
+
+    planner = FakePlanner(Plan(("First",)), Plan(("Second",)), Finish(True, "Done"))
+    flow = await make_workflow(planner, FakeSelector(complete("done"), complete("")))
+    handler = flow.run(goal="Check battery", max_steps=5)
+    events = [event async for event in handler.stream_events()]
+    assert (await handler).success
+
+    assert provider.get_state.await_count == phone.context.await_count == 5
+    assert phone.screenshot.await_count == 3
+    assert [(e.step, e.package, e.planner) for e in events if isinstance(e, Observed)] == [
+        (0, "initial", True),
+        (1, "child1", False),
+        (2, "after1", True),
+        (2, "child2", False),
+        (4, "after2", True),
+    ]
+    assert [event.steps for event in events if isinstance(event, Finished)] == [5]
+    snapshots = [state.current for state in planner.states]
+    assert [item.ui.formatted_text for item in snapshots] == packages[::2]
+    assert [item.device_context for item in snapshots] == [[item] for item in contexts[::2]]
+    assert [item.screenshot is not None for item in snapshots] == [screenshot_supported] * 3
+    if screenshot_supported:
+        assert snapshots[-1].screenshot.path.read_bytes() == phone.screenshot.return_value
+        assert all(not item.screenshot.path.exists() for item in snapshots[:-1])
 
 
 @pytest.mark.anyio
@@ -286,8 +416,205 @@ async def test_later_child_protection_clears_earlier_image_references(make_workf
     assert (await handler).success
     path = planner.states[1].actions[0].before.screenshot.path
     assert not path.exists()
-    assert planner.prompt_inputs[2][2] and planner.states[2].current.screenshot is None
+    assert not planner.states[0].current.screenshot.path.exists()
+    assert not planner.states[1].current.screenshot.path.exists()
+    assert planner.states[2].current.screenshot is None
     assert all(record.before.screenshot is None for record in planner.states[2].actions)
+
+
+@pytest.mark.anyio
+async def test_vision_planner_reads_full_ui_after_child_completes_without_message(
+    make_workflow, phone, monkeypatch
+):
+    from mobilerun_agents.agent.action_selector.llm.models import Capabilities
+    from mobilerun_agents.agent.planner import LlamaIndexPlanner
+    from tests.unit.agent.planner.test_llama_index import Replies
+
+    monkeypatch.setattr(
+        "mobilerun_agents.agent.planner.llama_index.adapter_capabilities",
+        lambda _: Capabilities(vision=True),
+    )
+    full_ui = "Other product\n" * 400 + "Requested price: £42.00"
+    old = UIState([{"text": "Old screen"}], "Old screen", "", {}, 100, 100)
+    new = UIState([{"text": "New screen"}], full_ui, "", {}, 100, 100)
+    phone._state_provider_override.get_state.side_effect = [old, old, old, new]
+    protected = ToolSelection(
+        tool_id="protect", tool_name="protect", tool_kwargs={"text": "fixture-private"}
+    )
+    llm = Replies()
+    llm._calls = [
+        ("set_plan", {"subgoals": ["Read the price"]}),
+        ("complete", {"success": True, "message": "The price is £42.00"}),
+    ]
+    flow = await make_workflow(LlamaIndexPlanner(llm), FakeSelector(protected, complete("")))
+    handler = flow.run(goal="Find the price", max_steps=4)
+    assert (await handler).message == "The price is £42.00"
+    (first, _), (second, _) = llm._requests
+    initial_image = next(block for block in first[0].blocks if isinstance(block, ImageBlock))
+    assert initial_image.path is not None and not initial_image.path.exists()
+    assert phone.screenshot.await_count == 1
+    assert not any(isinstance(block, ImageBlock) for block in second[0].blocks)
+    assert full_ui in second[0].content
+    assert (
+        "Read the values the goal needs yourself if the executor did not report them."
+        in second[0].content
+    )
+
+
+@pytest.mark.anyio
+async def test_planner_keeps_findings_when_switching_between_price_screens(make_workflow, phone):
+    from mobilerun_agents.agent.planner import LlamaIndexPlanner
+    from tests.unit.agent.planner.test_llama_index import Replies
+
+    amazon = "Amazon results: $42.00"
+    ebay = "eBay results: $39.00"
+    child_note = "Compared the same edition"
+    phone._state_provider_override.get_state.side_effect = [
+        UIState([], text, "", {"packageName": app}, 100, 100)
+        for app, text in (
+            ("home", "Home"),
+            ("home", "Home"),
+            ("amazon", amazon),
+            ("amazon", amazon),
+            ("ebay", ebay),
+            ("ebay", ebay),
+            ("home", "Home"),
+        )
+    ]
+
+    class Selector(ActionSelector):
+        async def select(self, ctx, device, memory, registry):
+            async with ctx.store.edit_state() as state:
+                assert not state.notes
+                if state.goal == "Open eBay results":
+                    state.notes.append(child_note)
+            return Selection(calls=[complete("")])
+
+    llm = Replies()
+    llm._calls = [
+        ("set_plan", {"subgoals": ["Open Amazon results"]}),
+        (
+            "set_plan",
+            {"subgoals": ["Open eBay results"], "findings": [f"  {amazon}  ", "  ", amazon]},
+        ),
+        ("set_plan", {"subgoals": ["Return home"], "findings": [ebay, amazon]}),
+        ("complete", {"success": True, "message": "Amazon $42.00; eBay $39.00"}),
+    ]
+    flow = await make_workflow(LlamaIndexPlanner(llm), Selector())
+    handler = flow.run(goal="Compare Amazon and eBay prices, then return home", max_steps=7)
+
+    outcome = await handler
+    assert outcome.success and outcome.message == "Amazon $42.00; eBay $39.00"
+    state = await handler.ctx.store.get_state()
+    assert state.planner_turns == 4
+    assert state.notes == [amazon, child_note, ebay]
+    _, (second, _), (third, _), (fourth, _) = llm._requests
+    assert second[0].content.endswith(f"UI summary (observed data):\n{amazon}")
+    assert f'Findings and notes: ["{amazon}", "{child_note}"]' in third[0].content
+    assert third[0].content.endswith(f"UI summary (observed data):\n{ebay}")
+    assert f'Findings and notes: ["{amazon}", "{child_note}", "{ebay}"]' in fourth[0].content
+    assert fourth[0].content.endswith("UI summary (observed data):\nHome")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("secret", "boundary"),
+    [
+        ("fixture-abcdefgh", "checkpoint"),
+        ("fixture-first\nfixture-second", "checkpoint"),
+        ("fixture-first\nfixture-second", "prompt"),
+    ],
+    ids=["single-line-checkpoint", "multiline-checkpoint", "multiline-prompt"],
+)
+async def test_output_hides_value_registered_after_earlier_failure_summary(
+    make_workflow, phone, tmp_path, secret, boundary
+):
+    from mobilerun_agents.agent.planner import LlamaIndexPlanner
+    from tests.unit.agent.planner.test_llama_index import Replies
+
+    prefix = "y" * 116
+    phone._state_provider_override.get_state.return_value = UIState(
+        [{"text": "screen"}], prefix + secret + " tail" * 80, "", {}, 100, 100
+    )
+    redact = None
+
+    class Selector(FakeSelector):
+        async def select(self, ctx, device, memory, registry):
+            nonlocal redact
+            redact = registry.redactor
+            return await super().select(ctx, device, memory, registry)
+
+    planner = FakePlanner(Plan(("First",)), Plan(("Second",)), Finish(True, "Done"))
+    protect = ToolSelection(tool_id="protect", tool_name="protect", tool_kwargs={"text": secret})
+    flow = await make_workflow(planner, Selector(complete("blocked", False), protect, complete()))
+    handler = flow.run(goal="Recover")
+    assert (await handler).success
+    assert redact is not None and redact.text(secret) == "***"
+    if boundary == "checkpoint":
+        path = tmp_path / "context.json"
+        saved = await save_context(path, handler.ctx, redact)
+        assert "fixture-" not in path.read_text()
+        restored = await Context.from_dict(flow, saved).store.get_state()
+        assert restored.results[0].summary.screens[0][1] == prefix + "***" + " tail" * 80
+    else:
+        # The planner renders only the latest failure. Render the earlier failure
+        # with the registry after the second child has registered the value.
+        state = await handler.ctx.store.get_state()
+        ctx = Context(flow)
+        await ctx.store.set_state(
+            state.model_copy(update={"results": state.results[:1], "current": None})
+        )
+        llm = Replies()
+        await LlamaIndexPlanner(llm).bind(None, None, redact).plan(ctx)
+        messages, _ = llm._requests[0]
+        prompt = messages[0].content
+        assert prefix + "fixt" not in prompt
+        assert f"— {prefix} ×1" in prompt
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("boundary", ["checkpoint", "prompt"])
+async def test_failure_summary_keeps_multiline_values_intact_until_redaction(
+    make_workflow, phone, tmp_path, boundary
+):
+    from mobilerun_agents.agent.planner import LlamaIndexPlanner
+    from tests.unit.agent.planner.test_llama_index import Replies
+
+    secret = "synthetic-first-half\nsynthetic-second-half"
+    before = UIState([], f"Sign in: {secret} unrelated tail", "", {}, 100, 100)
+    after = UIState([], "Sign-in dialog closed", "", {}, 100, 100)
+    phone._state_provider_override.get_state.side_effect = [before, before, after, after]
+    redact = None
+
+    class Selector(ActionSelector):
+        async def select(self, ctx, device, memory, registry):
+            nonlocal redact
+            redact = registry.redactor
+            redact.add(secret)
+            return Selection(
+                calls=[ToolSelection(tool_id="tick", tool_name="tick", tool_kwargs={})]
+            )
+
+    llm = Replies()
+    llm._calls = [
+        ("set_plan", {"subgoals": ["Find price"]}),
+        ("complete", {"success": False, "message": "Price unavailable"}),
+    ]
+    flow = await make_workflow(LlamaIndexPlanner(llm), Selector())
+    handler = flow.run(goal="Find price", max_steps=3)
+    assert (await handler).reason == "complete"
+    if boundary == "checkpoint":
+        assert redact is not None
+        path = tmp_path / "context.json"
+        saved = await save_context(path, handler.ctx, redact)
+        assert "synthetic-first-half" not in path.read_text()
+        state = await Context.from_dict(flow, saved).store.get_state()
+        assert state.results[0].summary.screens[0][1] == "Sign in: *** unrelated tail"
+    else:
+        messages, _ = llm._requests[-1]
+        prompt = messages[0].content
+        assert "synthetic-first-half" not in prompt
+        assert "— Sign in:  ×1" in prompt
 
 
 @pytest.mark.anyio
@@ -298,31 +625,158 @@ async def test_child_budget_allows_replan_but_total_budget_prevents_another_chil
     )
     config = AgentConfig(planning={"subgoal_steps": 1})
     flow = await make_workflow(planner, selector, config=config)
-    handler = flow.run(goal="Recover", max_steps=2)
+    handler = flow.run(goal="Recover", max_steps=5)
     events = [event async for event in handler.stream_events()]
     assert (await handler).reason == "max_steps"
-    assert [event.step for event in events if isinstance(event, Observed)] == [1, 2]
-    assert [event.steps for event in events if isinstance(event, Finished)] == [2]
+    assert [event.steps for event in events if isinstance(event, Finished)] == [5]
+    assert [event.step for event in events if isinstance(event, Observed)] == [0, 1, 2, 2, 4]
     assert planner.states[1].results[0].reason == "max_steps"
     assert selector.goals == ["First", "Second"]
 
 
 @pytest.mark.anyio
-async def test_planner_turn_budget_is_independent_of_child_steps(make_workflow):
-    planner = FakePlanner(Plan(("Only child",)))
+async def test_child_cannot_consume_the_planners_final_step(make_workflow):
+    from mobilerun_agents.agent.planner import LlamaIndexPlanner
+    from tests.unit.agent.planner.test_llama_index import Replies
+
+    llm = Replies()
+    llm._calls = [
+        ("set_plan", {"subgoals": ["Only child"]}),
+        ("complete", {"success": False, "message": "The sign-in dialog blocked the price."}),
+    ]
+    tick = ToolSelection(tool_id="tick", tool_name="tick", tool_kwargs={})
+    selector = FakeSelector(tick, tick)
     flow = await make_workflow(
-        planner, FakeSelector(complete()), config=AgentConfig(planning={"max_planner_turns": 1})
+        LlamaIndexPlanner(llm), selector, config=AgentConfig(planning={"subgoal_steps": 10})
     )
-    handler = flow.run(goal="Check")
-    assert (await handler).reason == "max_planner_turns"
-    assert len(planner.states) == (await handler.ctx.store.get_state()).executor_steps == 1
+    handler = flow.run(goal="Check", max_steps=3)
+    outcome = await handler
+    assert not outcome.success and outcome.reason == "complete"
+    assert outcome.message == "The sign-in dialog blocked the price."
+    state = await handler.ctx.store.get_state()
+    assert (state.planner_turns, state.executor_steps) == (2, 1)
+    assert state.results[0].reason == "max_steps"
+    assert selector.goals == ["Only child"]
+    messages, tools = llm._requests[-1]
+    assert [tool.metadata.get_name() for tool in tools] == ["complete"]
+    assert "final planner turn" in messages[0].content
 
 
 @pytest.mark.anyio
-async def test_planner_can_finish_at_exact_executor_limit(make_workflow):
+@pytest.mark.parametrize("valid_final_reply", [True, False])
+async def test_invalid_first_reply_preserves_final_complete_only_step(
+    make_workflow, valid_final_reply
+):
+    from mobilerun_agents.agent.planner import LlamaIndexPlanner
+    from tests.unit.agent.planner.test_llama_index import Replies
+
+    llm = Replies()
+    invalid = ("set_plan", {"subgoals": ["No room for a child"]})
+    blocker = "Sign-in required"
+    llm._calls = [
+        invalid,
+        ("complete", {"success": False, "message": blocker}) if valid_final_reply else invalid,
+    ]
+    config = AgentConfig(decision={"max_response_repair_attempts": 1})
+    flow = await make_workflow(LlamaIndexPlanner(llm, config), FakeSelector(), config=config)
+    handler = flow.run(goal="Find price", max_steps=2)
+    steps = []
+    async for event in handler.stream_events():
+        match event:
+            case Finished(steps=count):
+                steps.append(count)
+    result = await handler
+
+    assert steps == [2]
+    assert (result.reason, result.message) == (
+        ("complete", blocker) if valid_final_reply else ("max_steps", "Step limit reached")
+    )
+    assert [[tool.metadata.get_name() for tool in tools] for _, tools in llm._requests] == [
+        ["complete"],
+        ["complete"],
+    ]
+
+
+@pytest.mark.anyio
+async def test_custom_planner_cannot_finish_last_turn_with_blank_failure(make_workflow):
+    flow = await make_workflow(FakePlanner(Finish(False, " \t\n")), FakeSelector())
+    result = await flow.run(goal="Find price", max_steps=1)
+
+    assert not result.success
+    assert (result.reason, result.message) == ("max_steps", "Step limit reached")
+
+
+@pytest.mark.anyio
+async def test_planning_console_reports_subgoal_turn_and_final_budgets(phone, caplog):
+    from mobilerun_agents.agent.operators import PlanningOperator
+    from mobilerun_agents.config.loader import ConfigLoader
+    from mobilerun_agents.config.user_config import MobileConfig
+
+    caplog.set_level("INFO", logger="mobilerun_agents.agent.logs.console")
+    config = MobileConfig()
+    config.analytics.enabled = False
+    config.tracing.enabled = False
+    config.checkpoints.enabled = False
+    operator = PlanningOperator(
+        FakePlanner(Plan(("Search eBay",)), Plan(("Try again",)), Finish(False, "Price hidden")),
+        FakeSelector(complete(), complete()),
+    )
+    with ConfigLoader.override(config):
+        result = await operator.execute(phone, "Find the price", max_steps=60)
+
+    assert not result.success and result.answer == "Price hidden" and result.steps == 5
+    assert "→ subgoal (step 1/60): Search eBay" in caplog.messages
+    assert "→ subgoal (step 3/60): Try again" in caplog.messages
+    assert "✗ Price hidden (5/60 steps · 3 planner, 2 actions)" in caplog.messages
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("last_reply", ["failure", "invalid-tool", "invalid-output"])
+async def test_last_planner_turn_reports_the_blocker_or_falls_back(make_workflow, last_reply):
+    from mobilerun_agents.agent.planner import LlamaIndexPlanner
+    from tests.unit.agent.planner.test_llama_index import Replies
+
+    class FinalReply(Replies):
+        async def achat(self, messages, tools, tool_required, **kwargs):
+            if [tool.metadata.get_name() for tool in tools] == ["complete"]:
+                assert "Sign-in required" in messages[0].content
+                reply = {
+                    "failure": (
+                        "complete",
+                        {"success": False, "message": "Cannot read the price: sign-in required."},
+                    ),
+                    "invalid-tool": ("set_plan", {"subgoals": ["Retry"]}),
+                    "invalid-output": ("complete", {"success": True, "message": "Found it"}),
+                }[last_reply]
+                self._calls[len(self._requests)] = reply
+            return await super().achat(messages, tools, tool_required, **kwargs)
+
+    llm = FinalReply()
+    llm._calls = [("set_plan", {"subgoals": ["Read price"]})] * 3
+    config = AgentConfig(
+        decision={"max_response_repair_attempts": 1},
+        max_output_validation_attempts=1,
+    )
+    selector = FakeSelector(*(complete("Sign-in required", False) for _ in range(3)))
+    flow = await make_workflow(
+        LlamaIndexPlanner(llm, config), selector, config=config, output=Output
+    )
+    result = await flow.run(goal="Find the price", max_steps=5)
+
+    assert not result.success and result.output is None
+    assert (result.reason, result.message) == (
+        ("complete", "Cannot read the price: sign-in required.")
+        if last_reply == "failure"
+        else ("max_steps", "Step limit reached")
+    )
+    assert selector.goals == ["Read price", "Read price"]
+
+
+@pytest.mark.anyio
+async def test_planner_can_finish_with_the_last_shared_step(make_workflow):
     planner = FakePlanner(Plan(("Read value",)), Finish(True, "Found it"))
     flow = await make_workflow(planner, FakeSelector(complete("Read 12")))
-    assert (await flow.run(goal="Find value", max_steps=1)).success
+    assert (await flow.run(goal="Find value", max_steps=3)).success
     assert planner.states[1].results[0].message == "Read 12"
 
 
@@ -335,36 +789,49 @@ async def test_typed_planner_output_repairs_without_rerunning_executor(make_work
     flow = await make_workflow(planner, selector, output=Output)
     assert (await flow.run(goal="Find price")).output == {"price": 42}
     assert selector.goals == []
-    schema, repair, _ = planner.prompt_inputs[1]
+    schema, repair = planner.prompt_inputs[1]
     assert schema["properties"]["price"]["type"] == "integer"
     assert "output is invalid" in repair
 
 
 @pytest.mark.anyio
-async def test_parent_cancellation_stops_running_child(make_workflow):
+@pytest.mark.parametrize("protect", [False, True])
+async def test_parent_cancellation_stops_child_and_purges_newly_protected_image(
+    make_workflow, protect
+):
     started = asyncio.Event()
     ended = asyncio.Event()
 
     class Waiting(ActionSelector):
         async def select(self, ctx, device, memory, registry):
+            if protect:
+                registry.protect(
+                    ToolSelection(
+                        tool_id="protect", tool_name="protect", tool_kwargs={"text": "fake-secret"}
+                    )
+                )
             started.set()
             try:
                 await asyncio.Future()
             finally:
                 ended.set()
 
-    flow = await make_workflow(FakePlanner(Plan(("Wait",))), Waiting())
+    planner = FakePlanner(Plan(("Wait",)))
+    flow = await make_workflow(planner, Waiting())
     handler = flow.run(goal="Cancel")
     await asyncio.wait_for(started.wait(), timeout=5)
+    path = planner.states[0].current.screenshot.path
+    assert path.is_file()
     await handler.cancel_run()
     with pytest.raises(WorkflowCancelledByUser):
         await handler
     await asyncio.wait_for(ended.wait(), timeout=5)
+    assert path.exists() is not protect
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("batch", ["parallel", "sequential", "complete_only"])
-async def test_planner_gets_post_action_tree_without_redundant_refresh(make_workflow, phone, batch):
+async def test_planner_refreshes_after_each_kind_of_terminal_batch(make_workflow, phone, batch):
     tick = ToolSelection(tool_id="tick", tool_name="tick", tool_kwargs={})
     completion = complete("")
     turns = iter(
@@ -377,7 +844,7 @@ async def test_planner_gets_post_action_tree_without_redundant_refresh(make_work
     before = UIState([{"text": "Before"}], "Before", "", {}, 100, 100)
     after = UIState([{"text": "After"}], "After", "", {}, 100, 100)
     provider = phone._state_provider_override
-    provider.get_state.side_effect = [before, before, after]
+    provider.get_state.side_effect = [before, before, after, after]
 
     async def screenshot():
         return phone.state.current.formatted_text.encode()
@@ -393,12 +860,11 @@ async def test_planner_gets_post_action_tree_without_redundant_refresh(make_work
     assert (await workflow.run(goal="Advance")).success
 
     state = planner.states[1]
-    expected = "Before" if batch == "complete_only" else "After"
-    assert state.current.ui.formatted_text == expected
+    assert state.current.ui.formatted_text == "After"
     assert state.actions[0].before.ui.formatted_text == "Before"
-    assert provider.get_state.await_count == (2 if batch == "complete_only" else 3)
-    assert state.current.screenshot.path.read_bytes() == expected.encode()
-    assert phone.screenshot.await_count == 1
+    assert provider.get_state.await_count == (4 if batch == "sequential" else 3)
+    assert state.current.screenshot.path.read_bytes() == b"After"
+    assert phone.screenshot.await_count == 2
 
 
 @pytest.mark.anyio
@@ -434,7 +900,7 @@ async def test_failure_summary_never_clips_through_protected_values(make_workflo
     workflow = await make_workflow(planner, Selector())
     await workflow.run(goal="Advance")
 
-    summary = planner.states[1].results[0].summary
+    summary = _render_failure(planner.states[1].results[0], planner.redact)
     suffix = "" if position in {"crossing", "encoded_crossing"} else marker[:remaining]
     assert f"- {thought_prefix}{suffix}\n" in summary
     assert f" — {screen_prefix}{suffix} ×1\n" in summary
@@ -454,10 +920,8 @@ async def test_failure_summary_never_splits_protected_thoughts(make_workflow, se
     workflow = await make_workflow(planner, Selector())
     await workflow.run(goal="Advance")
 
-    summary = planner.states[1].results[0].summary
-    redact = Redactor()
-    redact.add(secret)
-    assert "fixture-a" not in redact.text(summary)
+    summary = _render_failure(planner.states[1].results[0], planner.redact)
+    assert "fixture-a" not in planner.redact.text(summary)
     assert summary.count(f"- {thought}\n") == 2
 
 

@@ -249,7 +249,7 @@ def build_registry(
 
     @tool
     async def wait(phone: Device) -> None:
-        """Wait for the configured duration."""
+        """Wait for the screen to finish loading or changing."""
         await phone.wait(tool_config.wait_duration)
 
     def project(action: Action) -> Action | None:

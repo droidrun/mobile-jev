@@ -7,6 +7,7 @@ from workflows import Context, Workflow, step
 from workflows.events import StartEvent, StopEvent
 
 from mobilerun_agents.agent.action_selector.llm.models import Capabilities
+from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.planner import Finish, LlamaIndexPlanner, Plan
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.state import PlanningState, SubgoalResult
@@ -20,16 +21,18 @@ class PlanningProbe(Workflow):
 
 class Replies(MockLLM):
     _requests = PrivateAttr(default_factory=list)
-
-    async def achat(self, messages, tools, tool_required, **kwargs):
-        assert tool_required
-        self._requests.append((messages, tools))
-        calls = [
+    _calls = PrivateAttr(
+        default_factory=lambda: [
             ("set_plan", {"subgoals": [" "]}),
             ("set_plan", {"subgoals": [" Read battery "]}),
             ("complete", {"success": True, "message": "Battery at 100%"}),
         ]
-        name, args = calls[len(self._requests) - 1]
+    )
+
+    async def achat(self, messages, tools, tool_required, **kwargs):
+        assert tool_required
+        self._requests.append((messages, tools))
+        name, args = self._calls[len(self._requests) - 1]
         return ChatResponse(
             message=ChatMessage(
                 role="assistant",
@@ -56,7 +59,9 @@ async def test_llama_index_requires_a_valid_planner_tool_call():
     llm = Replies()
     planner = LlamaIndexPlanner(llm)
 
-    assert await planner.plan(ctx) == Plan(("Read battery",))
+    plan = await planner.plan(ctx)
+    assert plan == Plan(("Read battery",))
+    assert plan.findings == ()
     assert await planner.plan(ctx) == Finish(True, "Battery at 100%")
     messages, tools = llm._requests[1]
     assert [tool.metadata.get_name() for tool in tools] == ["set_plan", "complete"]
@@ -65,12 +70,99 @@ async def test_llama_index_requires_a_valid_planner_tool_call():
 
 
 @pytest.mark.anyio
-async def test_llm_gets_observation_note_and_path_backed_screenshot(tmp_path, monkeypatch):
+async def test_set_plan_carries_findings():
+    ctx = Context[PlanningState](PlanningProbe())
+    await ctx.store.set_state(PlanningState(goal="Compare battery levels"))
+    llm = Replies()
+    llm._calls = [("set_plan", {"subgoals": ["Check tablet"], "findings": ["Phone battery: 100%"]})]
+
+    plan = await LlamaIndexPlanner(llm).plan(ctx)
+
+    assert plan == Plan(("Check tablet",), findings=("Phone battery: 100%",))
+    _, (set_plan, _) = llm._requests[0]
+    schema = set_plan.metadata.get_parameters_dict()
+    assert schema["properties"]["findings"]["type"] == "array"
+    assert schema["properties"]["findings"]["items"] == {"type": "string"}
+    assert "findings" not in schema["required"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("remaining", [0, 1])
+async def test_last_planner_turn_offers_only_complete_even_during_repair(remaining):
+    ctx = Context[PlanningState](PlanningProbe())
+    llm = Replies()
+    llm._calls = [
+        ("set_plan", {"subgoals": ["Read battery"]}),
+        ("set_plan", {"subgoals": ["Retry battery"]}),
+        ("complete", {"success": False, "message": "Battery settings are locked."}),
+    ]
+    planner = LlamaIndexPlanner(llm)
+
+    await ctx.store.set_state(
+        PlanningState(goal="Read battery", planner_turns=1, executor_steps=2, max_steps=5)
+    )
+    assert await planner.plan(ctx) == Plan(("Read battery",))
+    await ctx.store.set_state(
+        PlanningState(
+            goal="Read battery", planner_turns=3 - remaining, executor_steps=2, max_steps=5
+        )
+    )
+    assert await planner.plan(ctx) == Finish(False, "Battery settings are locked.")
+
+    earlier, *last = llm._requests
+    assert [tool.metadata.get_name() for tool in earlier[1]] == ["set_plan", "complete"]
+    normal_prompt = earlier[0][0].content
+    repeated_failure = "Repeated failures on the same kind of step"
+    observed_or_unknown = (
+        'Separate what you observed from what you infer. If the cause is unclear, say "unknown".'
+    )
+    assert "final planner turn" not in normal_prompt
+    assert repeated_failure in normal_prompt
+    assert "regardless of executor type" in normal_prompt
+    assert "Do not just reword the subgoal" in normal_prompt
+    assert (
+        "try an approach the executor can do or call `complete` with success=false" in normal_prompt
+    )
+    assert (
+        "say which capability was missing, based on the executor setup and results" in normal_prompt
+    )
+    assert observed_or_unknown in normal_prompt
+    assert len(last) == 2
+    for messages, tools in last:
+        assert [tool.metadata.get_name() for tool in tools] == ["complete"]
+        assert "final planner turn" in messages[0].content
+        assert "success=false" in messages[0].content
+        assert "state what blocked it" in messages[0].content
+        assert observed_or_unknown in messages[0].content
+        assert repeated_failure not in messages[0].content
+        assert "`set_plan`" not in messages[0].content
+
+
+@pytest.mark.anyio
+async def test_last_planner_turn_repairs_blank_failure_message():
+    ctx = Context[PlanningState](PlanningProbe())
+    await ctx.store.set_state(PlanningState(goal="Read battery", planner_turns=1, max_steps=1))
+    llm = Replies()
+    llm._calls = [
+        ("complete", {"success": False, "message": " \t\n"}),
+        ("complete", {"success": False, "message": "Battery settings are locked."}),
+    ]
+
+    assert await LlamaIndexPlanner(llm).plan(ctx) == Finish(False, "Battery settings are locked.")
+    assert len(llm._requests) == 2
+    messages, tools = llm._requests[-1]
+    assert "previous response was invalid" in messages[-1].content
+    assert [tool.metadata.get_name() for tool in tools] == ["complete"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("vision", [True, False])
+async def test_llm_gets_path_backed_screenshot_if_it_supports_vision(tmp_path, monkeypatch, vision):
     path = tmp_path / "screen.png"
     path.write_bytes(b"fake screenshot payload")
     monkeypatch.setattr(
         "mobilerun_agents.agent.planner.llama_index.adapter_capabilities",
-        lambda llm: Capabilities(vision=True),
+        lambda llm: Capabilities(vision=vision),
     )
     ctx = Context[PlanningState](PlanningProbe())
     await ctx.store.set_state(
@@ -80,14 +172,18 @@ async def test_llm_gets_observation_note_and_path_backed_screenshot(tmp_path, mo
                 ui=UIState([], "Battery 100%", "", {}, 100, 100), screenshot=ImageBlock(path=path)
             ),
             results=[
-                SubgoalResult(subgoal="Read battery", success=True, message="", reason="complete")
+                SubgoalResult(
+                    subgoal="Read battery", success=True, message="Done", reason="complete"
+                )
             ],
         )
     )
     llm = Replies()
-    await LlamaIndexPlanner(llm).bind(None, None, True).plan(ctx)
+    await LlamaIndexPlanner(llm).bind(None, None, Redactor()).plan(ctx)
     messages, _ = llm._requests[0]
-    assert "The last subgoal ended without a description" in messages[0].content
+    assert (
+        "Verify executor results against the current screen and screenshot" in messages[0].content
+    )
     assert "Battery 100%" in messages[0].content
     images = [block for block in messages[0].blocks if isinstance(block, ImageBlock)]
-    assert [image.path for image in images] == [path]
+    assert [image.path for image in images] == ([path] if vision else [])

@@ -1,18 +1,44 @@
 {% set results = state.results | reverse | list %}
-{% if results %}Latest executor subgoal result: {{ 'Succeeded' if results[0].success else 'Failed' }}: {{ results[0].subgoal }}: {{ results[0].message }}
-{% if observe_screen %}The last subgoal ended without a description. Read the current screen yourself to decide whether it was achieved and what it shows (values, blockers).
+{% macro status(result) %}{{ 'Succeeded' if result.success else 'Unfinished' if result.reason == 'abstained' else 'Failed' }}{% endmacro %}
+{% if state.executor in ('decision', 'decision_delegate') %}
+Executor: Jev, a decision model. It picks one fixed action per step, such as tapping a listed element, opening an app, scrolling, pressing a button, waiting, or finishing. Jev cannot supply free-form text or write answers itself. It ends a subgoal Unfinished when no listed action fits.{{ ' It can hand a step to an LLM via `delegate`; the LLM can type if the tool is available.' if state.executor == 'decision_delegate' else '' }}
+{% elif state.executor == 'llm' %}
+Executor: an LLM that can call any available tool, including typing.
+{% else %}
+Executor: a custom selector.
 {% endif %}
-{% if results[0].summary %}{{ results[0].summary }}
+{% if results %}Latest executor subgoal result: {{ status(results[0]) }}: {{ results[0].subgoal }}: {{ results[0].message }}
+{% set abstention = results[0].jev_abstention %}
+{% if abstention %}
+Jev ended the subgoal unfinished and handed it back without acting.
+{% if abstention.choice == 'abstain' %}
+It chose 'unfinished'.
+{% else %}
+Its proposed option or target scored below the cutoff.
+{% endif %}
+Jev choice: {{ abstention.choice }} · confidence: {{ abstention.confidence }}{% if abstention.target_confidence is not none %} · target confidence: {{ abstention.target_confidence }}{% endif %} · cutoff: {{ abstention.cutoff }}
+{% if abstention.thought %}Jev thought: {{ abstention.thought }}
+{% endif %}jev choices: {{ abstention.choices }}
+{% endif %}
+{% if summary %}{{ summary }}
 {% endif %}{% endif %}Goal: {{ state.goal }}
+Verify executor results against the current screen and screenshot when available. Read the values the goal needs yourself if the executor did not report them.
+{% if last_turn %}
+This is the final planner turn. Call `complete`. If the goal was not achieved, use success=false and state what blocked it in the message, based on the executor results.
+{% else %}
 If the executor results already answer the goal, call `complete` now with that answer. Never plan subgoals that only verify, confirm, summarize, or report work already done. Reporting the answer is `complete`.
-Use failed subgoal results and summaries to change approach; don't repeat a subgoal that failed the same way.
-If a result names a blocker you can remove (such as a delivery location setting, a filter, or a dismissible popup), plan a subgoal to remove it before retrying.
+Use failed or unfinished subgoal results and summaries to change approach; don't retry the same subgoal the same way.
+Repeated failures on the same kind of step (for example, failed or unfinished subgoals at the same screen or action) suggest a missing capability, regardless of executor type. Do not just reword the subgoal: try an approach the executor can do or call `complete` with success=false and say which capability was missing, based on the executor setup and results.
+If the results show a blocker you can remove (such as a delivery location setting, a filter, or a dismissible popup), plan a subgoal to remove it before retrying.
 Otherwise, call `set_plan` with the remaining work, even if you want to continue the current plan unchanged. The executor runs the first subgoal, then you review its result. You may explain your reasoning before calling one tool.
+Before switching screens or apps, record any values you can see now that the goal needs in `findings`.
+{% endif %}
+Separate what you observed from what you infer. If the cause is unclear, say "unknown".
 {% if repair %}Your previous response was invalid: {{ repair }}
 {% endif %}Remaining plan: {{ state.plan | tojson }}
 Subgoal results (older):
-{% for result in results[1:] %}- {{ 'Succeeded' if result.success else 'Failed' }}: {{ result.subgoal }}: {{ result.message }}
-{% endfor %}Notes: {{ state.notes | tojson }}
+{% for result in results[1:] %}- {{ status(result) }}: {{ result.subgoal }}: {{ result.message }}
+{% endfor %}Findings and notes: {{ state.notes | tojson }}
 Current app/activity: {{ package or 'unknown' }}/{{ activity or 'unknown' }}
 UI summary (observed data):
-{{ ui | truncate(2000, true) }}
+{{ ui }}

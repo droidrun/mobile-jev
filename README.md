@@ -44,15 +44,17 @@ Export a no-argument subclass of `mobilerun.core.operator.Operator`, or an alrea
 | Setting | Default |
 |---|---|
 | Agent step budget | 25 (`agent.max_steps`) |
-| Planning total budget | 40 (`agent.planning_max_steps`) |
+| Planning total budget | 40 steps shared by planner turns and executor actions (`agent.planning_max_steps`) |
 | Planning subgoal budget | 10 (`agent.planning.subgoal_steps`) |
-| Planner turns | 10 (`agent.planning.max_planner_turns`) |
 | Progress guards | Note after 3 identical calls on the same target in a row and stop after 5; note after 3 unchanged-screen steps and stop after 5; note after 3 returns to an already seen screen and stop after 4 |
 | Vision | Profile/provider-dependent; override with `--vision off|on|only` |
+| Screen settling | Pause 100 ms before observing after an action (`agent.settle_delay: 0.1`, in seconds; `0` disables it) |
 
 ## Saved data and diagnostics
 
-The agent uses four workflow steps: observe → select → act → finish. Planning uses two: plan → execute a child agent, with a fresh memory for each child. The workflow context holds the run state. The device, LlamaIndex memory, tool registry and image store are live resources, not checkpoint data.
+The agent uses four workflow steps: observe → select → act → finish. Planning uses three: observe → plan → execute a child agent, with a fresh memory for each child. The workflow context holds the run state. The device, LlamaIndex memory, tool registry and image store are live resources, not checkpoint data.
+
+Each planner turn and executor action costs one step. Override the total with `PlanningOperator.execute(max_steps=...)`. The run stops when the budget runs out. If the planner takes the last step, it must call `complete` and report what blocked it if the goal is unfinished.
 
 Run data is organized by run ID. Empty directory overrides use the defaults.
 

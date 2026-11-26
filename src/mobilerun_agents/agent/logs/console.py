@@ -9,6 +9,7 @@ from workflows.events import Event
 from mobilerun_agents.agent.events import (
     Acted,
     Detail,
+    Finished,
     Observed,
     Repaired,
     Selected,
@@ -39,10 +40,12 @@ class ConsoleLog:
 
     def event(self, event: Event) -> None:
         match event:
-            case Observed(step=step, package=package, activity=activity):
+            case Observed(step=step, package=package, activity=activity, planner=planner):
                 self._step = step
                 _log.debug(
-                    "  screen: %s", self._line("/".join(p for p in (package, activity) if p))
+                    "  %sscreen: %s",
+                    "planner " if planner else "",
+                    self._line("/".join(p for p in (package, activity) if p)),
                 )
             case Selected(thought=thought) if thought:
                 _log.debug("  thought: %s", self._line(thought))
@@ -56,9 +59,12 @@ class ConsoleLog:
             case Repaired(attempt=attempt, reason=reason):
                 _log.info("Retrying invalid selection")
                 _log.debug("  retry %s · %s", attempt, self._line(reason))
-            case Subgoal(text=text):
+            case Subgoal(text=text, step=step, budget=budget):
                 self._memory_selectors.pop(self._step, None)
-                _log.info("→ subgoal: %s", self._line(text))
+                progress = (
+                    f" (step {step}/{budget})" if step is not None and budget is not None else ""
+                )
+                _log.info("→ subgoal%s: %s", progress, self._line(text))
             case MemoryDetail() if _log.isEnabledFor(logging.DEBUG):
                 self._memory(event)
             case MemoryDetail():
@@ -125,14 +131,28 @@ class ConsoleLog:
     def subgoal_finished(self, success: bool, message: str) -> None:
         _log.info("%s subgoal: %s", "✓" if success else "✗", self._line(message))
 
-    def finish(self, success: bool, message: str, steps: int, folder: Path | None = None) -> None:
+    def finish(
+        self, success: bool, message: str, steps: int | Finished, folder: Path | None = None
+    ) -> None:
         self._refresh_memory_redaction()
+        breakdown = ""
+        match steps:
+            case Finished(steps=count, budget=budget, planner_turns=turn) if (
+                budget is not None and turn is not None
+            ):
+                step_count = f"{count}/{budget}"
+                unit = "steps"
+                breakdown = f" · {turn} planner, {count - turn} actions"
+            case Finished(steps=count) | (int() as count):
+                step_count = str(count)
+                unit = "step" if count == 1 else "steps"
         _log.info(
-            "%s %s (%s %s%s)",
+            "%s %s (%s %s%s%s)",
             "✓" if success else "✗",
             self._line(message),
-            steps,
-            "step" if steps == 1 else "steps",
+            step_count,
+            unit,
+            breakdown,
             f" · {self._line(str(folder))}" if folder else "",
             extra={"agent_result": True},
         )

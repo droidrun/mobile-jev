@@ -94,6 +94,8 @@ async def _consume(
     finished: Finished | None = None
     pending: list[Event] = []
     steps = 0
+    action_steps = 0
+    shared_steps = 0
     checkpoint_revision = 0
 
     def display_message(message: str | None, success: bool, reason: str) -> str:
@@ -121,26 +123,32 @@ async def _consume(
                     case Acted(action=action):
                         flush()
                         console.event(event)
-                        if steps < action.step:
-                            steps = action.step
+                        if action_steps < action.step:
+                            action_steps = steps = action.step
                             if checkpoint is not None:
                                 revision = redact.revision
                                 await save_context(checkpoint, handler.ctx, redact)
                                 checkpoint_revision = revision
                     case Finished():
                         finished = event
-                    case Subgoal(result=subgoal) if subgoal is not None:
+                    case Subgoal(result=subgoal, step=step) if subgoal is not None:
+                        if step is not None:
+                            shared_steps = max(shared_steps, step)
                         flush()
                         console.subgoal_finished(
                             subgoal.success,
                             display_message(subgoal.message, subgoal.success, subgoal.reason),
                         )
+                    case Subgoal(step=step) if step is not None:
+                        shared_steps = max(shared_steps, step)
+                        pending.append(event)
                     case _:
                         pending.append(event)
             outcome = Outcome.model_validate(await handler)
             if finished is None:
                 raise RuntimeError("Workflow ended without a Finished event")
             steps = finished.steps
+            shared_steps = max(shared_steps, finished.steps)
             if checkpoint is not None:
                 revision = redact.revision
                 saved = await save_context(checkpoint, handler.ctx, redact)
@@ -176,8 +184,8 @@ async def _consume(
                     try:
                         serialized = json.loads(public_output.model_dump_json(by_alias=True))
                     except PydanticSerializationError:
-                        # A serializer may require context that only the caller has.
-                        pass
+                        # Without a successful safety check, do not expose the model.
+                        public_output = None
                     else:
                         if redact.value(serialized) != serialized:
                             public_output = None
@@ -191,7 +199,7 @@ async def _consume(
                 device=redact.text(device.identifier or device.platform),
                 trajectory_path=redact.text(str(folder)) if folder else None,
             )
-            console.finish(outcome.success, answer, steps, folder)
+            console.finish(outcome.success, answer, finished, folder)
             trace.finish(outcome.success, steps)
             await analytics.finish(outcome.success, steps)
             return result
@@ -211,7 +219,22 @@ async def _consume(
                     _log.warning("Unable to refresh checkpoint with new redactions")
             cancelled = type(error) in (asyncio.CancelledError, KeyboardInterrupt)
             trace.finish(False, steps)
-            console.finish(False, "cancelled" if cancelled else type(error).__name__, steps, folder)
+            console_steps = shared_steps or steps
+            try:
+                match await handler.ctx.store.get_state():
+                    case PlanningState(planner_turns=turns, executor_steps=executed):
+                        console_steps = turns + max(executed, action_steps)
+                    case AgentState():
+                        console_steps = steps
+            except BaseException:
+                # State is best-effort here; preserve the error that ended the run.
+                pass
+            console.finish(
+                False,
+                "cancelled" if cancelled else type(error).__name__,
+                console_steps,
+                folder,
+            )
             if not cancelled:
                 await analytics.finish(False, steps)
             if type(error) is WorkflowTimeoutError:

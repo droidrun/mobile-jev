@@ -95,6 +95,18 @@ def test_schema_candidate_sends_tool_description_as_context(sdk):
     assert "down swipes the finger up" in criteria["action_0"]["context"]
 
 
+def test_wait_tool_describes_loading_in_jev_and_llm_choices(sdk):
+    client, _, _ = sdk
+    turn = Turn("Open the app")
+    turn.registry = build_registry(turn.device, [], ToolsConfig())
+    asyncio.run(turn.select(DecisionSelector(TypeSafeDecisionModel(), "off", exclude={"complete"})))
+    description = "Wait for the screen to finish loading or changing."
+    criteria = client.system_one.call_args.kwargs["questions"]["action"].criteria
+    assert criteria["action_0"]["description"] == "wait"
+    assert criteria["action_0"]["context"] == description
+    assert turn.registry.by_name["wait"].metadata.description == description
+
+
 @pytest.mark.parametrize("choice,confidence", [("abstain", 0.9), ("action_0", 0.2)])
 def test_abstention_and_low_confidence(sdk, choice, confidence):
     client, close, _ = sdk
@@ -269,14 +281,17 @@ async def test_out_of_range_option_is_repairable(index):
         await Turn().select(selector)
 
 
-@pytest.mark.parametrize("point", [None, (-0.1, 0.5), (0.5, 1.1), (float("nan"), 0.5)])
+@pytest.mark.parametrize(
+    ("point", "confidence"),
+    [(None, 0.2), (None, 0.9), ((-0.1, 0.5), 0.9), ((0.5, 1.1), 0.9), ((float("nan"), 0.5), 0.9)],
+)
 @pytest.mark.anyio
-async def test_bad_located_point_is_repairable(point):
+async def test_bad_located_point_is_repairable(point, confidence):
     def answer(request):
         index = next(i for i, option in enumerate(request.options) if option.point_space)
-        return Decision(option_index=index, point=point)
+        return Decision(option_index=index, point=point, confidence=confidence)
 
-    selector = DecisionSelector(Model(answer, locates_points=True), "only")
+    selector = DecisionSelector(Model(answer, locates_points=True), "only", min_confidence=0.7)
     turn = Turn(tools=fake_tools("tap"), screenshot=b"fake screenshot")
 
     with pytest.raises(InvalidResponse, match="Invalid arguments"):

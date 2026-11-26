@@ -134,28 +134,169 @@ async def run(
     return result, await handler.ctx.store.get_state(), events, device, selector
 
 
-def test_jev_low_confidence_spends_repair_budget_without_llm(tmp_path, monkeypatch):
+@pytest.mark.parametrize("delay", [None, 0], ids=["default", "disabled"])
+def test_observe_settles_after_action_without_charging_a_step(tmp_path, monkeypatch, delay):
+    from mobilerun_agents.agent.events import Finished, Observed
+    from mobilerun_agents.agent.workflows import agent as workflow
+    from mobilerun_agents.config.user_config import AgentConfig
+
+    loading = UIState([], "Loading", "", {}, 10, 10)
+    loaded = UIState([], "Loaded", "", {"packageName": "app"}, 10, 10)
+    screens = iter([loading, loaded])
+    calls = []
+
+    async def refresh(self):
+        calls.append("refresh")
+        return next(screens)
+
+    async def sleep(seconds):
+        calls.append(("sleep", seconds))
+
+    monkeypatch.setattr(Phone, "refresh", refresh)
+    monkeypatch.setattr(workflow, "sleep", sleep)
+    config = AgentConfig() if delay is None else AgentConfig(settle_delay=delay)
+    result, state, events, phone, _ = asyncio.run(
+        run(
+            tmp_path,
+            monkeypatch,
+            [call("write", text="open"), complete()],
+            [b"A", b"B"],
+            config=config,
+        )
+    )
+    assert result.success
+    expected = ["refresh", ("sleep", 0.1), "refresh"] if delay is None else ["refresh", "refresh"]
+    assert calls == expected
+    assert [(event.step, event.package) for event in events if isinstance(event, Observed)] == [
+        (1, None),
+        (2, "app"),
+    ]
+    assert [event.steps for event in events if isinstance(event, Finished)] == [2]
+    assert state.current.ui.formatted_text == "Loaded"
+    assert phone.captures == 2
+
+
+@pytest.mark.parametrize("delegated", [False, True])
+def test_jev_abstention_stops_without_repair_or_fallback(tmp_path, monkeypatch, delegated):
     from mobilerun_agents.agent.action_selector import DecisionSelector, DelegatingSelector
     from mobilerun_agents.agent.events import Repaired
-    from mobilerun_agents.config.user_config import AgentConfig, DecisionConfig
     from tests.unit.agent.action_selector.test_delegating_selector import Model, Stub
 
-    decision = Model(*[("wait", 0.2)] * 3)
+    memories = []
+
+    class Primary(DecisionSelector):
+        async def select(self, ctx, device, memory, registry, **kwargs):
+            memories.append(memory)
+            return await super().select(ctx, device, memory, registry, **kwargs)
+
+    decision = Model(*[("wait", 0.2)] * 4)
+    primary = Primary(decision, "off", min_confidence=0.7)
     delegate = Stub()
-    selector = DelegatingSelector(DecisionSelector(decision, "off", min_confidence=0.7), delegate)
-    result, state, events, _, _ = asyncio.run(
+    selector = DelegatingSelector(primary, delegate) if delegated else primary
+
+    async def check():
+        result, state, events, _, _ = await run(
+            tmp_path, monkeypatch, [], [b"A"], selector=selector
+        )
+        assert not result.success and result.reason == "abstained"
+        assert not state.actions and state.repairs == 0
+        assert state.current.screenshot is None
+        assert not any(isinstance(event, Repaired) for event in events)
+        assert len(decision.requests) == 1 and not delegate.calls
+        assert not await memories[0].aget()
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize(
+    ("explicit", "confidence", "target_confidence", "message"),
+    [
+        (
+            False,
+            0.32,
+            0.61,
+            "Unfinished: the decision model's best choice (wait, confidence 0.32) "
+            "was below the cutoff 0.7, so no action was taken.",
+        ),
+        (
+            False,
+            0.85,
+            0.2,
+            "Unfinished: the decision model's best choice (wait, target confidence 0.2) "
+            "was below the cutoff 0.7, so no action was taken.",
+        ),
+        (
+            True,
+            0.32,
+            None,
+            "Unfinished: the decision model handed the subgoal back without acting "
+            "(it chose 'unfinished').",
+        ),
+    ],
+    ids=["below-cutoff", "target-below-cutoff", "explicit"],
+)
+def test_jev_abstention_outcome_keeps_raw_decision_and_choices(
+    tmp_path, monkeypatch, explicit, confidence, target_confidence, message
+):
+    from mobilerun_agents.agent.action_selector import DecisionSelector
+    from mobilerun_agents.agent.action_selector.decision_model.base import Decision
+    from tests.unit.agent.action_selector.test_typesafe_decision_model import Model
+
+    def answer(request):
+        index = next(i for i, option in enumerate(request.options) if option.action.name == "wait")
+        return Decision(
+            option_index=None if explicit else index,
+            confidence=confidence,
+            target_confidence=target_confidence,
+            thought="  The search field is visible.\n",
+        )
+
+    result, _, _, _, _ = asyncio.run(
         run(
             tmp_path,
             monkeypatch,
             [],
             [b"A"],
-            selector=selector,
-            config=AgentConfig(decision=DecisionConfig(max_response_repair_attempts=2)),
+            selector=DecisionSelector(Model(answer), "off", min_confidence=0.7),
         )
     )
-    assert result.reason == "repair_attempts" and not state.actions
-    assert [event.attempt for event in events if isinstance(event, Repaired)] == [1, 2, 3]
-    assert len(decision.requests) == 3 and not delegate.calls
+    assert result.reason == "abstained" and result.message == message
+    details = result.jev_abstention
+    assert details is not None
+    assert details.choice == ("abstain" if explicit else "wait")
+    assert details.confidence == confidence and details.cutoff == 0.7
+    assert details.target_confidence == target_confidence
+    assert details.thought == "  The search field is visible.\n"
+    assert "wait 1" in details.choices and "complete 2" in details.choices
+    assert "input_text" not in details.choices
+
+
+def test_abstention_removes_prior_saved_images_for_newly_protected_value(tmp_path, monkeypatch):
+    from mobilerun_agents.agent.action_selector.base import Selection
+
+    marker = "fixture-late-abstention"
+
+    class ProtectOnAbstain(Selector):
+        async def select(self, ctx, device, memory, registry):
+            state = await ctx.store.get_state()
+            if len(state.actions) < 2:
+                return await super().select(ctx, device, memory, registry)
+            assert sorted(path.read_bytes() for path in tmp_path.rglob("*.png")) == [b"A", b"B"]
+            registry.protect(call("protect", text=marker))
+            return Selection(abstained=True)
+
+    selector = ProtectOnAbstain(
+        [call("write", text=marker), call("write", text="next")], lambda _: None
+    )
+    result, state, *_ = asyncio.run(
+        run(tmp_path, monkeypatch, [], [b"A", b"B", b"C"], selector=selector)
+    )
+
+    assert result.reason == "abstained"
+    assert result.message == "Unfinished: the selector took no action."
+    assert not list(tmp_path.rglob("*.png"))
+    assert all(record.before.screenshot is None for record in state.actions)
+    assert state.current.screenshot is None
 
 
 def test_happy_path_keeps_pinned_before_and_adds_call_and_result_to_memory(tmp_path, monkeypatch):
@@ -410,14 +551,37 @@ def chat_selector(vision):
 
         async def _achat(self, messages, **kwargs):
             self.requests.append(messages)
+            reply = next(self.replies)
+            if reply is None:
+                return None
             return ChatResponse(
                 message=ChatMessage(
                     role="assistant",
-                    content=f"<function_calls>{next(self.replies)}</function_calls>",
+                    content=f"<function_calls>{reply}</function_calls>",
                 )
             )
 
     return Chat()
+
+
+def test_empty_llm_response_repairs_on_same_observation(tmp_path, monkeypatch):
+    from mobilerun_agents.agent.events import Repaired
+
+    selector = chat_selector("off")
+    selector.replies = iter(
+        [
+            None,
+            '<invoke name="complete"><parameter name="success">true</parameter>'
+            '<parameter name="message">done</parameter></invoke>',
+        ]
+    )
+    result, _, events, phone, _ = asyncio.run(
+        run(tmp_path, monkeypatch, [], [b"A"], selector=selector)
+    )
+    reason = "No tool selected; choose an available tool."
+    assert result.success and phone.captures == 1 and len(selector.requests) == 2
+    assert [event.reason for event in events if isinstance(event, Repaired)] == [reason]
+    assert reason in [message.content for message in selector.requests[1]]
 
 
 @pytest.mark.parametrize("vision,captures", [("off", 0), ("on", 2), ("only", 2)])

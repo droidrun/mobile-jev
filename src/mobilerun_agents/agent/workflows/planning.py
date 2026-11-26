@@ -2,8 +2,8 @@
 
 import json
 import logging
-import re
 from itertools import groupby
+from sys import exc_info
 from typing import Any, cast
 
 from llama_index.core.base.llms.types import ImageBlock
@@ -13,7 +13,12 @@ from pydantic import BaseModel, PositiveInt, ValidationError
 from workflows import Context, Workflow, step
 from workflows.events import Event, StartEvent, StopEvent
 
-from mobilerun_agents.agent.action_selector.base import ActionSelector
+from mobilerun_agents.agent.action_selector import (
+    ActionSelector,
+    DecisionSelector,
+    DelegatingSelector,
+    LLMSelector,
+)
 from mobilerun_agents.agent.action_selector.llm.calls import InvalidResponse
 from mobilerun_agents.agent.events import (
     Acted,
@@ -24,14 +29,21 @@ from mobilerun_agents.agent.events import (
     Selected,
     Subgoal,
 )
-from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.memory.memory import build_run_memory
 from mobilerun_agents.agent.planner import Finish, Plan, Planner
+from mobilerun_agents.agent.planner.base import remaining_child_steps, remaining_steps
 from mobilerun_agents.config.user_config import AgentConfig, MemoryConfig
 
 from .agent import AgentWorkflow
 from .core.snapshot import StepSnapshot
-from .core.state import ActionRecord, AgentState, Outcome, PlanningState, SubgoalResult
+from .core.state import (
+    ActionRecord,
+    AgentState,
+    FailureSummary,
+    Outcome,
+    PlanningState,
+    SubgoalResult,
+)
 from .resources import DeviceResource, ServicesResource, run_resources
 
 _log = logging.getLogger(__name__)
@@ -44,49 +56,18 @@ class Begin(StartEvent):
 
 class RunSubgoal(Event):
     goal: str
+    max_steps: PositiveInt
 
 
 class SubgoalDone(Event):
-    observe_screen: bool
+    pass
 
 
-def _stop(ctx: Context[PlanningState], state: PlanningState, outcome: Outcome) -> StopEvent:
-    ctx.write_event_to_stream(Finished(outcome=outcome, steps=state.executor_steps))
-    return StopEvent(result=outcome)
+class PlanTurn(Event):
+    pass
 
 
-def _clip(text: str, limit: int, redact: Redactor) -> str:
-    if 0 < limit < len(text):
-        # Going right to left also catches earlier spans that overlap the new cut.
-        for start, end in reversed(redact.masked_spans(text)):
-            if start < limit < end:
-                limit = start
-    return text[:limit]
-
-
-def _failure_summary(state: AgentState, outcome: Outcome, redact: Redactor) -> str:
-    thoughts = list(dict.fromkeys(action.thought for action in state.actions if action.thought))
-
-    def blocker_lines(thought: str) -> list[str]:
-        # Splitting (or stripping) a secret can leave a fragment that won't mask later.
-        if redact.text(thought) != thought:
-            return [thought]
-        return [line.strip() for line in re.split(r"\n|(?<=[.!?])\s+", thought)]
-
-    blockers = dict.fromkeys(
-        [
-            *state.notes,
-            *(action.summary for action in state.actions if not action.ok),
-            *(
-                line
-                for thought in thoughts
-                for line in blocker_lines(thought)
-                if re.search(
-                    r"\b(?:block\w*|can't|cannot|requires?|denied|unavailable|hides?)\b", line, re.I
-                )
-            ),
-        ]
-    )
+def _failure_summary(state: AgentState) -> FailureSummary:
     snapshots = [action.before for action in state.actions]
     if state.current is not None and (not snapshots or state.current.at != snapshots[-1].at):
         snapshots.append(state.current)
@@ -94,41 +75,35 @@ def _failure_summary(state: AgentState, outcome: Outcome, redact: Redactor) -> s
     def screen(snapshot: StepSnapshot) -> tuple[str, str]:
         location = snapshot.ui.phone_state
         label = f"{location.get('packageName') or 'unknown'}/{location.get('activityName') or 'unknown'}"
-        text = snapshot.ui.formatted_text
-        return label, _clip(text, min(120, len(text.partition("\n")[0])), redact)
+        # Keep the full text so the output boundaries can mask values learned later.
+        return label, snapshot.ui.formatted_text
 
     visits: dict[tuple[str, str], int] = {}
     for key, _ in groupby(snapshots, key=screen):
         visits[key] = visits.get(key, 0) + 1
 
-    lines = [f"Failure reason: {outcome.reason}"]
-    for title, items in (
-        ("Observed blockers", list(blockers)[-3:]),
-        ("Recent executor thoughts (observed data)", thoughts[-3:]),
-        (
-            "Screens visited",
-            [f"{label} — {title} ×{count}" for (label, title), count in visits.items()],
-        ),
-        (
-            "Recent action results",
-            [f"{action.call.tool_name}: {action.summary}" for action in state.actions[-3:]],
-        ),
-    ):
-        if items:
-            lines.extend([f"{title}:", *(f"- {_clip(item, 240, redact)}" for item in items)])
-    return "\n".join(lines)
+    return FailureSummary(
+        blockers=[*state.notes, *(action.summary for action in state.actions if not action.ok)],
+        thoughts=list(dict.fromkeys(action.thought for action in state.actions if action.thought)),
+        screens=[(label, text, count) for (label, text), count in visits.items()],
+        actions=[f"{action.call.tool_name}: {action.summary}" for action in state.actions[-3:]],
+    )
 
 
 def _offset(action: ActionRecord, offset: int) -> ActionRecord:
     return action.model_copy(update={"step": action.step + offset})
 
 
+def _unlink_screenshot(snapshot: StepSnapshot) -> None:
+    if snapshot.screenshot is not None and snapshot.screenshot.path is not None:
+        snapshot.screenshot.path.unlink(missing_ok=True)
+
+
 def _forget_previous_images(state: PlanningState, action_count: int) -> None:
     # The previous children did not know about the newly protected value.
     # Pixels alone cannot prove which of their observations contain it.
     def without_image(snapshot: StepSnapshot) -> StepSnapshot:
-        if snapshot.screenshot is not None and snapshot.screenshot.path is not None:
-            snapshot.screenshot.path.unlink(missing_ok=True)
+        _unlink_screenshot(snapshot)
         return snapshot.model_copy(update={"screenshot": None})
 
     state.actions = [
@@ -161,55 +136,112 @@ class PlanningWorkflow(Workflow):
         kwargs.setdefault("timeout", self.config.workflow_timeout)
         super().__init__(**kwargs)
 
+    def _stop(
+        self, ctx: Context[PlanningState], state: PlanningState, outcome: Outcome
+    ) -> StopEvent:
+        ctx.write_event_to_stream(
+            Finished(
+                outcome=outcome,
+                steps=state.executor_steps + state.planner_turns,
+                budget=state.max_steps,
+                planner_turns=state.planner_turns,
+            )
+        )
+        return StopEvent(result=outcome)
+
     @step
-    async def plan(
-        self, ctx: Context[PlanningState], ev: Begin | SubgoalDone, device: DeviceResource
-    ) -> RunSubgoal | StopEvent:
+    async def observe(
+        self,
+        ctx: Context[PlanningState],
+        ev: Begin | SubgoalDone,
+        device: DeviceResource,
+        services: ServicesResource,
+    ) -> PlanTurn:
         state = await ctx.store.get_state()
-        observe_screen = False
-        repair = None
         match ev:
             case Begin(goal=goal, max_steps=max_steps):
                 state = PlanningState(
                     goal=goal,
                     max_steps=max_steps or self.config.planning_max_steps,
-                    current=StepSnapshot(ui=await device.state.refresh()),
                 )
-            case SubgoalDone(observe_screen=observe_screen):
+                match self.executor:
+                    case DelegatingSelector():
+                        state.executor = "decision_delegate"
+                    case DecisionSelector():
+                        state.executor = "decision"
+                    case LLMSelector():
+                        state.executor = "llm"
+                    case _:
+                        state.executor = "custom"
+            case SubgoalDone():
                 pass
+        snapshot = StepSnapshot(
+            ui=await device.state.refresh(), device_context=list(await device.context())
+        )
+        if not services.registry.protected_values:
+            try:
+                image = await device.screenshot()
+            except DeviceOperationNotSupported:
+                pass
+            else:
+                if image:
+                    snapshot.screenshot = ImageBlock(path=services.images.save(image))
+        # Unlike action snapshots, only the current planner observation is retained.
+        if state.current is not None:
+            _unlink_screenshot(state.current)
+        state.current = snapshot
+        await ctx.store.set_state(state)
+        phone = snapshot.ui.phone_state
+        ctx.write_event_to_stream(
+            Observed(
+                step=state.executor_steps + state.planner_turns,
+                package=phone.get("packageName"),
+                activity=phone.get("activityName"),
+                planner=True,
+            )
+        )
+        return PlanTurn()
+
+    @step
+    async def plan(
+        self, ctx: Context[PlanningState], ev: PlanTurn, services: ServicesResource
+    ) -> RunSubgoal | StopEvent:
+        state = await ctx.store.get_state()
+        repair = None
         output_attempts = 0
-        while state.planner_turns < self.config.planning.max_planner_turns:
+        while remaining_steps(state) > 0:
             state.planner_turns += 1
+            child_budget = min(self.config.planning.subgoal_steps, remaining_child_steps(state))
+            complete_only = child_budget <= 0
             await ctx.store.set_state(state)
             try:
-                decision = await self.planner.bind(self.output_schema, repair, observe_screen).plan(
-                    ctx
-                )
+                decision = await self.planner.bind(
+                    self.output_schema, repair, services.registry.redactor
+                ).plan(ctx)
             except InvalidResponse:
-                return _stop(
-                    ctx,
-                    state,
-                    Outcome(
-                        success=False, message="Invalid planner tool call", reason="repair_attempts"
-                    ),
-                )
+                repair = "Invalid planner tool call"
+                continue
             match decision:
-                case Plan(subgoals=subgoals):
+                case Plan(subgoals=subgoals, findings=findings):
+                    if complete_only:
+                        repair = "Call complete when there is no budget for another subgoal."
+                        continue
                     if not subgoals or any(not goal.strip() for goal in subgoals):
                         repair = "set_plan requires a non-empty list of subgoals"
                         ctx.write_event_to_stream(Detail(section="planning", text=repair))
                         continue
-                    if state.executor_steps >= state.max_steps:
-                        return _stop(
-                            ctx,
-                            state,
-                            Outcome(
-                                success=False, message="Step limit reached", reason="max_steps"
-                            ),
-                        )
                     first, *state.plan = subgoals
+                    for finding in findings:
+                        finding = finding.strip()
+                        if finding and finding not in state.notes:
+                            state.notes.append(finding)
                     await ctx.store.set_state(state)
-                    return RunSubgoal(goal=first)
+                    return RunSubgoal(goal=first, max_steps=child_budget)
+                case Finish(success=False, message=message) if (
+                    complete_only and not message.strip()
+                ):
+                    repair = "Explain what blocked the goal in the complete message."
+                    continue
                 case Finish(success=success, message=message, output=raw):
                     output: JSONValue = raw if success else None
                     if success and self.output is not None:
@@ -219,9 +251,12 @@ class PlanningWorkflow(Workflow):
                             output_attempts += 1
                             repair = "Planner output is invalid. Correct it to match the complete schema."
                             ctx.write_event_to_stream(Detail(section="planning", text=repair))
-                            if output_attempts >= self.config.max_output_validation_attempts:
+                            if (
+                                not complete_only
+                                and output_attempts >= self.config.max_output_validation_attempts
+                            ):
                                 await ctx.store.set_state(state)
-                                return _stop(
+                                return self._stop(
                                     ctx,
                                     state,
                                     Outcome(
@@ -231,18 +266,16 @@ class PlanningWorkflow(Workflow):
                                     ),
                                 )
                             continue
-                    return _stop(
+                    return self._stop(
                         ctx,
                         state,
                         Outcome(success=success, message=message, reason="complete", output=output),
                     )
         await ctx.store.set_state(state)
-        return _stop(
+        return self._stop(
             ctx,
             state,
-            Outcome(
-                success=False, message="Planner turn limit reached", reason="max_planner_turns"
-            ),
+            Outcome(success=False, message="Step limit reached", reason="max_steps"),
         )
 
     @step
@@ -254,7 +287,12 @@ class PlanningWorkflow(Workflow):
         services: ServicesResource,
     ) -> SubgoalDone:
         state = await ctx.store.get_state()
-        ctx.write_event_to_stream(Subgoal(text=ev.goal))
+        subgoal = Subgoal(
+            text=ev.goal,
+            step=state.executor_steps + state.planner_turns,
+            budget=state.max_steps,
+        )
+        ctx.write_event_to_stream(subgoal)
         memory = build_run_memory(self.memory_config, device.platform, self.config)
         protection = services.registry.redactor.revision
         offset = state.executor_steps
@@ -266,12 +304,7 @@ class PlanningWorkflow(Workflow):
                 config=self.config,
                 resource_manager=await run_resources(device, memory, services),
                 timeout=None,
-            ).run(
-                goal=ev.goal,
-                max_steps=min(
-                    self.config.planning.subgoal_steps, state.max_steps - state.executor_steps
-                ),
-            )
+            ).run(goal=ev.goal, max_steps=ev.max_steps)
             child_ctx = cast(Context[AgentState], child.ctx)
             async for event in child.stream_events():
                 if protection != services.registry.redactor.revision:
@@ -303,10 +336,20 @@ class PlanningWorkflow(Workflow):
                 if child is not None and not child.is_done():
                     await child.cancel_run()
             finally:
+                failed = exc_info()[0] is not None
                 try:
-                    await memory.aclose()
+                    if protection != services.registry.redactor.revision:
+                        _forget_previous_images(state, start)
+                        await ctx.store.set_state(state)
                 except Exception:
-                    _log.warning("Unable to close child run memory")
+                    if not failed:
+                        raise
+                    _log.warning("Unable to purge earlier screenshots")
+                finally:
+                    try:
+                        await memory.aclose()
+                    except Exception:
+                        _log.warning("Unable to close child run memory")
 
         outcome = final.outcome
         assert outcome is not None
@@ -315,43 +358,16 @@ class PlanningWorkflow(Workflow):
             *(_offset(record, offset) for record in final.actions),
         ]
         state.executor_steps += final.actions[-1].step if final.actions else 0
-        current = final.current
-        # A terminal batch skips the child's next Observe step. Keep each action's
-        # before-snapshot, but do not use it as evidence for the planner's next turn.
-        if current is not None and any(
-            record.before.at == current.at and record.call.tool_name != "complete"
-            for record in reversed(final.actions)
-        ):
-            current = StepSnapshot(
-                ui=await device.state.refresh(), device_context=list(await device.context())
-            )
-            final.current = current
-        state.current = current
         state.notes = list(dict.fromkeys([*state.notes, *final.notes]))
-        protected = services.registry.protected_values
-        redact = services.registry.redactor
         result = SubgoalResult(
             subgoal=ev.goal,
             success=outcome.success,
             message=outcome.message,
             reason=outcome.reason,
-            summary="" if outcome.success else _failure_summary(final, outcome, redact),
+            summary=None if outcome.success else _failure_summary(final),
+            jev_abstention=outcome.jev_abstention,
         )
         state.results.append(result)
-        ctx.write_event_to_stream(Subgoal(text=ev.goal, result=result))
-        observe_screen = not result.message
-        if (
-            observe_screen
-            and state.current is not None
-            and state.current.screenshot is None
-            and not protected
-        ):
-            try:
-                image = await device.screenshot()
-            except DeviceOperationNotSupported:
-                pass
-            else:
-                if image:
-                    state.current.screenshot = ImageBlock(path=services.images.save(image))
+        ctx.write_event_to_stream(subgoal.model_copy(update={"result": result}))
         await ctx.store.set_state(state)
-        return SubgoalDone(observe_screen=observe_screen)
+        return SubgoalDone()

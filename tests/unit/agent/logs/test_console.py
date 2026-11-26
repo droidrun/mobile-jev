@@ -4,12 +4,12 @@ import click
 from llama_index.core.tools import ToolSelection
 from mobilerun.core.state.ui_state import UIState
 
-from mobilerun_agents.agent.events import Acted, Detail, Observed, Repaired, Subgoal
+from mobilerun_agents.agent.events import Acted, Detail, Finished, Observed, Repaired, Subgoal
 from mobilerun_agents.agent.logs import ConsoleLog, configure_cli_logging
 from mobilerun_agents.agent.logs.memory import MemoryDetail
 from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
-from mobilerun_agents.agent.workflows.core.state import ActionRecord
+from mobilerun_agents.agent.workflows.core.state import ActionRecord, Outcome
 
 
 def test_console_redacts_event_text_and_arguments(caplog):
@@ -49,6 +49,40 @@ def test_cli_routes_debug_to_stderr_and_result_to_stdout(capsys):
     output = capsys.readouterr()
     assert "image: no image" in output.err
     assert "✓ done (1 step)" in output.out
+
+
+def test_agent_console_keeps_step_count_and_path(caplog, tmp_path):
+    caplog.set_level("INFO", logger="mobilerun_agents.agent.logs.console")
+    finished = Finished(outcome=Outcome(success=True, reason="completed"), steps=1)
+    ConsoleLog(Redactor()).finish(True, "done", finished, tmp_path)
+
+    assert caplog.messages == [f"✓ done (1 step · {tmp_path})"]
+
+
+def test_console_distinguishes_planner_and_executor_screens(caplog):
+    caplog.set_level("DEBUG", logger="mobilerun_agents.agent.logs.console")
+    console = ConsoleLog(Redactor())
+    console.event(Observed(step=0, package="shop", planner=True))
+    console.event(Observed(step=1, package="shop"))
+
+    assert caplog.messages == ["  planner screen: shop", "  screen: shop"]
+
+
+def test_console_subgoal_shows_shared_step_progress(caplog):
+    caplog.set_level("INFO", logger="mobilerun_agents.agent.logs.console")
+    ConsoleLog(Redactor()).event(Subgoal(text="Open settings", step=12, budget=60))
+
+    assert caplog.messages == ["→ subgoal (step 12/60): Open settings"]
+
+
+def test_console_finish_shows_shared_step_breakdown(caplog, tmp_path):
+    caplog.set_level("INFO", logger="mobilerun_agents.agent.logs.console")
+    finished = Finished(
+        outcome=Outcome(success=True, reason="completed"), steps=16, planner_turns=10, budget=60
+    )
+    ConsoleLog(Redactor()).finish(True, "done", finished, tmp_path)
+
+    assert caplog.messages == [f"✓ done (16/60 steps · 10 planner, 6 actions · {tmp_path})"]
 
 
 def test_memories_share_a_step_file_without_wrapping_console_output(capsys, tmp_path):

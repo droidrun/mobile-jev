@@ -12,7 +12,7 @@ from workflows import Context
 
 from mobilerun_agents.agent.tools.registry import ToolRegistry
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
-from mobilerun_agents.agent.workflows.core.state import AgentState
+from mobilerun_agents.agent.workflows.core.state import AgentState, JevAbstention
 
 NativeToolAPI = Literal["responses", "chat_completions", "anthropic", "gemini"]
 
@@ -22,6 +22,7 @@ class Selection(BaseModel):
     thought: str | None = None
     confidence: float | None = None
     abstained: bool = False
+    jev_abstention: JevAbstention | None = None
 
 
 class ActionSelector(ABC):

@@ -139,7 +139,7 @@ class LLMSelector(ActionSelector):
             )
         response = await self._achat([system_message, *history, user], **kwargs)
         if response is None:
-            return Selection(abstained=True)
+            return Selection()
         parsed = self._parse(response)
         error = render_prompt(decision.invalid_arguments_prompt)
         if parsed.status is ToolCallParseStatus.MALFORMED or not parsed.calls:

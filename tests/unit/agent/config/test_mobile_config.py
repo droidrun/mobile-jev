@@ -15,10 +15,13 @@ def test_llm_profiles_validate_the_same_providers_the_loader_supports():
 def test_clean_config_round_trip(tmp_path):
     path = tmp_path / "agent.yaml"
     path.write_text(
-        "agent: {max_steps: 7}\ncheckpoints: {enabled: true}\nmemory: {token_limit: 9000}\n"
+        "agent: {max_steps: 7, planning_max_steps: 19, planning: {subgoal_steps: 4}}\n"
+        "checkpoints: {enabled: true}\nmemory: {token_limit: 9000}\n"
     )
     config = ConfigLoader.load(str(path))
     assert config.agent.max_steps == 7 and config.memory.token_limit == 9000
+    assert config.agent.planning_max_steps == 19
+    assert config.agent.planning.subgoal_steps == 4
     assert config.checkpoints.enabled
     assert config.profiles == {} and config.setups == {} and config.default_setup is None
     assert MobileConfig.model_validate(config.model_dump(mode="json")) == config
@@ -30,6 +33,14 @@ def test_run_budgets():
     assert config.planning_max_steps == 40
     assert config.decision.timeout == 120
     assert config.workflow_timeout is None
+
+
+def test_post_action_settle_defaults_and_bounds():
+    config = MobileConfig().agent
+    assert config.settle_delay == 0.1
+    assert MobileConfig.model_validate({"agent": {"settle_delay": 0}}).agent.settle_delay == 0
+    with pytest.raises(ValidationError):
+        MobileConfig.model_validate({"agent": {"settle_delay": -1}})
 
 
 @pytest.mark.parametrize("value", [None, "", "override"])

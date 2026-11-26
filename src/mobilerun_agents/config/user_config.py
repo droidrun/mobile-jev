@@ -13,6 +13,7 @@ from pydantic import (
     ConfigDict,
     Field,
     HttpUrl,
+    NonNegativeFloat,
     PositiveFloat,
     PositiveInt,
     ValidationError,
@@ -187,7 +188,6 @@ class DecisionConfig(Section):
 
 class PlanningConfig(Section):
     subgoal_steps: PositiveInt = 10
-    max_planner_turns: PositiveInt = 10
 
 
 class AgentConfig(Section):
@@ -201,6 +201,7 @@ class AgentConfig(Section):
     planning_max_steps: PositiveInt = 40
     planning: PlanningConfig = Field(default_factory=PlanningConfig)
     workflow_timeout: PositiveFloat | None = None
+    settle_delay: NonNegativeFloat = 0.1
     max_output_validation_attempts: PositiveInt = 2
 
     system_prompt: str = DEFAULT_FAST_SYSTEM_PROMPT
@@ -271,6 +272,12 @@ class MobileConfig(Section):
                 raise ValueError("Invalid agents.yaml syntax") from None
         if type(data) is dict:
             agent = data.get("agent")
+            planning = agent.get("planning") if type(agent) is dict else None
+            if type(planning) is dict and "max_planner_turns" in planning:
+                raise OldConfigKeys(
+                    "Delete agent.planning.max_planner_turns from agents.yaml; "
+                    "planner turns now count against agent.planning_max_steps."
+                )
             if {"llm_profiles", "decision_profiles", "default_" + "llm"} & data.keys() or (
                 type(agent) is dict and {"selector", "delegation"} & agent.keys()
             ):

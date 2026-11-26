@@ -2,7 +2,11 @@
 
 **Purpose:** Decide the next subgoals or finish the overall run.
 
-**What belongs here / what doesn't:** Planners read `Context[PlanningState]` and return a decision. They do not execute actions or write workflow state. `LlamaIndexPlanner` requires a `set_plan` or `complete` tool call. When a child has no message, the planner sees current screen evidence; vision-capable models also see the screenshot if available. Failed children include recent thoughts, action results, screen visits, and observed blockers.
+**What belongs here / what doesn't:** Planners read `Context[PlanningState]` and return a decision. They do not execute actions or write workflow state. `LlamaIndexPlanner` requires a `set_plan` or `complete` tool call. The planner sees the executor setup and full current UI, even when the child reported a result. Vision-capable models also get the current screenshot if available. Failed or unfinished children include recent thoughts, action results, screen visits, and observed blockers. When Jev hands back an unfinished subgoal, the planner also sees the raw choice and confidence details.
+
+Planner turns and executor actions each use one step from the same budget. If only one step remains when the planner is called, it must call `complete` and report any blocker instead of setting another plan.
+
+`set_plan` can include findings from the current screen, such as a shop's price. The workflow keeps them alongside child notes for later planner turns. It does not pass them to the executor.
 
 **Contents:**
 

@@ -112,7 +112,7 @@ async def test_execute_maps_result_and_checkpoints_agent_actions(config, plannin
     with ConfigLoader.override(config):
         result = await operator.execute(phone, "type some sample text", output=Answer)
     assert result.success and result.answer == "done"
-    assert result.steps == 2 and result.output == Answer(count=1)
+    assert result.steps == (4 if planning else 2) and result.output == Answer(count=1)
     assert phone.inputs == ["sample text"]
     checkpoint = Path(result.trajectory_path) / "context.json"
     workflow = PlanningWorkflow(ScriptPlanner(), selector) if planning else AgentWorkflow(selector)
@@ -149,7 +149,7 @@ async def test_typed_planning_uses_untyped_decision_executor_completion(config):
             return Decision(option_index=index)
 
     class TypedPlanner(ScriptPlanner):
-        def bind(self, output_schema, repair, observe_screen):
+        def bind(self, output_schema, repair, redact):
             assert output_schema == Answer.model_json_schema()
             return self
 
@@ -167,7 +167,7 @@ async def test_typed_planning_uses_untyped_decision_executor_completion(config):
     with ConfigLoader.override(config):
         result = await planner.execute(Phone(), "read count", output=Answer)
         agent_result = await agent.execute(Phone(), "read count", output=Answer)
-    assert result.success and result.steps == 1 and result.output == Answer(count=1)
+    assert result.success and result.steps == 3 and result.output == Answer(count=1)
     assert agent_result.success and agent_result.output == Answer(count=2)
 
 
@@ -520,6 +520,57 @@ async def test_images_close_on_success_error_and_cancellation(config, monkeypatc
     assert len(closed) == 1 and not closed[0].exists()
 
 
+@pytest.mark.anyio
+async def test_abnormal_planning_finish_reports_shared_step_count(config, monkeypatch):
+    finished = []
+
+    class FailingSelector(ActionSelector):
+        async def select(self, ctx, device, memory, registry):
+            raise RuntimeError("fixture executor failure")
+
+    original_finish = consumers.ConsoleLog.finish
+
+    def capture(console, success, message, steps, folder):
+        finished.append(steps)
+        return original_finish(console, success, message, steps, folder)
+
+    monkeypatch.setattr(consumers.ConsoleLog, "finish", capture)
+    with (
+        ConfigLoader.override(config),
+        pytest.raises(RuntimeError, match="fixture executor failure"),
+    ):
+        await PlanningOperator(ScriptPlanner(), FailingSelector()).execute(Phone(), "goal")
+    assert finished == [1]
+
+
+@pytest.mark.anyio
+async def test_cancellation_during_second_planner_turn_reports_three_steps(config, caplog):
+    second_turn = asyncio.Event()
+
+    class BlockingPlanner(ScriptPlanner):
+        async def plan(self, ctx):
+            if self.turn == 1:
+                second_turn.set()
+                await asyncio.Future()
+            return await super().plan(ctx)
+
+    caplog.set_level(logging.INFO, logger="mobilerun_agents.agent.logs.console")
+    config.checkpoints.enabled = False
+    selector = Script(("complete", {"success": True, "message": "done"}))
+    with ConfigLoader.override(config):
+        run = asyncio.create_task(
+            PlanningOperator(BlockingPlanner(), selector).execute(Phone(), "goal")
+        )
+        try:
+            await asyncio.wait_for(second_turn.wait(), 5)
+        finally:
+            run.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await run
+
+    assert "cancelled (3 steps)" in caplog.text
+
+
 class Aliased(BaseModel):
     order_id: str = Field(alias="orderId")
 
@@ -652,11 +703,14 @@ async def test_public_output_checks_values_after_revalidation(config, caplog, so
 
 
 @pytest.mark.anyio
-async def test_public_output_keeps_valid_model_with_contextual_serializer(config, caplog):
+@pytest.mark.parametrize("use_default", [False, True], ids=["masked-input", "protected-default"])
+async def test_public_output_omits_unverified_model_with_contextual_serializer(
+    config, caplog, use_default
+):
     marker = "fixture-contextual-output"
 
     class ContextualOutput(BaseModel):
-        text: str
+        text: str = marker
 
         @field_serializer("text")
         def serialize_text(self, value: str, info: SerializationInfo) -> str:
@@ -668,14 +722,18 @@ async def test_public_output_keeps_valid_model_with_contextual_serializer(config
             return await super().select(ctx, device, memory, registry)
 
     selector = Selector(
-        ("complete", {"success": True, "message": "done", "output": {"text": marker}})
+        (
+            "complete",
+            {"success": True, "message": "done", "output": {} if use_default else {"text": marker}},
+        )
     )
     with ConfigLoader.override(config):
         result = await AgentOperator(selector).execute(Phone(), "read", output=ContextualOutput)
 
-    assert result.success and result.output == ContextualOutput(text="***")
-    assert result.output.model_dump(context={"prefix": "answer: "}) == {"text": "answer: ***"}
-    assert not [r for r in caplog.records if r.name == consumers.__name__]
+    assert result.success and result.output is None
+    assert [r.message for r in caplog.records if r.name == consumers.__name__] == [
+        "Typed output omitted: redacted output did not match the schema"
+    ]
 
 
 @pytest.mark.anyio

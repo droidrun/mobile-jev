@@ -4,17 +4,17 @@ These examples can change the phone's screen and send screen contents to model p
 
 1. Install the agents package and base device dependencies. Configure provider credentials with environment variables or `mobilerun agent providers add PROVIDER`. Jev uses the `typesafe` provider.
 2. In [`demo.py`](demo.py), set `DEVICE` to an existing cloud ID (`CLOUD = True`), or an Android serial or remote URL (`CLOUD = False`). Choose one or more names in `RUN`. `['all']` includes the comparisons and replay; it is not a smoke test.
-3. Run `python tests/demo/demo.py` from the repo root. `DEBUG` shows CLI per-step detail. `MAX_STEPS` and `TIMEOUT` apply to each operator run. `RESET` stops the foreground app when supported and presses Home before each run; disable it to keep the current screen.
+3. Run `python tests/demo/demo.py` from the repo root. `DEBUG` shows CLI per-step detail. `MAX_STEPS` and `TIMEOUT` apply to each operator run. In planning runs, each planner turn and executor action uses one step from `MAX_STEPS`. `RESET` stops the foreground app when supported and presses Home before each run; disable it to keep the current screen.
 
 | `RUN` name | Example |
 | --- | --- |
 | `llm` | Use a plain LLM with the UI tree, without screenshots. |
 | `llm_vision` | Run the same goal with tree + screenshot, then screenshot only. |
-| `jev` | Run Jev alone; choices below `JEV_MIN_CONFIDENCE` abstain. |
+| `jev` | Run Jev alone; choosing Unfinished or scoring below `JEV_MIN_CONFIDENCE` ends the run unfinished without a retry. |
 | `jev_exclude` | Remove `press_button` from Jev's choices. |
 | `delegation` | Hand a step to the LLM only when Jev explicitly chooses `delegate`. |
 | `planner_llm` | Use an LLM planner with a separate LLM executor. |
-| `planner_jev` | Use Jev alone to execute subgoals. A failed subgoal returns to the planner. |
+| `planner_jev` | Use Jev alone to execute subgoals. When Jev cannot take a next action, it hands the unfinished subgoal back to the planner. |
 | `planner_delegation` | Use the delegating executor on the harder `GOAL`. |
 | `vault_login` | Bind the local fake or an existing cloud vault and type a password reference into Chrome. |
 | `phone_number` | Temporarily bind an existing, unbound cloud number to a telephony-enabled cloud phone and read inbound SMS. Set `PHONE_NUMBER_ID`; the demo disables `sms.send`. |

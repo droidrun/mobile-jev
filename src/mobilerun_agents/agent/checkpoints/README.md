@@ -12,3 +12,5 @@
 **Examples:** With checkpoints enabled, `<runs>/<run_id>/context.json` is updated after each action and at completion. Read it with `Context.from_dict(workflow, payload)`. Planning saves child actions in its parent context with continuous step numbers. Screenshots remain separate in `<images>/<run_id>/`. Macros go in the base macro directory; the exporter skips masked arguments and drops only guards that cannot be matched safely.
 
 **Depends on / used by:** Operated by the stream consumer. The base macro player consumes `macro.json`. Protect both folders: plain typed text and observations are not secret by default.
+
+Checkpoints from before this version's planning-state change (failure summaries are now structured instead of strings) cannot be restored; older `context.json` files can still be read as plain JSON.

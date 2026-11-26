@@ -1,13 +1,42 @@
 import asyncio
 from datetime import UTC, datetime
 
+import pytest
 from mobilerun.core.credentials import DictCredentials
 from mobilerun.core.state.ui_state import UIState
 from mobilerun.models.context import ContextItem
+from workflows import Context, Workflow, step
+from workflows.context.serializers import JsonSerializer
+from workflows.events import StartEvent, StopEvent
 
+from mobilerun_agents.agent.checkpoints.store import save_context
 from mobilerun_agents.agent.logs.redaction import Redactor, observe_vault
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
+from mobilerun_agents.agent.workflows.core.state import PlanningState
 from tests.unit.device_fixtures import MemoryDevice
+
+
+class PlanningProbe(Workflow):
+    @step
+    async def start(self, ctx: Context[PlanningState], ev: StartEvent) -> StopEvent:
+        return StopEvent()
+
+
+def test_checkpoint_round_trip_preserves_planning_executor(tmp_path):
+    async def check():
+        flow = PlanningProbe()
+        ctx = Context(flow)
+        expected = PlanningState(executor="decision_delegate")
+        await ctx.store.set_state(expected)
+        redactor = Redactor()
+        redactor.add("decision")
+
+        saved = await save_context(tmp_path / "context.json", ctx, redactor)
+        restored = Context.from_dict(flow, saved, serializer=JsonSerializer())
+
+        assert (await restored.store.get_state()).executor == "decision_delegate"
+
+    asyncio.run(check())
 
 
 def test_masked_spans_include_registered_variants_and_overlapping_keys():
@@ -16,9 +45,25 @@ def test_masked_spans_include_registered_variants_and_overlapping_keys():
     redact.add("fixture-token suffix")
 
     text = "fixture alpha / fixture%20alpha / Bearer fixture-token suffix"
-    assert redact.masked_spans(text) == [(0, 13), (16, 31), (34, 54), (41, 61)]
+    assert redact.masked_spans(text) == [(0, 13), (16, 31), (34, 61)]
     assert redact.masked_spans("ordinary text") == []
     assert redact.text(text) == "*** / *** / ***"
+
+
+@pytest.mark.parametrize(
+    ("registered", "text", "span"),
+    [
+        (["abcd", "cdefgh"], "abcdefgh", (0, 8)),
+        (["Bearer xyz"], "Bearer xyz-token", (0, 16)),
+        (["abcd", "efgh"], "abcdefgh", (0, 8)),
+    ],
+    ids=["overlapping-values", "registered-key-prefix", "adjacent-values"],
+)
+def test_text_and_spans_cover_entire_protected_region(registered, text, span):
+    redact = Redactor()
+    redact.add(registered)
+    assert redact.text(text) == "***"
+    assert redact.masked_spans(text) == [span]
 
 
 def test_overlapping_vault_scopes_mask_only_their_own_values_and_restore_device():

@@ -143,6 +143,18 @@ def test_unknown_yaml_provider_fails_during_config_load():
     assert "private" in result.output and "agent profiles add --help" in result.output
 
 
+def test_removed_planner_turn_limit_has_one_actionable_error():
+    path = ConfigLoader.get_user_config_path()
+    path.parent.mkdir(parents=True)
+    path.write_text("agent: {planning: {max_planner_turns: 10}}\n")
+    result = invoke("configure", "show")
+    assert result.exit_code == 1
+    assert result.output.strip() == (
+        "Error: Delete agent.planning.max_planner_turns from agents.yaml; "
+        "planner turns now count against agent.planning_max_steps."
+    )
+
+
 def test_profile_base_url_accepts_plain_endpoint():
     url = "https://example.invalid:8443/api/v1"
     ok(

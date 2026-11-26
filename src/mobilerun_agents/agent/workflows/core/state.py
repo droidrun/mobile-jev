@@ -1,3 +1,5 @@
+from typing import Literal
+
 from llama_index.core.tools import ToolSelection
 from mobilerun.models.context import JSONValue
 from pydantic import BaseModel, Field
@@ -7,11 +9,21 @@ from mobilerun_agents.config.settings import DEFAULT_MAX_STEPS
 from .snapshot import StepSnapshot
 
 
+class JevAbstention(BaseModel):
+    choice: str
+    confidence: float | None
+    target_confidence: float | None
+    cutoff: float
+    thought: str | None
+    choices: str
+
+
 class Outcome(BaseModel):
     success: bool
     message: str | None = None
     reason: str
     output: JSONValue = None
+    jev_abstention: JevAbstention | None = None
 
 
 class ActionRecord(BaseModel):
@@ -36,16 +48,25 @@ class AgentState(BaseModel):
     outcome: Outcome | None = None
 
 
+class FailureSummary(BaseModel):
+    blockers: list[str]
+    thoughts: list[str]
+    screens: list[tuple[str, str, int]]
+    actions: list[str]
+
+
 class SubgoalResult(BaseModel):
     subgoal: str
     success: bool
     message: str | None = None
     reason: str
-    summary: str = ""
+    summary: FailureSummary | None = None
+    jev_abstention: JevAbstention | None = None
 
 
 class PlanningState(BaseModel):
     goal: str = ""
+    executor: Literal["decision", "decision_delegate", "llm", "custom"] = "custom"
     plan: list[str] = Field(default_factory=list)
     results: list[SubgoalResult] = Field(default_factory=list)
     planner_turns: int = 0

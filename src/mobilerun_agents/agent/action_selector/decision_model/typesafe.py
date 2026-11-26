@@ -1,7 +1,6 @@
 """Native TypeSafe Jev choices, without an LLM compatibility layer."""
 
 import traceback
-from collections import Counter
 from time import monotonic
 from typing import Any
 
@@ -128,12 +127,7 @@ class TypeSafeDecisionModel:
             diagnostic(
                 "jev input", f"{tree}{image} · {'locate requested' if locating else 'no locate'}"
             )
-            groups = Counter(option.action.name for option in request.options)
-            grouped = ", ".join(f"{name} {count}" for name, count in groups.most_common())
-            diagnostic(
-                "jev choices",
-                f"{len(request.options)} · {grouped} · +abstain",
-            )
+            diagnostic("jev choices", request.describe_choices())
         started = monotonic() if diagnostic else 0.0
         validating_result = False
         try:

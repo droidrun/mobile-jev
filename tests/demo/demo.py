@@ -186,7 +186,7 @@ async def llm_vision(phone: Device) -> str:
     return "\n".join(results)
 
 
-# Low-confidence Jev choices abstain; there is no LLM to fall back to.
+# Low-confidence Jev choices end the run without retrying or calling an LLM.
 async def jev(phone: Device, goal: str = JEV_GOAL) -> Result:
     return await execute(AgentOperator(decision_selector()), phone, goal)
 

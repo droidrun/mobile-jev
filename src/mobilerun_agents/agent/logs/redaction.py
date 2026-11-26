@@ -49,24 +49,41 @@ class Redactor:
                     )
                     self.revision += 1
 
-    def _registered_pattern(self) -> re.Pattern[str] | None:
-        if not self._values:
-            return None
-        return re.compile("|".join(map(re.escape, sorted(self._values, key=len, reverse=True))))
-
     def text(self, value: str) -> str:
-        pattern = self._registered_pattern()
-        if pattern is not None:
-            value = pattern.sub(lambda _: MASK, value)
-        return _KEY.sub(MASK, value)
+        spans = self.masked_spans(value)
+        if not spans:
+            return value
+        parts: list[str] = []
+        previous = 0
+        for start, end in spans:
+            parts.extend((value[previous:start], MASK))
+            previous = end
+        parts.append(value[previous:])
+        return "".join(parts)
 
     def masked_spans(self, value: str) -> list[tuple[int, int]]:
-        """Find registered and key matches on the original text, retaining overlaps."""
+        """Find and merge registered and key matches on the original text."""
         spans = [match.span() for match in _KEY.finditer(value)]
-        pattern = self._registered_pattern()
-        if pattern is not None:
-            spans.extend(match.span() for match in pattern.finditer(value))
-        return sorted(spans)
+        for registered in self._values:
+            width = len(registered)
+            start = value.find(registered)
+            while start >= 0:
+                end = start + width
+                next_start = value.find(registered, start + 1)
+                while 0 <= next_start <= end:
+                    end = next_start + width
+                    next_start = value.find(registered, next_start + 1)
+                spans.append((start, end))
+                start = next_start
+
+        merged: list[tuple[int, int]] = []
+        for start, end in sorted(spans):
+            if merged and start <= merged[-1][1]:
+                left, right = merged[-1]
+                merged[-1] = left, max(right, end)
+            else:
+                merged.append((start, end))
+        return merged
 
     def value(self, value: Any, freeform: bool = True) -> Any:
         match value:
@@ -87,7 +104,7 @@ class Redactor:
 
     def _checkpoint_field(self, key: str, value: Any) -> Any:
         match key, value:
-            case "at", _:
+            case "at" | "executor", _:
                 return value
             case "device_context", list() as items:
                 return [self._context_item(item) for item in items]

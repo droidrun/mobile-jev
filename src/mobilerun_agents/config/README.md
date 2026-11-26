@@ -21,8 +21,9 @@
 | Model | Use `default_setup` when set. Otherwise use a straight agent with the first LLM profile; if there are no LLM profiles, use the first provider with an environment or saved key: OpenAI (`gpt-5-mini`), Anthropic (`claude-sonnet-5`), Gemini (`gemini-3.8-flash`), then OpenRouter (`openai/gpt-5-mini`). |
 | Reasoning effort | Planner: high; executor: low; agent: medium. An LLM profile can override `reasoning` for supported OpenAI models. |
 | Vision | On for OpenAI, Anthropic, Gemini and TypeSafe; off for other providers unless configured. Use `vision: off`, `on`, or `only` on a profile. |
-| Step budget | Agent: 25 (`agent.max_steps`); planning: 40 (`agent.planning_max_steps`). |
+| Step budget | Agent: 25 (`agent.max_steps`); planning: 40 shared by planner turns and executor actions (`agent.planning_max_steps`). |
 | Timeout | 120 seconds per LLM call (`agent.decision.timeout`); no whole-run deadline unless `agent.workflow_timeout` or `execute(timeout=…)` is set. |
+| Screen settling | Pause 100 ms (`agent.settle_delay: 0.1`, in seconds) before observing after an action. Set the delay to `0` to disable it. |
 
 **Examples:**
 

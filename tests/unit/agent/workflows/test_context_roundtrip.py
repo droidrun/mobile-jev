@@ -9,10 +9,13 @@ from workflows import Context, Workflow, step
 from workflows.context.serializers import JsonSerializer
 from workflows.events import StartEvent, StopEvent
 
+from mobilerun_agents.agent.checkpoints.store import save_context
+from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.state import (
     ActionRecord,
     AgentState,
+    JevAbstention,
     Outcome,
     PlanningState,
     SubgoalResult,
@@ -109,7 +112,19 @@ def test_native_context_round_trip(tmp_path):
             goal="tap",
             plan=["tap"],
             results=[
-                SubgoalResult(subgoal="tap", success=True, reason="complete", summary="tapped")
+                SubgoalResult(
+                    subgoal="tap",
+                    success=True,
+                    reason="complete",
+                    jev_abstention=JevAbstention(
+                        choice="fixture-protected-value",
+                        confidence=None,
+                        target_confidence=None,
+                        cutoff=0.5,
+                        thought="fixture-protected-value",
+                        choices="fixture-protected-value",
+                    ),
+                )
             ],
             planner_turns=1,
             executor_steps=4,
@@ -130,14 +145,19 @@ def test_native_context_round_trip(tmp_path):
         flow = PlanningProbe()
         ctx = Context(flow)
         await ctx.store.set_state(plan)
-        plan_payload = json.dumps(ctx.to_dict(serializer=serializer))
-        assert str(path) in plan_payload
+        redactor = Redactor()
+        redactor.add("fixture-protected-value")
+        saved_plan = await save_context(tmp_path / "context.json", ctx, redactor)
+        plan_payload = json.dumps(saved_plan)
+        assert "fixture-protected-value" not in plan_payload
         assert pixels.decode() not in plan_payload
         assert base64.b64encode(pixels).decode() not in plan_payload
         restored_plan = Context.from_dict(flow, json.loads(plan_payload), serializer=serializer)
         restored_state = await restored_plan.store.get_state()
-        assert restored_state.model_dump(mode="json") == plan.model_dump(mode="json")
         assert restored_state.results[0].message is None
+        assert restored_state.results[0].jev_abstention is not None
+        abstention = restored_state.results[0].jev_abstention
+        assert abstention.choice == abstention.thought == abstention.choices == "***"
         assert [(record.step, record.call.tool_id) for record in restored_state.actions] == [
             (1, "call_7"),
             (4, "call_8"),
