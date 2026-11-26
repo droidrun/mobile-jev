@@ -7,13 +7,13 @@
 **Contents:**
 
 - `__init__.py` — Package marker.
-- `agent/` — Model setup, saved-key logout, agent runs and cloud tasks.
+- `agent/` — Provider credentials, named model profiles and setups, runs and cloud tasks.
 - `macro_agent/` — Macro replay with agent handoff.
 
 **Examples:**
 
 ```sh
-mobilerun agent setup
+mobilerun agent profiles add local --provider ollama --model llama3.2:3b
 mobilerun agent run "Open Settings" emulator-5554 --steps 10
 mobilerun macro list
 mobilerun macro-agent replay <run_id> emulator-5554

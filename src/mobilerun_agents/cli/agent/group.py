@@ -5,9 +5,10 @@ from mobilerun.cli.base.menu import MenuGroup
 from mobilerun.cli.base.prompts import SelectChoice
 
 _COMMANDS = {
-    "logout": "Remove a provider and its saved key.",
+    "configure": "Create, inspect and choose named setups.",
+    "profiles": "Manage named model profiles.",
+    "providers": "Manage provider credentials.",
     "run": "Run a command on your mobile device.",
-    "setup": "Manage providers, models and the default LLM.",
     "task": "Inspect and stop cloud agent tasks.",
 }
 
@@ -32,10 +33,18 @@ class AgentGroup(MenuGroup):
             from .task import task
 
             return task
-        if cmd_name in ("setup", "logout"):
-            from .setup import logout, setup
+        if cmd_name == "configure":
+            from .configure import configure
 
-            return setup if cmd_name == "setup" else logout
+            return configure
+        if cmd_name == "profiles":
+            from .profiles import profiles
+
+            return profiles
+        if cmd_name == "providers":
+            from .providers import providers
+
+            return providers
         return None
 
 

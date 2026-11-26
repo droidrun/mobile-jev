@@ -17,7 +17,7 @@ def selection_run(
     run.state_provider.requires_coordinate_tools = screenshot is not None
     run.state_provider.requires_active_contract_for_coords = False
     run.config = AgentConfig(streaming=stream, parallel_tools=parallel_tools)
-    run.registry = ToolRegistry(tuple(tools))
+    run.registry = ToolRegistry(run, tuple(tools))
     run.device.screenshot = AsyncMock(return_value=screenshot)
     run.memory = SimpleNamespace(aget=AsyncMock(return_value=[]))
     run._state_snapshot = state
@@ -30,7 +30,10 @@ async def captured_turn(run):
         goal=state.goal,
         history=list(state.actions),
         memory="\n".join(m.content or "" for m in await run.history()),
-        by_name=run.registry.by_name,
+        by_name={
+            tool.metadata.get_name(): tool
+            for tool in run.registry.tools(run.selection_exclude, run.selection_include)
+        },
         state=run.ui,
         registry=run.registry,
     )

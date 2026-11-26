@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+from urllib.parse import quote_plus
 
 import click
 import httpx2
@@ -19,7 +20,6 @@ import mobilerun_agents.agent.action_selector.decision_model.typesafe as typesaf
 from mobilerun_agents import ToolRegistry
 from mobilerun_agents.agent.action_selector import ActionCandidate, DecisionSelector
 from mobilerun_agents.agent.action_selector.decision_model.base import DecisionInput
-from mobilerun_agents.agent.action_selector.decision_model.loader import load_decision_model
 from mobilerun_agents.agent.action_selector.decision_model.typesafe import TypeSafeDecisionModel
 from mobilerun_agents.agent.action_selector.llm.parsing import ToolCall
 from mobilerun_agents.agent.logs import ConsoleLog, configure_cli_logging
@@ -27,12 +27,7 @@ from mobilerun_agents.agent.logs.diagnostics import protect, sink
 from mobilerun_agents.agent.operators._consumers import RunConsumers
 from mobilerun_agents.agent.tools.registry import build_registry
 from mobilerun_agents.agent.workflows.agent import AgentWorkflow
-from mobilerun_agents.config.user_config import (
-    CheckpointsConfig,
-    DecisionConfig,
-    DecisionProfile,
-    MobileConfig,
-)
+from mobilerun_agents.config.user_config import CheckpointsConfig, MobileConfig
 from tests.unit.agent.selector_fixtures import selection_run
 from tests.unit.device_fixtures import MemoryDevice, fake_tools
 
@@ -74,7 +69,7 @@ def sdk(monkeypatch):
 def request(**kwargs):
     values = dict(
         goal="Battery",
-        registry=ToolRegistry(fake_tools("click")),
+        registry={"click": fake_tools("click")[0]},
         instructions="Choose",
         options=(ActionCandidate(ToolCall("click", {"index": 7}), "Click Battery"),),
     )
@@ -93,21 +88,15 @@ def test_opaque_labels_preserve_identity_and_scoped_client(sdk):
     close.assert_awaited_once()
 
 
-@pytest.mark.parametrize("explicit", [False, True])
-def test_profile_fields_override_client_kwargs_only_when_set(sdk, explicit):
+def test_explicit_typesafe_client_options(sdk):
     _, _, factory = sdk
-    profile = DecisionProfile(
-        model="jev" if explicit else None,
-        base_url="https://profile.example" if explicit else None,
-        kwargs={"model": "kwargs-model", "base_url": "https://kwargs.example"},
-    )
-    model = load_decision_model(profile, DecisionConfig())
+    model = TypeSafeDecisionModel(model="jev", base_url="https://profile.example")
 
     asyncio.run(model.decide(request()))
 
     factory.assert_called_once_with(
-        model="jev" if explicit else "kwargs-model",
-        base_url="https://profile.example" if explicit else "https://kwargs.example",
+        model="jev",
+        base_url="https://profile.example",
         api_key="fake-env",
     )
 
@@ -123,8 +112,10 @@ def test_schema_candidate_sends_tool_description_as_context(sdk):
 
     client, _, _ = sdk
     run = selection_run("Scroll")
-    run.registry = build_registry(run, [scroll], None).extend((), {"complete", "wait"})
-    asyncio.run(DecisionSelector(TypeSafeDecisionModel(), "off").select(run))
+    run.registry = build_registry(run, [scroll], None)
+    asyncio.run(
+        DecisionSelector(TypeSafeDecisionModel(), "off", exclude={"complete", "wait"}).select(run)
+    )
     criteria = client.system_one.call_args.kwargs["questions"]["action"].criteria
     assert criteria["action_0"]["description"] == "scroll down"
     assert "down swipes the finger up" in criteria["action_0"]["context"]
@@ -165,13 +156,9 @@ def test_invalid_confidence_is_validated_at_sdk_boundary(sdk, confidence):
 def test_completion_is_offered_only_when_enabled(sdk, choice, success):
     client, _, _ = sdk
     client.system_one.return_value.choices["action"].choice = choice
-    result = asyncio.run(
-        TypeSafeDecisionModel().decide(
-            request(registry=ToolRegistry(fake_tools("click", "complete")))
-        )
-    )
-    assert result.success is success
-    assert result.option_index is None
+    run = selection_run("Battery", fake_tools("click", "complete"))
+    result = asyncio.run(DecisionSelector(TypeSafeDecisionModel(), "off").select(run))
+    assert result.actions[0].parameters["success"] is success
     with pytest.raises(ValueError, match="unknown or missing"):
         asyncio.run(TypeSafeDecisionModel().decide(request()))
 
@@ -197,6 +184,32 @@ def test_jev_can_complete_without_any_discrete_device_options(sdk):
     run = selection_run("Finish", fake_tools("complete"))
     selection = asyncio.run(DecisionSelector(TypeSafeDecisionModel(), "off").select(run))
     assert selection.actions[0].name == "complete"
+    choices = client.system_one.call_args.kwargs["questions"]["action"].criteria
+    assert choices["complete_success"]["description"] == "complete: subgoal done"
+    assert (
+        choices["complete_failure"]["description"]
+        == "complete: report failure (blocked or impossible)"
+    )
+
+
+def test_jev_with_delegate_does_not_offer_abstain(sdk):
+    client, _, _ = sdk
+    run = selection_run("Delegate", fake_tools("delegate"))
+    result = asyncio.run(DecisionSelector(TypeSafeDecisionModel(), "off").select(run))
+    assert result.actions == [ToolCall("delegate")]
+    choices = client.system_one.call_args.kwargs["questions"]["action"].criteria
+    assert "abstain" not in choices
+    assert choices["action_0"]["description"] == (
+        "delegate: hand this step to the LLM (typing text, or nothing listed fits)"
+    )
+
+
+def test_typesafe_wire_state_includes_current_delegate_intent(sdk):
+    client, _, _ = sdk
+    turn = request()
+    turn.intent = "Read the price from the first listing"
+    asyncio.run(TypeSafeDecisionModel(api_key="fake").decide(turn))
+    assert client.system_one.call_args.kwargs["state"]["intent"] == turn.intent
 
 
 def test_native_history_preserves_tool_call_and_result_identity(sdk):
@@ -262,7 +275,7 @@ def test_located_target_is_scaled_out_of_image_padding(sdk):
         TypeSafeDecisionModel().decide(
             request(
                 screenshot=output.getvalue(),
-                registry=ToolRegistry(fake_tools("click_at")),
+                registry={"click_at": fake_tools("click_at")[0]},
                 options=(ActionCandidate(ToolCall("click_at"), "Tap", (100, 2400)),),
             )
         )
@@ -344,7 +357,7 @@ def test_jev_debug_reports_actual_vision_inputs(
     run.device = phone
     tools = build_registry(run, [], None)
     run.registry = ToolRegistry(
-        tuple(tools.by_name[name] for name in ("tap", "tap_element", "complete"))
+        run, tuple(tools.by_name[name] for name in ("tap", "tap_element", "complete"))
     )
     selector = DecisionSelector(TypeSafeDecisionModel(min_confidence=0.7), vision)
 
@@ -363,12 +376,14 @@ def test_jev_debug_reports_actual_vision_inputs(
     assert ("target" in sent["questions"]) is (vision == "only")
     choices = sent["questions"]["action"].criteria
     assert [choice["tool"] for choice in choices.values() if isinstance(choice, dict)] == [
-        "tap" if vision == "only" else "tap_element"
+        "tap" if vision == "only" else "tap_element",
+        "complete",
+        "complete",
     ]
     client.system_one.assert_awaited_once()
     log = capsys.readouterr().err
     assert f"jev input: {input_line}" in log
-    assert f"jev choices: {groups} · +complete/abstain" in log
+    assert f"jev choices: 3 · complete 2, {groups.split(' · ')[1]} · +abstain" in log
     assert "jev option:" not in log
     assert f"jev answer: {answer}" in log
     assert "confidence=0.9 (min=0.7)" in log
@@ -444,7 +459,7 @@ def test_decision_sidecar_preserves_public_parameters_and_masks_declared_secrets
         """Use a package and token."""
 
     run = tool_run()
-    req = DecisionInput("test", registry=build_registry(run, [mixed], None))
+    req = DecisionInput("test", registry=build_registry(run, [mixed], None).by_name)
     params = [
         {"package": "example.app"},
         {"x1": 12, "y1": 35, "x2": 7, "y2": 2},
@@ -455,7 +470,7 @@ def test_decision_sidecar_preserves_public_parameters_and_masks_declared_secrets
         for name, args in zip(("start_app", "swipe", "mixed"), params, strict=True)
     )
     rows = _recorded_choices(req, choices, False)
-    assert [row["tool_call"]["parameters"] for row in rows[:-1]] == [
+    assert [row["tool_call"]["parameters"] for row in rows] == [
         *params[:2],
         {"package": "example.app", "token": "***"},
     ]
@@ -526,3 +541,63 @@ def test_jev_records_full_masked_decisions_only_with_checkpoints(
         assert len(taps) == 21
         assert taps[0]["tool_call"] == {"name": "tap_element", "parameters": {"index": 3}}
         assert 'tap_element [3] "***"' in taps[0]["label"]
+
+
+@pytest.mark.parametrize("debug", [False, True])
+def test_jev_sidecar_masks_tracked_values_in_ordinary_arguments(sdk, tmp_path, debug):
+    from mobilerun_agents import Run, tool
+    from mobilerun_agents.agent.action_selector.base import ActionSelection, ActionSelector
+    from tests.unit.agent.workflows.test_run import complete, resources
+
+    private = 'fixture "é"\n  marker / value'
+    provider = "fixture / provider"
+    private_packages = (
+        private,
+        json.dumps(private)[1:-1],
+        repr(private)[1:-1],
+        " ".join(private.split()),
+        quote_plus(private),
+        provider,
+        quote_plus(provider),
+    )
+
+    @tool(sensitive_parameters=frozenset({"token"}))
+    async def authorize(run: Run, token: str) -> None:
+        """Use a fixture credential."""
+
+    class Selector(ActionSelector):
+        async def select(self, run: Run) -> ActionSelection:
+            if not run.state.actions:
+                return ActionSelection(actions=[ToolCall("authorize", {"token": private})])
+            options = tuple(
+                ActionCandidate(ToolCall("start_app", {"package": package}), "Open app")
+                for package in (*private_packages, "example.app")
+            ) + (
+                ActionCandidate(ToolCall("tap", {"x": 12, "y": 35}), "Tap"),
+            )
+            await TypeSafeDecisionModel(api_key=provider).decide(request(options=options))
+            return ActionSelection(actions=[complete()])
+
+    config = MobileConfig(
+        checkpoints=CheckpointsConfig(folder=tmp_path),
+        analytics=TelemetryConfig(enabled=False),
+    )
+    config.tracing.enabled = False
+
+    async def run():
+        async with RunConsumers(config, "tracked-values", 2) as consumers:
+            await consumers.consume(
+                AgentWorkflow(Selector()).run(**await resources(), tools=[authorize])
+            )
+
+    with click.Context(click.Command("agent")):
+        configure_cli_logging(debug)
+        asyncio.run(run())
+
+    sidecar = tmp_path / "tracked-values" / "decisions" / "0001.json"
+    calls = [row["tool_call"] for row in json.loads(sidecar.read_text())["choices"]]
+    packages = [call["parameters"]["package"] for call in calls if call["name"] == "start_app"]
+    if packages[:-1] != ["***"] * len(private_packages):
+        pytest.fail("Sidecar did not mask every tracked value", pytrace=False)
+    assert packages[-1] == "example.app"
+    assert {"name": "tap", "parameters": {"x": 12, "y": 35}} in calls

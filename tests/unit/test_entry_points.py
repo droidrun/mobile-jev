@@ -52,13 +52,13 @@ def test_agent_macro_entry_point_accepts_resolved_target(monkeypatch):
         handoff(provider="openai", model="example", **options)
     assert len(calls) == 1
     config = calls[0][1].pop("config")
-    assert calls[0][1] == options and not loaded_config.llm_profiles
-    assert config.llm_profiles[config.agent.selector].model == "example"
+    assert calls[0][1] == options and not loaded_config.profiles
+    assert config.profiles["recovery"].model == "example"
 
 
 def test_agent_group_has_no_macro_alias():
     from mobilerun_agents.cli.agent.group import agent
 
     with click.Context(agent) as ctx:
-        assert agent.list_commands(ctx) == ["logout", "run", "setup", "task"]
+        assert agent.list_commands(ctx) == ["configure", "profiles", "providers", "run", "task"]
         assert agent.get_command(ctx, "replay") is None

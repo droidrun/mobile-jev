@@ -27,7 +27,7 @@ def test_replay_dispatches_path_target_and_model(tmp_path, monkeypatch, folder):
     assert options["path"] == str(path)
     assert options["target"].identifier == "emulator-5554"
     config = options["config"]
-    profile = config.llm_profiles[config.agent.selector]
+    profile = config.profiles["recovery"]
     assert (profile.provider, profile.model) == ("openai", "mock")
 
 

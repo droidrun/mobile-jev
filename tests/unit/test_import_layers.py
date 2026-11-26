@@ -1,6 +1,7 @@
 """Enforce the dependency direction of the agents package, including lazy imports."""
 
 import ast
+from importlib import import_module
 from importlib.util import resolve_name
 from pathlib import Path
 
@@ -136,6 +137,13 @@ def test_import_layers():
                 elif level > source_layer or 0 <= source_tool < target_tool:
                     violations.append(f"{relative}:{line}: upward import {target}")
     assert not violations, "\n" + "\n".join(violations)
+
+
+def test_external_plugins_have_no_workflow_module():
+    module = "mobilerun_agents.agent.workflows.external"
+    with pytest.raises(ModuleNotFoundError) as exc:
+        import_module(module)
+    assert exc.value.name == module
 
 
 @pytest.mark.parametrize(

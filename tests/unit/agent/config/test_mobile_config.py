@@ -3,8 +3,13 @@ import asyncio
 import pytest
 from pydantic import ValidationError
 
+from mobilerun_agents.agent.action_selector.llm.models import MODELS
 from mobilerun_agents.config.loader import ConfigLoader
-from mobilerun_agents.config.user_config import MobileConfig
+from mobilerun_agents.config.user_config import PROVIDER_KINDS, MobileConfig
+
+
+def test_llm_profiles_validate_the_same_providers_the_loader_supports():
+    assert {name for name, kind in PROVIDER_KINDS.items() if kind == "llm"} == MODELS.keys()
 
 
 def test_clean_config_round_trip(tmp_path):
@@ -15,7 +20,7 @@ def test_clean_config_round_trip(tmp_path):
     config = ConfigLoader.load(str(path))
     assert config.agent.max_steps == 7 and config.memory.token_limit == 9000
     assert str(config.checkpoints.folder) == "runs"
-    assert config.llm_profiles == {} and config.default_llm is None
+    assert config.profiles == {} and config.setups == {} and config.default_setup is None
     assert MobileConfig.model_validate(config.model_dump(mode="json")) == config
 
 
@@ -54,11 +59,27 @@ def test_scoped_config_is_nested_and_task_local():
         {"mcp": {}},
         {"agent": {"max_steps": 0}},
         {"llm_profiles": {"default": {"auth_mode": "oauth"}}},
+        {"profiles": {"jev": {"provider": "typesafe", "min_confidence": 4}}},
+        {"profiles": {"jev": {"provider": "typesafe", "model": "jev"}}},
     ],
 )
 def test_rejects_invalid_or_removed_settings(data):
     with pytest.raises(ValidationError):
         MobileConfig.model_validate(data)
+
+
+def test_unquoted_vision_modes_in_yaml(tmp_path):
+    path = tmp_path / "agents.yaml"
+    path.write_text(
+        "profiles:\n"
+        "  luna: {provider: openai, model: gpt-6-luna, vision: off}\n"
+        "  jev: {provider: typesafe, vision: on}\n"
+        "agent: {streaming: false}\n"
+    )
+    config = ConfigLoader.load(str(path))
+    assert config.profiles["luna"].vision == "off"
+    assert config.profiles["jev"].vision == "on"
+    assert not config.agent.streaming
 
 
 def test_asset_resolver_does_not_rewrite_old_config_paths(tmp_path, monkeypatch):

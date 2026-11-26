@@ -27,7 +27,7 @@ async def test_priority_and_missing(monkeypatch):
         await resolve("typesafe")
     assert missing.value.args[0] == (
         "No API key for typesafe: pass api_key or set TYPESAFE_API_KEY. "
-        "You can also save a provider key with `mobilerun agent setup`."
+        "You can also save a key with `mobilerun agent providers add`."
     )
     store.save_key("typesafe", "saved")
     assert await resolve("typesafe") == Credential("typesafe", api_key="saved")

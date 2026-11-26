@@ -9,7 +9,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 import mobilerun_agents
 from mobilerun_agents.agent.action_selector import ActionSelector, DelegatingSelector
 from mobilerun_agents.config.prompts import render_selector_prompt
-from mobilerun_agents.config.user_config import DecisionConfig, DelegationConfig, MobileConfig
+from mobilerun_agents.config.user_config import DecisionConfig, DelegationConfig
 
 
 class Stub(ActionSelector):
@@ -24,8 +24,8 @@ def test_decision_defaults():
 
 
 def test_config_override_changes_threshold():
-    config = MobileConfig.model_validate({"agent": {"delegation": {"min_confidence": 0.25}}})
-    selector = DelegatingSelector(Stub(), Stub(), config=config.agent.delegation)
+    config = DelegationConfig.model_validate({"min_confidence": 0.25})
+    selector = DelegatingSelector(Stub(), Stub(), config=config)
     assert selector.min_confidence == 0.25
 
 
@@ -127,3 +127,14 @@ def test_no_model_facing_prose_in_selector_code():
                 if len(node.value) > 80 or len(re.findall(r"[.!?](?:\s|$)", node.value)) > 1:
                     violations.append(f"{path.name}:{node.lineno}: {node.value}")
     assert not violations, "\n".join(violations)
+
+
+def test_fast_agent_prompt_reports_partial_results_and_visible_blockers():
+    path = Path(mobilerun_agents.__file__).parent / "assets/prompts/fast_agent/system.jinja2"
+    assert "site-packages" in str(path), "Check the installed wheel, not the checkout"
+    prompt = path.read_text()
+    assert "including partial values. Don't keep searching the same places." in prompt
+    assert "Name any visible blocker" in prompt
+    assert (
+        '"blocked: price hidden because item can\'t ship to selected location (Germany)"' in prompt
+    )

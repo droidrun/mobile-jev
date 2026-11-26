@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from llama_index.core.llms import LLM, ChatMessage
 from llama_index.core.memory import Memory
+from llama_index.core.tools import BaseTool
 from mobilerun.core.devices import Device
 from mobilerun.core.state.base import StateProvider
 from mobilerun.core.state.ui_state import UIState
@@ -15,7 +17,7 @@ from mobilerun.errors import DeviceOperationNotSupported
 from mobilerun.macro.recorder import MacroRecorder
 from pydantic import BaseModel
 
-from mobilerun_agents.agent.workflows.core.state import AgentState
+from mobilerun_agents.agent.workflows.core.state import ActionRecord, AgentState
 from mobilerun_agents.config.user_config import AgentConfig, ToolsConfig
 
 if TYPE_CHECKING:
@@ -51,8 +53,13 @@ class Run:
     config: AgentConfig
     output: type[BaseModel] | None = None
     action_selector: ActionSelector | None = None
+    report_completion: Callable[[str], None] | None = field(default=None, repr=False)
     _apps: tuple[InstalledApp, ...] | None = field(default=None, init=False, repr=False)
     atomic_drops: set[str] = field(default_factory=set, init=False, repr=False)
+    selection_exclude: frozenset[str] = field(default_factory=frozenset, init=False, repr=False)
+    selection_include: tuple[BaseTool, ...] = field(default=(), init=False, repr=False)
+    avoid_signature: str = field(default="", init=False, repr=False)
+    model_actions: list[ActionRecord] = field(default_factory=list, init=False, repr=False)
     _state_snapshot: AgentState = field(default_factory=AgentState, init=False, repr=False)
 
     @property

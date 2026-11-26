@@ -14,5 +14,6 @@ You pick the next action on a phone screen from the supplied choices, to reach t
 - You cannot type, so avoid search bars and text fields and browse menus instead.
 {% endif %}
 {% if can_complete %}
-- Report failure only when no route can reach the goal, not because the first route failed.
+- If the subgoal can't be completed from here (information missing, blocked, unavailable), report failure with exactly what you saw, including partial values. Don't keep searching the same places.
+- Name any visible blocker (delivery location or region, login, filter, permission, or popup) when reporting failure.
 {% endif %}

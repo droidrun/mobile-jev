@@ -15,6 +15,7 @@ from PIL import Image
 
 from mobilerun_agents import AgentOperator, LlamaIndexPlanner, Run, tool
 from mobilerun_agents.agent.action_selector import LlamaIndexLLMSelector
+from mobilerun_agents.agent.action_selector.loader import SetupSpec, build_setup
 from mobilerun_agents.config.loader import ConfigLoader
 from mobilerun_agents.config.user_config import LLMProfile, MobileConfig
 from tests.unit.device_fixtures import MemoryDevice
@@ -30,10 +31,16 @@ def block_network(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "debug,vision,plan",
-    [(False, False, False), (True, False, False), (True, True, False), (True, False, True)],
+    "debug,vision,plan,plan_retry",
+    [
+        (False, False, False, False),
+        (True, False, False, False),
+        (True, True, False, False),
+        (True, False, True, False),
+        (True, False, True, True),
+    ],
 )
-def test_debug_run(debug, vision, plan, monkeypatch):
+def test_debug_run(debug, vision, plan, plan_retry, monkeypatch):
     @tool(sensitive_parameters=frozenset({"value"}))
     async def unlock(run: Run, value: str) -> str:
         """Unlock the fake session."""
@@ -56,7 +63,7 @@ def test_debug_run(debug, vision, plan, monkeypatch):
         yield phone
 
     cfg = MobileConfig(
-        llm_profiles={
+        profiles={
             "default": LLMProfile(
                 provider="anthropic", model="claude-sonnet-4-5", vision="on" if vision else "off"
             )
@@ -68,6 +75,7 @@ def test_debug_run(debug, vision, plan, monkeypatch):
     replies = iter(
         [
             "not an invocation",
+            "still not an invocation",
             '<function_calls><invoke name="unlock"><parameter name="value">private-input</parameter></invoke></function_calls>',
             "Verify   the\n task. private-input fixture-not-a-key <add_memory>Checked</add_memory>"
             + "x" * 300
@@ -77,14 +85,19 @@ def test_debug_run(debug, vision, plan, monkeypatch):
     if plan:
         from tests.unit.agent.workflows.test_planning import PlannerLLM
 
-        planner = PlannerLLM(
+        plan_replies = [
             ("set_plan", {"subgoals": ["Open app", "Read screen"]}),
             ("complete", {"success": True, "message": "Finished"}),
-        )
-        monkeypatch.setattr(
-            "mobilerun_agents.cli.agent.run.default_planner",
-            AsyncMock(return_value=LlamaIndexPlanner(planner)),
-        )
+        ]
+        if plan_retry:
+            plan_replies.insert(0, ("unknown", {}))
+        planner = PlannerLLM(*plan_replies)
+
+        async def build_planning_setup(setup, vision):
+            straight = await build_setup(None, vision)
+            return SetupSpec(planner=LlamaIndexPlanner(planner), executor=straight.selector)
+
+        monkeypatch.setattr("mobilerun_agents.cli.agent.run.build_setup", build_planning_setup)
         complete = '<function_calls><invoke name="complete"><parameter name="success">true</parameter><parameter name="message">Finished</parameter></invoke></function_calls>'
         replies = iter([complete])
 
@@ -111,12 +124,16 @@ def test_debug_run(debug, vision, plan, monkeypatch):
         cli,
         (["--debug"] if debug else [])
         + ["agent", "run", "unlock", "serial"]
-        + (["--plan"] if plan else []),
+        + (["--setup", "planned"] if plan else []),
         env={"COLUMNS": "500"},
     )
     assert outcome.exit_code == 0, outcome.exception
+    assert " · attempt " not in outcome.output and "  repair " not in outcome.output
     if plan:
-        assert "LLM: unknown" in outcome.output
+        assert "LLM: llm:PlannerLLM/unknown" in outcome.output
+        assert "planning: turn 1" in outcome.output and "planning: turn 2" in outcome.output
+        retries = [line for line in outcome.output.splitlines() if line.startswith("  retry ")]
+        assert retries == (["  retry 2 · Invalid planner tool call"] if plan_retry else [])
         assert "planning: executor: llm:anthropic" in outcome.output
         assert "planning: subgoals: Open app; Read screen" in outcome.output
         assert "planning: reasoning: Review progress." in outcome.output
@@ -135,27 +152,29 @@ def test_debug_run(debug, vision, plan, monkeypatch):
         '"value": "***"',
         "unlock → unlock",
         "input=4 output=3 reasoning=2",
-        "  repair 1:",
+        "  retry 2 · No tool call in reply",
+        "  retry 3 · No tool call in reply",
         "  result: success · ***",
-        "total tokens=21",
+        "total tokens=28",
     ]:
         assert (detail in outcome.output) == debug, detail
     if debug:
         remaining = outcome.output
         for marker in (
-            "1 · attempt 1",
             "  screen:",
             "  selector:",
             "  image:",
             "  LLM:",
-            "  repair 1:",
-            "1 · attempt 2",
+            "  retry 2 · No tool call in reply",
+            "  screen:",
+            "  LLM:",
+            "  retry 3 · No tool call in reply",
             "  screen:",
             "  LLM:",
             "1 · unlock *** ✓",
             "  selection:",
             "  result:",
-            "2 · attempt 1",
+            "  screen:",
             "  thought:",
             "  memory:",
             "2 · complete ✓",
@@ -164,6 +183,7 @@ def test_debug_run(debug, vision, plan, monkeypatch):
         ):
             _, found, remaining = remaining.partition(marker)
             assert found, marker
+        assert outcome.output.count("  retry ") == 2
         assert "add_memory" not in outcome.output and "run folder=" not in outcome.output
         thought = next(line for line in outcome.output.splitlines() if "  thought:" in line)
         assert thought.startswith("  thought: Verify the task. *** *** x") and thought.endswith("…")

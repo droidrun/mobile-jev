@@ -19,6 +19,11 @@ class Screen(DebugStep):
     elements: int
 
 
+class Retry(DebugStep):
+    attempt: int
+    reason: str
+
+
 class ModelCall(DebugStep):
     name: str
     image: tuple[int, int] | None
@@ -36,7 +41,6 @@ class Detail(DebugStep):
         "memory",
         "planning",
         "image",
-        "repair",
         "jev input",
         "jev choices",
         "jev answer",

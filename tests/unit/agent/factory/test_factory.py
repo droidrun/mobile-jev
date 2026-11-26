@@ -19,12 +19,12 @@ from openai import RateLimitError
 from mobilerun_agents.agent.action_selector import LlamaIndexLLMSelector
 from mobilerun_agents.agent.action_selector.llm.calls import achat
 from mobilerun_agents.agent.action_selector.llm.factory import build_llm, capabilities
-from mobilerun_agents.agent.action_selector.loader import default_planner, default_selector
+from mobilerun_agents.agent.action_selector.loader import default_setup
 from mobilerun_agents.agent.auth import store
 from mobilerun_agents.agent.tools.base import complete
 from mobilerun_agents.agent.tools.registry import build_registry
 from mobilerun_agents.config.loader import ConfigLoader
-from mobilerun_agents.config.user_config import LLMProfile, MobileConfig
+from mobilerun_agents.config.user_config import LLMProfile, MobileConfig, SetupConfig
 from mobilerun_agents.errors import UnknownModel
 from tests.unit.agent.selector_fixtures import selection_run
 from tests.unit.device_fixtures import MemoryDevice, tool_run
@@ -76,16 +76,16 @@ def test_sonnet_grounding_budget_is_distinct_from_input_resolution():
 @pytest.mark.anyio
 async def test_key_order_checks_saved_and_environment(monkeypatch):
     with pytest.raises(ValueError) as failure:
-        await default_selector("agent")
-    assert str(failure.value) == "No model configured. Run: mobilerun agent setup"
+        await default_setup()
+    assert str(failure.value) == "No model configured. Run: mobilerun agent profiles add --help"
     monkeypatch.setenv("OPENROUTER_API_KEY", "unit-router")
-    assert (await default_selector("agent")).shared_llm.model == "openai/gpt-5-mini"
+    assert (await default_setup()).selector.shared_llm.model == "openai/gpt-5-mini"
     monkeypatch.setenv("GEMINI_API_KEY", "unit-google")
-    assert (await default_selector("agent")).shared_llm.model == "gemini-3.8-flash"
+    assert (await default_setup()).selector.shared_llm.model == "gemini-3.8-flash"
     store.save_key("anthropic", "unit-anthropic")
-    assert (await default_selector("agent")).shared_llm.model == "claude-sonnet-5"
+    assert (await default_setup()).selector.shared_llm.model == "claude-sonnet-5"
     monkeypatch.setenv("OPENAI_API_KEY", "unit-openai")
-    assert (await default_selector("agent")).shared_llm.model == "gpt-5-mini"
+    assert (await default_setup()).selector.shared_llm.model == "gpt-5-mini"
 
 
 @pytest.mark.anyio
@@ -108,13 +108,19 @@ async def test_profile_effort_on_wire(monkeypatch, role, model, override, expect
 
     install_transport(monkeypatch, "openai", respond)
     monkeypatch.setenv("OPENAI_API_KEY", "fake")
-    profile = LLMProfile(provider="openai", model=model, reasoning_effort=override, vision="off")
-    ConfigLoader.save(MobileConfig(llm_profiles={"chosen": profile}, default_llm="chosen"))
-    llm = (
-        (await default_planner()).llm
-        if role == "planner"
-        else (await default_selector(role)).shared_llm
+    profile = LLMProfile(provider="openai", model=model, reasoning=override, vision="off")
+    setup = (
+        SetupConfig(selector="chosen")
+        if role == "agent"
+        else SetupConfig(planner="chosen", executor="chosen")
     )
+    ConfigLoader.save(MobileConfig(profiles={"chosen": profile}, setups={"current": setup}))
+    built = await default_setup()
+    llm = {
+        "planner": lambda: built.planner.llm,
+        "agent": lambda: built.selector.shared_llm,
+        "executor": lambda: built.executor.shared_llm,
+    }[role]()
     await achat(llm, [ChatMessage(content="test")])
     assert captured[0].get("reasoning") == ({"effort": expected} if expected else None)
 
@@ -129,7 +135,13 @@ async def test_anthropic_without_offline_thinking_capability(monkeypatch):
 
     install_transport(monkeypatch, "anthropic", respond)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
-    await achat((await default_planner()).llm, [ChatMessage(content="test")])
+    ConfigLoader.save(
+        MobileConfig(
+            profiles={"main": LLMProfile(provider="anthropic", model="claude-sonnet-5")},
+            setups={"planned": SetupConfig(planner="main", executor="main")},
+        )
+    )
+    await achat((await default_setup()).planner.llm, [ChatMessage(content="test")])
     assert "thinking" not in captured[0]
 
 
@@ -156,7 +168,13 @@ async def test_openai_planner_requires_one_native_tool_on_the_wire(monkeypatch):
     install_transport(monkeypatch, "openai", respond)
     monkeypatch.setenv("OPENAI_API_KEY", "fake")
     request = PlanningInput("Check status", AgentConfig(streaming=False))
-    assert await (await default_planner()).plan(request) == Plan(("Check status",))
+    ConfigLoader.save(
+        MobileConfig(
+            profiles={"main": LLMProfile(provider="openai", model="gpt-5-mini")},
+            setups={"planned": SetupConfig(planner="main", executor="main")},
+        )
+    )
+    assert await (await default_setup()).planner.plan(request) == Plan(("Check status",))
     [request] = requests
     assert [tool["name"] for tool in request["tools"]] == ["set_plan", "complete"]
     assert request["tool_choice"] == "required" and request["parallel_tool_calls"] is False
@@ -270,8 +288,7 @@ def test_cli_reports_unknown_model_before_device_target(stale_openai_metadata, m
     monkeypatch.setenv("OPENAI_API_KEY", "fake")
     ConfigLoader.save(
         MobileConfig(
-            llm_profiles={"default": LLMProfile(provider="openai", model="gpt-6-sol")},
-            default_llm="default",
+            profiles={"default": LLMProfile(provider="openai", model="gpt-6-sol")},
         )
     )
     result = CliRunner().invoke(cli, ["agent", "run", "read settings", "emulator-5554"])
@@ -389,7 +406,7 @@ async def test_native_registry_roundtrip(monkeypatch, provider, model, api):
     result = await selector.select(
         selection_run(
             goal="open battery and check status",
-            tools=registry,
+            tools=registry.tools(),
             parallel_tools=False,
         )
     )
@@ -469,7 +486,6 @@ async def test_openai_400_parameter_and_debug_note(log_response, param):
 @pytest.mark.anyio
 @pytest.mark.parametrize("profile_options", [{}, {"temperature": 0.0}])
 async def test_gemini_profile_temperature_on_wire(monkeypatch, profile_options):
-    from mobilerun_agents.agent.action_selector.loader import build_selector
     from mobilerun_agents.config.user_config import LLMProfile, MobileConfig
 
     bodies = []
@@ -483,14 +499,15 @@ async def test_gemini_profile_temperature_on_wire(monkeypatch, profile_options):
         }
 
     install_transport(monkeypatch, "gemini", respond)
+    monkeypatch.setenv("GOOGLE_API_KEY", "fake")
     config = MobileConfig()
-    config.llm_profiles[config.agent.selector] = LLMProfile(
+    config.profiles["default"] = LLMProfile(
         provider="gemini",
         model="gemini-3.8-flash",
-        kwargs={"api_key": "fake", "context_window": 8192, "max_tokens": 256},
         **profile_options,
     )
-    selector = await build_selector(config)
+    with ConfigLoader.override(config):
+        selector = (await default_setup()).selector
     await achat(selector.shared_llm, [ChatMessage(content="test")])
     generation = bodies[0]["generationConfig"]
     assert {k: generation[k] for k in generation if k == "temperature"} == profile_options

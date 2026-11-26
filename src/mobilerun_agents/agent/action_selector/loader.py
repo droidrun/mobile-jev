@@ -1,6 +1,7 @@
 """Resolve the configured selector and its optional delegate by profile name."""
 
 import os
+from dataclasses import dataclass
 from typing import Literal
 
 from google.genai.types import HttpOptions
@@ -9,7 +10,7 @@ from llama_index.llms.openai.utils import O1_MODELS
 
 from mobilerun_agents.agent.action_selector.base import ActionSelector
 from mobilerun_agents.agent.action_selector.decision_model.base import DecisionSelector
-from mobilerun_agents.agent.action_selector.decision_model.loader import load_decision_model
+from mobilerun_agents.agent.action_selector.decision_model.typesafe import TypeSafeDecisionModel
 from mobilerun_agents.agent.action_selector.delegating import DelegatingSelector
 from mobilerun_agents.agent.action_selector.llm.factory import build_llm, capabilities
 from mobilerun_agents.agent.action_selector.llm.llama_index import LlamaIndexLLMSelector
@@ -18,7 +19,7 @@ from mobilerun_agents.agent.auth import CredentialMissing, resolve
 from mobilerun_agents.agent.planner import LlamaIndexPlanner, Planner
 from mobilerun_agents.config.loader import ConfigLoader
 from mobilerun_agents.config.settings import DEFAULT_MODELS
-from mobilerun_agents.config.user_config import LLMProfile, MobileConfig, Vision
+from mobilerun_agents.config.user_config import DecisionProfile, LLMProfile, MobileConfig, Vision
 
 Role = Literal["agent", "executor"]
 LLMRole = Literal["agent", "planner", "executor"]
@@ -28,18 +29,11 @@ class NoModelConfigured(ValueError):
     """Neither a configured selector nor a provider credential was available."""
 
 
-async def _load_selector(
-    config: MobileConfig, name: str, role: Role, vision: Vision | None = None
-) -> ActionSelector:
-    decision = config.agent.decision
-    if name in config.decision_profiles:
-        profile = config.decision_profiles[name]
-        model = load_decision_model(profile, decision)
-        selector = DecisionSelector(model, vision or profile.vision, config=decision)
-        selector.debug_label = "jev"
-        return selector
-
-    return await _llm_selector(config, config.llm_profiles[name], role, vision=vision)
+@dataclass(frozen=True)
+class SetupSpec:
+    selector: ActionSelector | None = None
+    planner: Planner | None = None
+    executor: ActionSelector | None = None
 
 
 async def _profile_llm(
@@ -49,28 +43,22 @@ async def _profile_llm(
     api_key: str | None = None,
 ) -> LLM:
     decision = config.agent.decision
-    options = dict(profile.kwargs)
-    options.setdefault("timeout", decision.timeout)
-    if api_key is not None:
-        options["api_key"] = api_key
+    options: dict[str, object] = {"timeout": decision.timeout}
     if profile.provider == "openai" and profile.model in O1_MODELS:
         effort = (
-            profile.reasoning_effort
-            or {"agent": "medium", "planner": "high", "executor": "low"}[role]
+            profile.reasoning or {"agent": "medium", "planner": "high", "executor": "low"}[role]
         )
-        options["reasoning_options"] = {**options.get("reasoning_options", {}), "effort": effort}
+        options["reasoning_options"] = {"effort": effort}
     if profile.temperature is not None:
-        options.setdefault("temperature", profile.temperature)
+        options["temperature"] = profile.temperature
     if profile.base_url:
         if profile.provider == "gemini":
-            options["http_options"] = HttpOptions.model_validate(
-                options.get("http_options", {})
-            ).model_copy(update={"base_url": profile.base_url})
+            options["http_options"] = HttpOptions(base_url=profile.base_url)
         elif profile.provider in {"anthropic", "ollama"}:
             options["base_url"] = profile.base_url
         else:
             options["api_base"] = profile.base_url
-    return await build_llm(profile.provider, profile.model, **options)
+    return await build_llm(profile.provider, profile.model, api_key=api_key, **options)
 
 
 async def _llm_selector(
@@ -93,32 +81,74 @@ async def _llm_selector(
     return selector
 
 
-async def build_selector(
-    config: MobileConfig, role: Role = "agent", vision: Vision | None = None
+async def _action_selector(
+    config: MobileConfig,
+    name: str,
+    role: Role,
+    delegate: str | None,
+    vision: Vision | None,
 ) -> ActionSelector:
-    delegation = config.agent.delegation
-    if delegation is None:
-        name = config.agent.selector
-        if name == "default" and name not in config.decision_profiles:
-            name = config.default_llm or name
-        if name in config.decision_profiles or name in config.llm_profiles:
-            return await _load_selector(config, name, role, vision)
-        if config.default_llm or name != "default":
-            raise ValueError(f"Unknown selector profile: {name}")
+    match config.profiles[name]:
+        case DecisionProfile() as profile:
+            await resolve(profile.provider)
+            decision = config.agent.decision
+            model = TypeSafeDecisionModel(
+                min_confidence=profile.min_confidence if delegate is None else None, config=decision
+            )
+            primary = DecisionSelector(model, vision or profile.vision or "on", config=decision)
+            primary.debug_label = "jev"
+            if delegate is not None:
+                fallback = await _llm_selector(
+                    config, _llm_profile(config, delegate), role, vision=vision
+                )
+                if profile.min_confidence is not None:
+                    return DelegatingSelector(
+                        primary, fallback, min_confidence=profile.min_confidence
+                    )
+                return DelegatingSelector(primary, fallback)
+            return primary
+        case LLMProfile() as profile:
+            return await _llm_selector(config, profile, role, vision=vision)
+
+
+def _llm_profile(config: MobileConfig, name: str) -> LLMProfile:
+    match config.profiles[name]:
+        case LLMProfile() as profile:
+            return profile
+        case DecisionProfile():
+            raise ValueError(f"Profile {name!r} must be an LLM profile")
+
+
+async def build_setup(name: str | None, vision: Vision | None = None) -> SetupSpec:
+    config = ConfigLoader.load()
+    selected = name if name is not None else config.default_setup or next(iter(config.setups), None)
+    if selected is None:
+        for profile in config.profiles.values():
+            match profile:
+                case LLMProfile():
+                    return SetupSpec(
+                        selector=await _llm_selector(config, profile, "agent", vision=vision)
+                    )
         profile, key = await _credential_profile()
-        return await _llm_selector(config, profile, role, key, vision)
-    name = delegation.primary or config.agent.selector
-    primary = await _load_selector(config, name, role, vision)
-    delegate = (
-        primary
-        if name == delegation.delegate
-        else await _load_selector(config, delegation.delegate, role, vision)
+        return SetupSpec(selector=await _llm_selector(config, profile, "agent", key, vision))
+    if selected not in config.setups:
+        raise ValueError(f"Unknown setup {selected!r}")
+    setup = config.setups[selected]
+    if setup.planner is None:
+        return SetupSpec(
+            selector=await _action_selector(
+                config, setup.action_profile, "agent", setup.delegate, vision
+            )
+        )
+    llm = await _profile_llm(config, _llm_profile(config, setup.planner), "planner")
+    executor = await _action_selector(
+        config, setup.action_profile, "executor", setup.delegate, vision
     )
-    return DelegatingSelector(primary, delegate, config=delegation)
+    return SetupSpec(planner=LlamaIndexPlanner(llm), executor=executor)
 
 
-async def default_selector(role: Role, vision: Vision | None = None) -> ActionSelector:
-    return await build_selector(ConfigLoader.load(), role, vision)
+async def default_setup() -> SetupSpec:
+    return await build_setup(None)
 
 
 async def _credential_profile() -> tuple[LLMProfile, str]:
@@ -129,20 +159,4 @@ async def _credential_profile() -> tuple[LLMProfile, str]:
         except CredentialMissing:
             continue
         return LLMProfile(provider=provider, model=model), key.api_key
-    raise NoModelConfigured("No model configured. Run: mobilerun agent setup")
-
-
-async def default_planner() -> Planner:
-    config = ConfigLoader.load()
-    delegation = config.agent.delegation
-    primary = (delegation.primary if delegation else None) or config.agent.selector
-    fallback = (
-        delegation.delegate if delegation and primary in config.decision_profiles else primary
-    )
-    name = config.default_llm or fallback
-    if name in config.llm_profiles:
-        llm = await _profile_llm(config, config.llm_profiles[name], "planner")
-    else:
-        profile, key = await _credential_profile()
-        llm = await _profile_llm(config, profile, "planner", key)
-    return LlamaIndexPlanner(llm)
+    raise NoModelConfigured("No model configured. Run: mobilerun agent profiles add --help")

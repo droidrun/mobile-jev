@@ -1,13 +1,46 @@
 import asyncio
+from threading import Event
 from unittest.mock import Mock, patch
 
 import pytest
 from mobilerun.config.user_config import TracingConfig
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
 
 from mobilerun_agents.agent.analytics import tracing
+
+
+@pytest.mark.parametrize("interruption", [asyncio.CancelledError, KeyboardInterrupt])
+def test_interrupted_run_does_not_start_a_slow_trace_flush(monkeypatch, interruption):
+    started = Event()
+    release = Event()
+
+    class SlowExporter(InMemorySpanExporter):
+        def export(self, spans):
+            started.set()
+            release.wait(0.25)
+            return super().export(spans)
+
+    processor = BatchSpanProcessor(SlowExporter(), schedule_delay_millis=60_000)
+    provider = TracerProvider(shutdown_on_exit=False, active_span_processor=processor)
+    monkeypatch.setattr(tracing, "_setup", lambda _: tracing._Pipeline(("fake",), provider, None))
+
+    async def exercise():
+        async with tracing.trace_run(TracingConfig(enabled=True), "interrupted"):
+            if interruption is asyncio.CancelledError:
+                asyncio.current_task().cancel()
+                await asyncio.sleep(0)
+            raise interruption
+
+    try:
+        with pytest.raises(interruption):
+            asyncio.run(exercise())
+        assert not started.is_set()
+    finally:
+        release.set()
+        provider.shutdown()
 
 
 def test_phoenix_only_records_scoped_llamaindex_spans(monkeypatch):

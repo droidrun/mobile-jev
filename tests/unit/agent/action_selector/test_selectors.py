@@ -16,6 +16,7 @@ from mobilerun_agents.agent.action_selector.decision_model.base import Decision
 from mobilerun_agents.agent.action_selector.decision_model.images import prepare_image
 from mobilerun_agents.agent.action_selector.llm.base import LLMSelector
 from mobilerun_agents.agent.action_selector.llm.parsing import ToolCall
+from mobilerun_agents.agent.tools.registry import build_registry
 from mobilerun_agents.config.user_config import DecisionConfig
 from tests.unit.agent.selector_fixtures import selection_run
 from tests.unit.device_fixtures import fake_tools
@@ -125,6 +126,26 @@ async def test_jev_vision_trims_its_own_request(vision):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("vision", ["off", "on", "only"])
+async def test_jev_offers_fixed_scrolls_in_every_vision_mode(vision):
+    run = selection_run("Scroll", screenshot=b"image")
+    run.device._supported_operations = frozenset({"swipe", "drag"})
+    run.state_provider.capabilities = set()
+    run.registry = build_registry(run, [], None)
+    model = FakeModel()
+    model.max_options = None
+    await DecisionSelector(model, vision).select(run)
+    assert [
+        option.description.split(" (")[0]
+        for option in model.request.options
+        if option.action.name == "swipe"
+    ] == ["scroll up", "scroll down", "scroll left", "scroll right"]
+    assert all(option.action.name != "drag" for option in model.request.options)
+    if vision == "off":
+        assert "drag" not in model.request.registry
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     "vision,elements,click,coordinate",
     [
@@ -146,18 +167,32 @@ async def test_llm_vision_trims_its_own_request(monkeypatch, vision, elements, c
         tools=fake_tools("tap_element", "tap", "wait"),
         elements=[{"index": 3}] if elements else [],
     )
+    run.device._supported_operations = frozenset({"swipe"})
+    run.state_provider.capabilities = set()
+    run.selection_include = (build_registry(run, [], None).by_name["swipe"],)
     run.device.screenshot.return_value = png.getvalue()
 
     async def chat(self, messages, **kwargs):
-        assert ("tap_element" in kwargs["tools"].by_name) == click
-        assert ("tap" in kwargs["tools"].by_name) == coordinate
+        names = {tool.metadata.get_name() for tool in kwargs["tools"]}
+        assert ("tap_element" in names) == click
+        assert ("tap" in names) == coordinate
+        assert ("swipe" in names) == coordinate
         assert (len(messages[-1].blocks) == 2) == coordinate
         assert ("<device_state>screen" in messages[-1].content) == (vision != "only")
-        assert "wait" in kwargs["tools"].by_name
+        assert "wait" in names
 
     monkeypatch.setattr(LlamaIndexLLMSelector, "_achat", chat)
     await LlamaIndexLLMSelector(MockLLM(), vision, supports_native=True).select(run)
     assert run.device.screenshot.await_count == coordinate
+
+
+def test_llm_diagnostic_name_maps_openai_adapter():
+    from llama_index.llms.openai.responses import OpenAIResponses
+
+    from mobilerun_agents.agent.action_selector import LlamaIndexLLMSelector
+
+    selector = LlamaIndexLLMSelector(OpenAIResponses(model="gpt-5.6-terra", api_key="test"))
+    assert selector.diagnostic_name == "llm:openai/gpt-5.6-terra"
 
 
 @pytest.mark.anyio
@@ -179,7 +214,7 @@ async def test_jev_off_delegates_to_llm_on_before_fetching_screenshot(monkeypatc
             return Decision(option_index=0)
 
     async def chat(self, messages, **kwargs):
-        assert "tap" in kwargs["tools"].by_name
+        assert "tap" in {tool.metadata.get_name() for tool in kwargs["tools"]}
         assert len(messages[-1].blocks) == 2
         run.device.screenshot.assert_awaited_once()
 
@@ -233,9 +268,8 @@ async def test_jev_without_usable_tools_fails_instead_of_falling_back():
 
     fallback = StaticSelector(ActionSelection(actions=[ToolCall("click_at")]))
     run = selection_run("Tap")
-    run.registry = build_registry(run, [set_proxy], None).extend(
-        fake_tools("tap"), {"complete", "wait"}
-    )
+    registry = build_registry(run, [set_proxy], None)
+    run.registry = type(registry)(run, registry.tools({"complete", "wait"}, fake_tools("tap")))
     selector = FallbackSelector(DecisionSelector(Model(), "off"), [fallback])
     with pytest.raises(
         SelectorCannotServe, match=r"^Jev has no usable action among: set_proxy, tap\.$"
@@ -357,7 +391,8 @@ def test_jev_and_an_abstaining_delegate_share_the_run_registry_across_steps():
             ],
         )
         selection = asyncio.run(composed.select(request))
-        assert model.request.registry is delegate.requests[-1].registry is request.registry
+        assert set(model.request.registry) == {"tap_element"}
+        assert delegate.requests[-1].registry is request.registry
         assert [o.action for o in model.request.options] == [
             ToolCall("tap_element", {"index": index})
         ]

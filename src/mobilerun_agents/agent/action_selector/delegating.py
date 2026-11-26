@@ -2,7 +2,7 @@
 
 import json
 from copy import copy
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 
 from llama_index.core.llms.llm import LLM
 
@@ -19,9 +19,27 @@ from mobilerun_agents.agent.action_selector.llm.parsing import (
 from mobilerun_agents.agent.logs.diagnostics import Detail, sink
 from mobilerun_agents.agent.run import Run
 from mobilerun_agents.agent.tools.base import RegistryTool
-from mobilerun_agents.agent.tools.registry import ToolRegistry
 from mobilerun_agents.config.prompts import render_selector_prompt
 from mobilerun_agents.config.user_config import DelegationConfig
+
+
+@dataclass
+class DelegationTurn:
+    """Routing retained by the workflow for one observed step, including repairs."""
+
+    delegated: bool = False
+    completion_hint: bool | None = None
+    previous_delegated: bool = False
+    intent: str = field(default="", repr=False)
+
+    def accept(self, selection: ActionSelection) -> None:
+        self.previous_delegated = self.delegated
+        if self.delegated and selection.thought.strip():
+            self.intent = selection.thought.strip()
+
+    def reset_attempt(self) -> None:
+        self.delegated = False
+        self.completion_hint = None
 
 
 class DelegatingSelector(ActionSelector):
@@ -42,10 +60,30 @@ class DelegatingSelector(ActionSelector):
     def shared_llm(self) -> LLM | None:
         return self.delegate.shared_llm
 
-    async def select(self, run: Run) -> ActionSelection:
-        selection = await self.primary.select(run)
+    async def select(self, run: Run, routing: DelegationTurn | None = None) -> ActionSelection:
+        routing = routing if routing is not None else DelegationTurn()
+        if routing.delegated or run.avoid_signature:
+            routing.delegated = True
+            return await self._select_delegate(run, routing.completion_hint)
+        match self.primary:
+            case DecisionSelector() as primary:
+                selection = await primary.select(run, intent=routing.intent)
+            case primary:
+                selection = await primary.select(run)
         diagnostic = sink.get()
-        unsure = not selection.abstained and self._unsure(selection)
+        confidence = selection.confidence
+        minimum = self.min_confidence
+        takeover_bar = (
+            max(minimum, min(minimum + self.config.takeover_margin, 0.95))
+            if routing.previous_delegated and minimum is not None
+            else None
+        )
+        takeover_denied = takeover_bar is not None and (
+            confidence is None or confidence < takeover_bar
+        )
+        unsure = not selection.abstained and (
+            takeover_denied or (takeover_bar is None and self._unsure(selection))
+        )
         explicit = False
         completion_reason = ""
         completion_hint: bool | None = None
@@ -87,39 +125,37 @@ class DelegatingSelector(ActionSelector):
                     render_selector_prompt(self.config.invalid_prompt, kind="parameters"),
                 )
         if diagnostic:
-            reason = (
-                "explicit delegate"
-                if explicit
-                else (
-                    f"confidence {selection.confidence} < {self.min_confidence}"
-                    if unsure
-                    else "primary abstained" if selection.abstained else completion_reason
-                )
-            )
+            if explicit:
+                reason = "explicit delegate"
+            elif selection.abstained:
+                reason = "primary abstained"
+            elif takeover_denied and takeover_bar is not None:
+                reason = f"takeover bar {takeover_bar:g} not met: {confidence if confidence is not None else 'unknown'}"
+            elif unsure:
+                reason = f"confidence {confidence} < {minimum}"
+            else:
+                reason = completion_reason
             diagnostic(
                 Detail(
                     section="selector",
                     text=f"{self.primary.diagnostic_name} → {self.delegate.diagnostic_name} ({reason})",
                 )
             )
-        match complete, completion_hint:
-            case RegistryTool(), bool() as success:
-                run = self._with_completion_hint(run, complete, success)
-        delegated = await self.delegate.select(run)
-        if any(a.name == "delegate" for a in delegated.actions):
-            return self._invalid(
-                delegated,
-                render_selector_prompt(self.config.invalid_prompt, kind="recursive"),
-            )
+        routing.delegated = True
+        routing.completion_hint = completion_hint
+        delegated = await self._select_delegate(run, completion_hint)
         if delegated.abstained:
-            if diagnostic and unsure and not explicit:
-                diagnostic(
-                    Detail(
-                        section="selector",
-                        text=f"{self.primary.diagnostic_name} (delegate abstained)",
+            if unsure and not explicit and not takeover_denied:
+                routing.reset_attempt()
+                if diagnostic:
+                    diagnostic(
+                        Detail(
+                            section="selector",
+                            text=f"{self.primary.diagnostic_name} (delegate abstained)",
+                        )
                     )
-                )
-            return selection if unsure and not explicit else delegated
+                return selection
+            return delegated
         if selection.abstained:
             return delegated
         return replace(
@@ -136,6 +172,19 @@ class DelegatingSelector(ActionSelector):
             ),
         )
 
+    async def _select_delegate(self, run: Run, completion_hint: bool | None) -> ActionSelection:
+        match run.registry.by_name.get("complete"), completion_hint:
+            case RegistryTool() as complete, bool() as success:
+                run = self._with_completion_hint(run, complete, success)
+        selection = await self.delegate.select(run)
+        if any(call.name == "delegate" for call in selection.actions):
+            return self._invalid(
+                selection,
+                render_selector_prompt(self.config.invalid_prompt, kind="recursive"),
+                repairable=True,
+            )
+        return selection
+
     @staticmethod
     def _with_completion_hint(run: Run, complete: RegistryTool, success: bool) -> Run:
         # Tool descriptions reach both native and XML delegates. This hint is not run history.
@@ -149,9 +198,7 @@ class DelegatingSelector(ActionSelector):
 
         hinted = RegistryTool(metadata, invoke, complete.action)
         delegate_run = copy(run)
-        delegate_run.registry = ToolRegistry(
-            tuple(hinted if tool is complete else tool for tool in run.registry)
-        )
+        delegate_run.selection_include += (hinted,)
         return delegate_run
 
     def _unsure(self, selection: ActionSelection) -> bool:
@@ -162,11 +209,15 @@ class DelegatingSelector(ActionSelector):
         )
 
     @staticmethod
-    def _invalid(selection: ActionSelection, error: str) -> ActionSelection:
+    def _invalid(
+        selection: ActionSelection, error: str, repairable: bool = False
+    ) -> ActionSelection:
         return replace(
             selection,
             actions=[],
-            failure=error,
+            abstained=False,
+            failure=None if repairable else error,
+            parse_error=error if repairable else None,
             response=None if not selection.textual_arguments else selection.response,
             parse_result=ToolCallParseResult(
                 thought=selection.thought,

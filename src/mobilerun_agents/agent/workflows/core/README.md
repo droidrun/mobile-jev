@@ -8,7 +8,7 @@
 
 - `__init__.py` — package entry.
 - `state.py` — `AgentState` and executed `ActionRecord` entries.
-- `result.py` — generic `AgentResult` with success, answer, output and step count.
+- `result.py` — generic `AgentResult`, run-local `StepEvidence`, and `FailureSummary` with counted `ScreenVisit` entries.
 
 **Examples:** `from mobilerun_agents.agent.workflows.core.state import AgentState`; `state = AgentState(goal="Read the battery level")` starts with no recorded actions.
 

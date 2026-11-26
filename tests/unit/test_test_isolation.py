@@ -7,10 +7,9 @@ def test_user_paths_are_isolated(tmp_path):
     from mobilerun.config.settings import get_settings
 
     settings = get_settings()
-    assert settings.MOBILERUN_CONFIG is not None
+    assert settings.MOBILERUN_CONFIG is None
     for path in (
         settings.MOBILERUN_USER_CONFIG_DIR,
-        Path(settings.MOBILERUN_CONFIG),
         ConfigLoader.get_user_config_path(),
         credential_path(),
     ):

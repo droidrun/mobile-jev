@@ -9,6 +9,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import Lock
+from types import TracebackType
 from typing import TYPE_CHECKING
 
 from mobilerun.config.env import secret_value
@@ -104,7 +105,16 @@ class _Pipeline:
     provider: TracerProvider
     client: Langfuse | None
 
-    async def flush(self) -> None:
+    async def flush_on_exit(
+        self,
+        _typ: type[BaseException] | None,
+        error: BaseException | None,
+        _tb: TracebackType | None,
+    ) -> None:
+        match error:
+            case asyncio.CancelledError() | KeyboardInterrupt():
+                # A default-executor worker would keep asyncio.run() open during shutdown.
+                return
         timeout = get_agent_settings().MOBILERUN_FINALIZE_TELEMETRY_SECONDS
         try:
             if self.client is not None:
@@ -224,7 +234,7 @@ async def trace_run(config: TracingConfig, run_id: str) -> AsyncIterator[RunTrac
                 if pipeline is not None:
                     from openinference.instrumentation import using_attributes
 
-                    scope.push_async_callback(pipeline.flush)
+                    scope.push_async_exit(pipeline.flush_on_exit)
                     _active.set(True)
                     scope.callback(detach, attach(Context()))
                     session = config.langfuse_session_id or run_id

@@ -1,10 +1,8 @@
 # Contributing
 
-Use Python 3.11–3.13. Add-on code belongs in `src/mobilerun_agents/`. The Mobilerun base checkout is read-only; do not build in or modify it. Test non-editable installed wheels, not `pip install -e` or `PYTHONPATH=src`.
+Use Python 3.11–3.13. Add-on code belongs in `src/mobilerun_agents/`; keep the Mobilerun base checkout read-only. Test installed split wheels, never editable installs or `PYTHONPATH=src`.
 
-## Development loop
-
-Install `uv` with `pipx install uv` or the [official installer](https://docs.astral.sh/uv/getting-started/installation/). From the repository root:
+## Development checks
 
 ```sh
 uv lock --check
@@ -14,24 +12,16 @@ python3 scripts/prepare_split_env.py --base-source ../mobilerun --env .venv --ex
 .venv/bin/python -m ruff check src tests scripts
 ```
 
-Replace the base source path with your own read-only checkout, or use `--base-wheel PATH` or `--base-version 0.7.4`. Run the harness with Python 3.11–3.13 outside the target environment, never `.venv/bin/python`; it **recreates** the selected environment. If `python3` points inside `.venv` or is an unsupported version, choose another Python, or use `uv run --no-project --python 3.13 python scripts/prepare_split_env.py ...`. The harness builds the add-on wheel, installs it alongside the unmodified base wheel, and records provenance in `.build/split-report.json`. Use a disposable path. Re-run it after code changes so tests use the new wheel. A published-base compatibility failure is a release blocker; do not silently replace the base with a local snapshot.
+Run the split harness with an external Python 3.11–3.13 interpreter; it recreates `.venv`. You may instead use `--base-wheel PATH` or `--base-version VERSION`. A published-base compatibility failure is a release blocker.
 
-## Tests and security
+## Tests and safety
 
-For a base source snapshot without Git metadata, pass `--skills-checkout /path/to/matching/base/skills` to the harness. The base build hook needs the submodule’s tracked file list. The harness copies only the index entries from this checkout; the packaged file contents still come from the snapshot. An ordinary checkout with an initialized skills submodule needs no extra flag.
+Tests use fakes and isolated configuration. Never commit secrets or call providers, cloud services or real devices in CI. Smoke tests are opt-in; inspect `tests/smoke/README.md` and get consent before live or paid runs. Clean up resources and report costs. Add fake tests for behavior changes.
 
-Normal tests use fakes and isolated configuration and credentials. Never commit secrets or call providers, OAuth, cloud services, or real devices in CI. Smoke tests are opt-in with `--smoke`; inspect their prerequisites first. Get explicit consent before live or paid tests, clean up any created resources, and report costs and resource IDs.
+## Layout and import direction
 
-Add fake tests for behavior changes. Keep canonical import paths and examples covered; do not add legacy aliases, config keys or compatibility shims.
+Imports go down: CLI/public exports → `macro_agent/` → `agent/operators/` → `agent/workflows/` → services (including `agent/planner/` and `agent/tools/`) → `agent/run.py` → `agent/workflows/core/` → `agent/auth/` → `config/` and `errors/`. Within `agent/tools/`, imports go from registry to atomic to helpers; selectors may use helpers. Replay may call the agent, never the reverse. Base owns device operations, extensions and macro playback.
 
-## Package layout
+## Adding a selector
 
-Imports go down: CLI and root exports → `macro_agent/` → `agent/operators/` → `agent/workflows/` → services (`action_selector/`, `tools/`, `memory/`, `checkpoints/`, `analytics/`, `logs/` under `agent/`) → `agent/run.py` → `agent/workflows/core/` (state and results) → `agent/auth/` → `config/`, `errors/`. Inside `agent/tools/`, imports go from `registry` to `atomic` to `helpers`; selectors can also use `helpers`. Base owns device operations, extensions and macro playback. Replay may call the agent, never the reverse.
-
-## Add a vendor or selector
-
-Declare LLM adapters and capabilities in `agent/action_selector/llm/models.py`. The factory builds a role-local LLM using API-key credentials from `agent/auth/`. Keep model-facing text in `assets/prompts/` rather than Python and tunables in typed config.
-
-For a selector, extend `LLMSelector` and implement `_achat`, or supply a `DecisionModel` to `DecisionSelector`. Inject it with `AgentOperator(selector=selector)`. Jev accepts `exclude`, for example `DecisionSelector(model, vision="on", exclude={"press_button"})`. Use specific argument and result types; do not infer capabilities by inspecting arbitrary objects. Test selection with fake responses. Pass async `@tool` functions in `AgentOperator(tools=[...])`; bind device extensions to the device instead. LLMs focus a field with `tap_element(index)` before entering text with `input_text(text, clear)`.
-
-The planned public install is `pip install mobilerun-agents` once published. Only `langfuse` and `dev` are extras; provider SDKs ship by default.
+LLM adapters live in `agent/action_selector/llm/`; decision selectors use `DecisionModel` and `DecisionSelector`. Keep model-facing text in `assets/prompts/` and tunables in typed configuration. Use explicit types and canonical import paths; do not add compatibility aliases or shims. Jev's registry choices are finite, while selectors choose their own `vision` mode and exclusions.

@@ -41,9 +41,7 @@ def replay_handoff(
     config = ConfigLoader.load()
     if provider and model:
         config = config.model_copy(deep=True)
-        config.agent.delegation = None
-        config.agent.selector = "default"
-        config.default_llm = "default"
-        config.decision_profiles = {}
-        config.llm_profiles = {"default": LLMProfile(provider=provider, model=model)}
+        config.default_setup = None
+        config.setups = {}
+        config.profiles = {"recovery": LLMProfile(provider=provider, model=model)}
     run_replay(MacroAgentOperator, config=config, **options)

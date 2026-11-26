@@ -9,10 +9,9 @@
 - `__init__.py` — model and selector exports.
 - `base.py` — `DecisionModel` contract and `DecisionSelector`.
 - `images.py` — prepare Jev input images and retain the visible bounds.
-- `loader.py` — construct a model from a decision profile.
 - `typesafe.py` — TypeSafe Jev requests and response decoding.
 - `candidates/` — preserve accessibility metadata for atomic tool expansion.
 
-**Examples:** `DecisionSelector(TypeSafeDecisionModel(), exclude={"press_button"})` selects with Jev without offering system buttons. It maps atomic registry tools to options, then returns a call such as `tap_element(index=3)`. With `vision="on"` the screenshot is context for these tree choices. Only `vision="only"` asks for a box to produce a `tap(x, y)` call.
+**Examples:** `DecisionSelector(TypeSafeDecisionModel(), vision="on", exclude={"press_button"})` selects with Jev without offering system buttons. It maps atomic registry tools to options, then returns a call such as `tap_element(index=3)`. With `vision="on"` the screenshot is context for these tree choices. Only `vision="only"` offers the located tap choice. All vision modes offer fixed scroll directions when supported: `scroll down` reveals content below by moving the finger up. When composed with a delegate, Jev does not abstain.
 
 **Depends on / used by:** Uses selector contracts, atomic registry choices, config and key resolution. The selector loader and direct Python callers construct decision selectors.

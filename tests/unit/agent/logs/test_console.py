@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 import click
@@ -5,7 +6,13 @@ import pytest
 
 from mobilerun_agents.agent.logs import configure_cli_logging
 from mobilerun_agents.agent.logs.console import ConsoleLog
-from mobilerun_agents.agent.logs.diagnostics import ActionDetail, Detail, ModelCall, Screen
+from mobilerun_agents.agent.logs.diagnostics import (
+    ActionDetail,
+    Detail,
+    ModelCall,
+    Screen,
+    private_values,
+)
 from mobilerun_agents.agent.workflows.core.result import AgentResult
 from mobilerun_agents.agent.workflows.core.state import ActionRecord
 from mobilerun_agents.errors import SelectorCannotServe, UnknownModel
@@ -90,6 +97,65 @@ def test_console_exception_omits_raw_request(caplog):
     assert caplog.messages == ["✗ RuntimeError (0 steps)"]
 
 
+def test_console_formats_cancelled_run(caplog):
+    caplog.set_level(logging.INFO, logger="mobilerun_agents.agent.logs.console")
+    ConsoleLog().on_error(asyncio.CancelledError(), 4, "runs/123")
+    assert caplog.messages == ["✗ cancelled (4 steps · runs/123)"]
+
+
+@pytest.mark.parametrize("debug", [False, True])
+def test_console_marks_every_action_in_a_delegated_step(caplog, debug):
+    caplog.set_level(logging.INFO, logger="mobilerun_agents.agent.logs.console")
+    console = ConsoleLog()
+
+    def action(name, args):
+        return ActionRecord(
+            step=13,
+            name=name,
+            args=args,
+            ok=True,
+            summary="ok",
+            screenshot=None,
+            ui_state=None,
+        )
+
+    token = private_values.set(set() if debug else None)
+    try:
+        console.on_action(action("tap_element", {"index": 16, "label": "Search"}))
+        console.on_action(action("input_text", {"text": "iPhone 15 Pro Max"}), delegated=True)
+        console.on_action(action("tap", {"x": 561, "y": 252}), delegated=True)
+        console.on_action(action("wait", {}).model_copy(update={"step": 14}))
+        console.flush_step()
+    finally:
+        private_values.reset(token)
+
+    assert caplog.messages == [
+        "13 · tap_element [16] Search ✓ · llm",
+        '13 · input_text "iPhone 15 Pro Max" ✓ · llm',
+        "13 · tap (561, 252) ✓ · llm",
+        "14 · wait ✓",
+    ]
+
+
+def test_console_masks_sensitive_typed_text(caplog):
+    caplog.set_level(logging.INFO, logger="mobilerun_agents.agent.logs.console")
+    console = ConsoleLog()
+    console.on_action(
+        ActionRecord(
+            step=1,
+            name="input_text",
+            args={"text": "***"},
+            ok=True,
+            summary="ok",
+            screenshot=None,
+            ui_state=None,
+        ),
+        delegated=True,
+    )
+    console.flush_step()
+    assert caplog.messages == ['1 · input_text "***" ✓ · llm']
+
+
 @pytest.mark.parametrize(
     "error",
     [
@@ -110,13 +176,12 @@ def test_console_debug_renders_missing_image(capsys):
         assert capsys.readouterr().err.strip() == "image: no image"
 
 
-def test_attempt_is_visible_before_the_model_returns(capsys):
+def test_first_screen_is_visible_without_an_attempt_header(capsys):
     with click.Context(click.Command("agent")):
         configure_cli_logging(True)
         console = ConsoleLog()
         console.on_event(Screen(package="app", activity="Main", elements=2))
         assert capsys.readouterr().err.splitlines() == [
-            "1 · attempt 1",
             "  screen: app/Main · 2 elements",
         ]
         console.on_event(
@@ -177,6 +242,61 @@ def test_debug_log_format_regressions(capsys):
         assert sum(line == "  planning: executor: llm:openai/gpt-5" for line in lines) == 1
         assert "  LLM: llm:openai/gpt-5 · 3.445s · input=1 output=1 reasoning=0" in lines
         assert "  result: success · 0.458s" in lines
+
+
+def test_long_thought_deduplicates_before_truncation(capsys):
+    with click.Context(click.Command("agent")):
+        configure_cli_logging(True)
+        text = "Amazon returned a unique query product price. " + " ".join(
+            f"detail{index} value{index}" for index in range(50)
+        )
+        repeated_prefix = text[: text.rfind(" ", 0, len(text) // 2)]
+        ConsoleLog().on_event(Detail(section="thought", text=text + " " + repeated_prefix))
+        line = capsys.readouterr().err.strip()
+        assert " ".join(line.split()) == "thought: " + text.strip()[:300] + "…"
+
+
+@pytest.mark.parametrize(
+    ("reasoning", "message", "expected"),
+    [
+        (
+            "Amazon's search field is active. Find the price from the results.",
+            "Amazon's search field is active. Find the price from the results.",
+            "Amazon's search field is active. Find the price from the results.",
+        ),
+        (
+            "I'll ensure the search field remains focused before entering the query. The eBay search field is already focused. I'll search",
+            "The eBay search field is already focused. I'll search for the item.",
+            "I'll ensure the search field remains focused before entering the query. The eBay search field is already focused. I'll search for the item.",
+        ),
+    ],
+)
+def test_debug_thought_deduplicates_reasoning_and_message(capsys, reasoning, message, expected):
+    with click.Context(click.Command("agent")):
+        configure_cli_logging(True)
+        ConsoleLog().on_event(Detail(section="thought", text=f"{reasoning} {message}"))
+        assert " ".join(capsys.readouterr().err.split()) == "thought: " + expected
+
+
+@pytest.mark.parametrize("middle", ["\n\t", "  "])
+def test_thought_deduplicates_whitespace_and_containment(capsys, middle):
+    with click.Context(click.Command("agent")):
+        configure_cli_logging(True)
+        phrase = "Amazon's search field is active. Find the price from the results."
+        full = "First check the app. " + phrase + " Then compare offers."
+        ConsoleLog().on_event(
+            Detail(section="thought", text=full + middle + phrase.replace(" ", "  "))
+        )
+        assert " ".join(capsys.readouterr().err.split()) == "thought: " + full
+
+
+def test_unknown_screen_package_uses_friendly_label(capsys):
+    with click.Context(click.Command("agent")):
+        configure_cli_logging(True)
+        ConsoleLog().on_event(Screen(package=None, activity=None, elements=27))
+        assert capsys.readouterr().err.splitlines() == [
+            "  screen: unknown app · 27 elements",
+        ]
 
 
 def test_failed_completion_redacts_and_caps_answer(caplog):

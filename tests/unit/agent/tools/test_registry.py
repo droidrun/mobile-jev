@@ -8,7 +8,34 @@ from tests.unit.device_fixtures import MemoryDevice, tool_run
 
 
 @pytest.mark.anyio
-async def test_sensitive_native_input_bypasses_an_outer_recorder():
+async def test_registry_projects_tools_per_call_and_expands_completion():
+    from inspect import signature
+
+    from mobilerun_agents.agent.tools.registry import build_registry
+    from tests.unit.device_fixtures import fake_tools
+
+    run = tool_run()
+    run.state_provider.capabilities = set()
+    registry = build_registry(run, [], None)
+    extra = fake_tools("probe")
+    assert list(signature(registry.tools).parameters) == ["exclude", "include"]
+    assert signature(registry.tools).parameters == signature(registry.atomic_tools).parameters
+    assert {entry.metadata.name for entry in registry.tools({"wait"}, extra)} == {
+        "complete",
+        "probe",
+    }
+    options = await registry.atomic_tools({"wait"}, extra)
+    assert {entry.name for entry in options} == {"complete", "probe"}
+    assert [entry.parameters for entry in options if entry.name == "complete"] == [
+        {"success": True},
+        {"success": False},
+    ]
+    assert "probe" not in {entry.metadata.name for entry in registry.tools()}
+    assert "probe" not in {entry.name for entry in await registry.atomic_tools()}
+
+
+@pytest.mark.anyio
+async def test_plain_native_input_is_visible_to_an_outer_recorder():
     from mobilerun.core.devices.recording import RecordingDevice
 
     from mobilerun_agents.agent.tools.registry import build_registry
@@ -16,9 +43,10 @@ async def test_sensitive_native_input_bypasses_an_outer_recorder():
     phone = MemoryDevice(supported_operations=frozenset({"input_text"}))
     outer = RecordingDevice(phone)
     run = tool_run(driver=outer)
-    result = await build_registry(run, [], None).by_name["input_text"].acall(text="fixture-private")
-    assert result.raw_output.success and phone.inputs == ["fixture-private"]
-    assert "fixture-private" not in repr(outer.recorded_actions)
+    text = "iPhone 15 Pro Max"
+    result = await build_registry(run, [], None).by_name["input_text"].acall(text=text)
+    assert result.raw_output.success and phone.inputs == [text]
+    assert [action["text"] for action in outer.recorded_actions] == [text]
 
 
 @pytest.mark.anyio
@@ -37,8 +65,28 @@ async def test_native_backend_failure_never_exposes_raw_message():
     assert "RuntimeError" in result.content and "private backend body" not in result.content
 
 
+@pytest.mark.anyio
+async def test_registry_uses_base_integer_schema_without_rounding_fractional_values():
+    from mobilerun.core.state.ui_state import UIState
+
+    from mobilerun_agents.agent.tools.registry import build_registry
+
+    class Phone(MemoryDevice):
+        async def tap(self, x: int, y: int) -> None:
+            assert type(x) is int and x == 30 and type(y) is int and y == 40
+
+    phone = Phone(supported_operations=frozenset({"tap"}))
+    run = tool_run(driver=phone, ui=UIState([], "", "", {}, 100, 100))
+    run.state_provider.capabilities = set()
+    run.state_provider.requires_coordinate_tools = False
+    run.state_provider.requires_active_contract_for_coords = False
+    tap = build_registry(run, [], None).by_name["tap"]
+    assert (await tap.acall(x=30.0, y=40)).raw_output.success
+    assert not (await tap.acall(x=30.5, y=40)).raw_output.success
+
+
 def test_registry_respects_native_capabilities_and_preserves_non_ui_index():
-    from mobilerun_agents.agent.action_selector.base import vision_registry
+    from mobilerun_agents.agent.tools.helpers import visual_tool_names
     from mobilerun_agents.agent.tools.registry import build_registry
 
     @tool
@@ -54,8 +102,7 @@ def test_registry_respects_native_capabilities_and_preserves_non_ui_index():
     run.state_provider.capabilities = {"element_index"}
     run.registry = build_registry(run, [inventory], None)
     assert "tap_element" in run.registry.by_name
-    assert "tap_element" not in vision_registry(run, "only").by_name
-    assert "inventory" in vision_registry(run, "only").by_name
+    assert visual_tool_names(run.registry.tools()) == ({"tap"}, {"tap_element"})
 
 
 def test_classified_public_device_methods_match_base():
@@ -105,17 +152,16 @@ def test_run_tool_schema_routing_and_collision():
     registry = build_registry(run, [label_phone], None)
     member = registry.by_name["label_phone"]
     assert member.metadata.fn_schema.model_json_schema() == entry.input_schema
-    assert registry.extend(()).tools == registry.tools
     assert set(entry.input_schema["properties"]) == {"label"}
     assert entry.sensitive_parameters == {"label"}
     assert asyncio.run(member.acall(label="bench")).raw_output == f"{device.platform}: bench"
     with pytest.raises(ExtensionActionError):
         asyncio.run(member.acall(run="other", label="bench"))
     with pytest.raises(ValueError, match="label_phone"):
-        registry.extend([member])
+        build_registry(run, [label_phone, label_phone], None)
 
 
-def test_exclude_names_and_sources_without_changing_existing_routes():
+def test_exclude_names_without_changing_existing_routes():
     from mobilerun.core.extensions import Extension, action
 
     from mobilerun_agents import Source
@@ -135,11 +181,8 @@ def test_exclude_names_and_sources_without_changing_existing_routes():
         base = build_registry(tool_run(driver=device), [label_phone], None)
         assert base.by_name["bench__ping"].metadata.source == "extension:bench"
         assert base.by_name["input_text"].metadata.source == Source.DEVICE
-        filtered = base.extend((), exclude={Source.DEVICE, "label_phone"})
-        assert set(filtered.by_name) == {"bench__ping", "complete", "wait"}
-        with pytest.raises(KeyError):
-            filtered.by_name["label_phone"]
-        assert "bench__ping" not in base.extend((), exclude={"extension:bench"}).by_name
+        filtered = base.tools(exclude={"input_text", "label_phone"})
+        assert {tool.metadata.name for tool in filtered} == {"bench__ping", "complete", "wait"}
         ping = asyncio.run(base.by_name["bench__ping"].acall()).raw_output
         assert ping.success and "ready" in ping.summary
         assert {"input_text", "label_phone"} <= base.by_name.keys()
@@ -257,10 +300,10 @@ async def test_native_registry_pins_tap_element_and_records_a_replayable_guard(t
 
 
 @pytest.mark.anyio
-async def test_native_registry_vision_trims_by_schema():
+async def test_tool_usage_is_derived_from_schema():
     from mobilerun.core.state.ui_state import UIState
 
-    from mobilerun_agents.agent.action_selector.base import vision_registry
+    from mobilerun_agents.agent.tools.helpers import visual_tool_names
     from mobilerun_agents.agent.tools.registry import build_registry
 
     @tool
@@ -274,9 +317,4 @@ async def test_native_registry_vision_trims_by_schema():
     )
     run.state_provider.capabilities = {"element_index"}
     run.registry = build_registry(run, [status], None)
-    coordinates = {"tap", "swipe", "drag"}
-    assert not coordinates & vision_registry(run, "off").by_name.keys()
-    assert coordinates | {"tap_element", "status"} <= vision_registry(run, "on").by_name.keys()
-    only = vision_registry(run, "only").by_name
-    assert coordinates | {"status", "wait", "complete"} <= only.keys()
-    assert "tap_element" not in only
+    assert visual_tool_names(run.registry.tools()) == ({"tap", "swipe", "drag"}, {"tap_element"})

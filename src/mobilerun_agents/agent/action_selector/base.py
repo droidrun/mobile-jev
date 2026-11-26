@@ -2,21 +2,42 @@
 
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from copy import copy
 from dataclasses import dataclass, field
+from hashlib import blake2b
+from secrets import token_bytes
 from typing import Literal
 
 from llama_index.core.base.llms.types import ChatResponse
 from llama_index.core.llms.llm import LLM
+from mobilerun.models.context import JSONValue
 
 from mobilerun_agents.agent.action_selector.llm.calls import Usage
 from mobilerun_agents.agent.action_selector.llm.parsing import ToolCall, ToolCallParseResult
 from mobilerun_agents.agent.run import Run
-from mobilerun_agents.agent.tools.base import ActionMetadata
-from mobilerun_agents.agent.tools.helpers import coordinate_pairs
-from mobilerun_agents.agent.tools.registry import ToolRegistry
 from mobilerun_agents.config.user_config import Vision as Vision
+
+_SIGNATURE_KEY = token_bytes(32)
+
+
+def action_signature(name: str, args: dict[str, JSONValue]) -> str:
+    """Compare actions without storing their (possibly sensitive) arguments."""
+    data = json.dumps([name, args], sort_keys=True, separators=(",", ":")).encode()
+    return blake2b(data, key=_SIGNATURE_KEY, digest_size=16).hexdigest()
+
+
+def guarded_turn(run: Run, name: str, signature: str) -> Run:
+    turn = copy(run)
+    member = run.registry.by_name.get(name)
+    # A whole tool can be hidden from the LLM only if it has no arguments.
+    if member is not None and not member.metadata.get_parameters_dict().get("properties"):
+        turn.selection_exclude |= {name}
+    turn.avoid_signature = signature
+    return turn
+
 
 NativeToolAPI = Literal["responses", "chat_completions", "anthropic", "gemini"]
 
@@ -61,19 +82,6 @@ class ActionSelector(ABC):
 
     @abstractmethod
     async def select(self, run: Run) -> ActionSelection: ...
-
-
-def vision_registry(run: Run, vision: Vision) -> ToolRegistry:
-    excluded: set[str] = set()
-    for name, member in run.registry.by_name.items():
-        fields = member.metadata.get_parameters_dict().get("properties", {})
-        if vision == "off" and coordinate_pairs(fields):
-            excluded.add(name)
-        if vision == "only" or not run.ui or not run.ui.elements:
-            match member.metadata:
-                case ActionMetadata(ui_indexed=True):
-                    excluded.add(name)
-    return run.registry.extend((), exclude=excluded)
 
 
 def sum_usage(*usages: Usage | None) -> Usage | None:

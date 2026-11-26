@@ -7,13 +7,15 @@ from enum import Enum
 from types import MethodType
 from typing import Any, get_type_hints, overload
 
-from llama_index.core.tools import ToolMetadata, ToolOutput
+from llama_index.core.tools import ToolOutput
 from llama_index.core.tools.types import AsyncBaseTool
 from mobilerun.core.extensions import Action
 from mobilerun.core.extensions.actions import Declaration
 
 from mobilerun_agents.agent.run import Run
 from mobilerun_agents.config.prompts import render_selector_prompt
+
+from .helpers.usage import IndexedToolMetadata
 
 
 @dataclass(frozen=True)
@@ -106,9 +108,8 @@ class Source(Enum):
 
 
 @dataclass
-class ActionMetadata(ToolMetadata):
+class ActionMetadata(IndexedToolMetadata):
     source: Source | str = Source.RUN
-    ui_indexed: bool = False
 
 
 class RegistryTool(AsyncBaseTool):

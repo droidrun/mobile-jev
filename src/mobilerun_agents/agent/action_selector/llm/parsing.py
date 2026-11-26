@@ -232,6 +232,8 @@ def _argument(schema: Mapping[str, Any], value: JSONValue, defs: Mapping[str, An
                 continue
         raise ValueError
     if kind := schema.get("type"):
+        if kind == "integer" and type(value) is float and value.is_integer():
+            value = int(value)
         value = _TYPES[kind].validate_python(value, strict=True)
     if "enum" in schema or "const" in schema:
         choices = schema["enum"] if "enum" in schema else [schema["const"]]
@@ -272,15 +274,16 @@ def _wire_argument(
 
 
 def coerce_arguments(
-    schema: Mapping[str, Any], raw: Mapping[str, JSONValue]
+    schema: Mapping[str, Any], raw: Mapping[str, JSONValue], *, textual: bool = True
 ) -> dict[str, JSONValue]:
     """Decode wire values against this action's advertised argument schema only."""
     properties = schema.get("properties", {})
     try:
         if not set(schema.get("required", ())) <= raw.keys():
             raise ValueError
+        normalize = _wire_argument if textual else _argument
         return {
-            key: _wire_argument(properties[key], value, schema.get("$defs", {}))
+            key: normalize(properties[key], value, schema.get("$defs", {}))
             for key, value in raw.items()
         }
     except (ValueError, KeyError):

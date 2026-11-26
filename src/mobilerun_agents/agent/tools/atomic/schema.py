@@ -9,10 +9,8 @@ from math import prod
 from llama_index.core.tools import BaseTool
 from mobilerun.models.context import JSONValue
 
-from mobilerun_agents.agent.logs.diagnostics import Detail, sink
 from mobilerun_agents.agent.run import Run
 from mobilerun_agents.config.prompts import render_selector_prompt
-from mobilerun_agents.config.user_config import DecisionConfig, Vision
 
 from ..helpers import coordinate_pairs
 
@@ -25,74 +23,70 @@ class AtomicTool:
     context: str = ""
 
 
-@dataclass(frozen=True)
-class Turn:
-    run: Run
-    config: DecisionConfig
-    vision: Vision
+def _display_value(value: JSONValue) -> str:
+    return value if type(value) is str else json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-def drop(run: Run, name: str, reason: str) -> None:
-    emit = sink.get()
-    if emit is not None and name not in run.atomic_drops:
-        run.atomic_drops.add(name)
-        emit(Detail(section="tools", text=f"dropped {name}: {reason}"))
-
-
-def from_schema(turn: Turn, member: BaseTool) -> list[AtomicTool]:
+def from_schema(run: Run, member: BaseTool) -> tuple[list[AtomicTool], str]:
     metadata = member.metadata
     name = metadata.get_name()
     schema = metadata.get_parameters_dict()
     properties = schema.get("properties", {})
     if coordinate_pairs(properties):
-        drop(turn.run, name, "coordinates")
-        return []
+        return [], "coordinates"
     domains: dict[str, list[JSONValue]] = {}
+    reasons: list[str] = []
     for key, field in sorted(properties.items()):
-        if (ref := field.get("$ref", "")).startswith("#/$defs/"):
+        ref = field.get("$ref", "")
+        if ref.startswith("#/$defs/"):
             field = schema.get("$defs", {}).get(ref.removeprefix("#/$defs/"), {})
         values: list[JSONValue]
         if name == "press_button" and key == "button":
-            values = list(sorted(turn.run.device.supported_buttons))
+            values = list(sorted(run.device.supported_buttons))
+            kind = "Literal"
         elif "enum" in field:
             values = field["enum"]
+            kind = "enum" if ref else "Literal"
         elif "const" in field:
             values = [field["const"]]
+            kind = "Literal"
         elif field.get("type") == "boolean":
             values = [False, True]
+            kind = "bool"
         else:
             kind = {"integer": "int", "number": "float", "string": "str"}.get(
                 field.get("type"), "object"
             )
-            drop(turn.run, name, "element index" if key == "index" else f"free {kind} {key!r}")
-            return []
+            return [], "element index" if key == "index" else f"free {kind} {key!r}"
         if not values:
-            drop(turn.run, name, "no supported values")
-            return []
+            return [], f"no supported values for {key!r}"
+        reasons.append(f"{kind} {key!r}")
         domains[key] = sorted(values, key=lambda value: json.dumps(value, sort_keys=True))
     count = prod(map(len, domains.values()))
-    limit = turn.config.max_schema_combinations
+    limit = run.tool_config.max_schema_combinations
     if count > limit:
-        drop(turn.run, name, f"{count} combinations exceed limit {limit}")
-        return []
+        return [], f"{count} combinations exceed limit {limit}"
     return [
         AtomicTool(
             name,
             dict(zip(domains, values, strict=True)),
             render_selector_prompt(
-                turn.config.candidate_prompt,
+                run.config.decision.candidate_prompt,
                 kind="schema",
                 name=name,
-                arguments=[
-                    (
-                        value
-                        if type(value) is str
-                        else json.dumps(value, ensure_ascii=False, sort_keys=True)
-                    )
-                    for value in values
-                ],
+                arguments=[_display_value(value) for value in values],
             ),
             metadata.description,
         )
         for values in product(*domains.values())
-    ]
+    ], (reasons[0].split(" ", 1)[0] if len(reasons) == 1 else ", ".join(reasons))
+
+
+def schema_summary(options: list[AtomicTool]) -> str:
+    if len(options[0].parameters) == 1 and len(options) <= 8:
+        values = ", ".join(
+            _display_value(next(iter(option.parameters.values()))) for option in options
+        )
+        if len(values) <= 120:
+            return values
+    return f"{len(options)} combinations"

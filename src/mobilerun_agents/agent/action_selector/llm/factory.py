@@ -65,9 +65,31 @@ def adapter_capabilities(llm: LLM) -> Capabilities:
         case _:
             model = llm.metadata.model_name
     provider = next((key for key, entry in MODELS.items() if type(llm) is entry.adapter), None)
-    if provider is None and type(llm) in (OpenAI, OpenAIResponses):
+    if type(llm) is OpenAI:
+        return replace(capabilities("openai", model), tool_call_format="chat_completions")
+    if provider is None and type(llm) is OpenAIResponses:
         provider = "openai"
     return capabilities(provider, model)
+
+
+def llm_diagnostic_name(llm: LLM) -> str:
+    adapter = type(llm)
+    try:
+        adapter_name = llm.class_name()
+        metadata_name = llm.metadata.model_name
+    except Exception:
+        adapter_name = adapter.__name__
+        metadata_name = "unknown"
+    provider = {
+        "openai_responses_llm": "openai",
+        "openai_llm": "openai",
+        "anthropic_llm": "anthropic",
+        "google_genai_llm": "gemini",
+        "openrouter_llm": "openrouter",
+        "openai_like_llm": "openai_like",
+        "ollama_llm": "ollama",
+    }.get(adapter_name.lower(), adapter.__name__)
+    return f"llm:{provider}/{metadata_name}"
 
 
 async def build_llm(

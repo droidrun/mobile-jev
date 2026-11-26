@@ -3,18 +3,18 @@
 import asyncio
 import json
 from abc import abstractmethod
-from copy import copy
+from collections.abc import Mapping
 from time import monotonic
 from typing import Any
 
 from llama_index.core.base.llms.types import ChatMessage, ChatResponse, ImageBlock
+from llama_index.core.tools import BaseTool
 
 from mobilerun_agents.agent.action_selector.base import (
     ActionSelection,
     ActionSelector,
     NativeToolAPI,
     Vision,
-    vision_registry,
 )
 from mobilerun_agents.agent.action_selector.llm.parsing import (
     ToolCallParseResult,
@@ -26,6 +26,8 @@ from mobilerun_agents.agent.action_selector.llm.parsing import (
 )
 from mobilerun_agents.agent.logs.diagnostics import ModelCall, sink
 from mobilerun_agents.agent.run import Run
+from mobilerun_agents.agent.tools.base import RegistryTool
+from mobilerun_agents.agent.tools.helpers import visual_tool_names
 from mobilerun_agents.agent.workflows.core.state import AgentState
 from mobilerun_agents.config.prompts import render_selector_prompt
 from mobilerun_agents.config.user_config import DecisionConfig
@@ -52,19 +54,29 @@ class LLMSelector(ActionSelector):
         self.config = config or DecisionConfig()
 
     async def select(self, run: Run) -> ActionSelection:
-        has_run_tools = bool(run.registry)
-        run = copy(run)
-        run.registry = vision_registry(run, self.vision)
+        has_run_tools = bool(run.registry.by_name or run.selection_include)
+        candidates = run.registry.tools(include=run.selection_include)
+        coordinates, indexed = visual_tool_names(candidates)
+        exclude = set(run.selection_exclude)
+        if self.vision == "off":
+            exclude |= coordinates
+        if self.vision == "only" or not run.ui or not run.ui.elements:
+            exclude |= indexed
+        tools = run.registry.tools(exclude=exclude, include=run.selection_include)
+        by_name = {member.metadata.get_name(): member for member in tools}
         state = run.state
         data = None if self.vision == "off" else await run.screenshot()
         image = await asyncio.to_thread(prepare_image, run, self._image_limits, data)
-        messages = await self._build_messages(run, state, image)
+        messages = await self._build_messages(run, state, image, by_name)
         kwargs: dict[str, Any] = {"stream": run.config.streaming, "timeout": self.config.timeout}
-        if run.registry.has_sensitive:
-            kwargs["log_response"] = False
+        for tool in tools:
+            match tool:
+                case RegistryTool(action=action) if action and action.sensitive_parameters:
+                    kwargs["log_response"] = False
+                    break
         if self.supports_native_tool_calls:
             kwargs.update(
-                tools=run.registry,
+                tools=tools,
                 allow_parallel_tool_calls=run.config.parallel_tools,
                 tool_required=self.native_tool_api == "responses",
             )
@@ -98,14 +110,15 @@ class LLMSelector(ActionSelector):
             parsed.parse_error = render_selector_prompt(self.config.invalid_arguments_prompt)
         if has_run_tools and not parsed.parse_error:
             for call in parsed.actions:
-                member = run.registry.by_name.get(call.name)
+                member = by_name.get(call.name)
                 try:
                     if member is None or member.metadata.fn_schema is None or call.error:
                         raise ValueError
-                    if not self.supports_native_tool_calls:
-                        call.parameters = coerce_arguments(
-                            member.metadata.get_parameters_dict(), call.parameters
-                        )
+                    call.parameters = coerce_arguments(
+                        member.metadata.get_parameters_dict(),
+                        call.parameters,
+                        textual=not self.supports_native_tool_calls,
+                    )
                     if call.parameters.keys() - member.metadata.fn_schema.model_fields.keys():
                         raise ValueError
                     member.metadata.fn_schema.model_validate_json(
@@ -121,9 +134,8 @@ class LLMSelector(ActionSelector):
         return self._to_selection(response, parsed)
 
     async def _build_messages(
-        self, run: Run, state: AgentState, image: ModelImage
+        self, run: Run, state: AgentState, image: ModelImage, names: Mapping[str, BaseTool]
     ) -> list[ChatMessage]:
-        names = run.registry.by_name
         system = render_selector_prompt(
             run.config.system_prompt,
             platform=run.device.platform,

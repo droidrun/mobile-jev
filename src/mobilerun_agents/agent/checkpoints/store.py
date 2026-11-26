@@ -103,7 +103,7 @@ class RunRecorder:
         payload["actions"] = [
             {
                 **a.model_dump(include={"step", "name", "ok", "screenshot", "ui_state"}),
-                "args": ({"text": "[REDACTED]"} if a.name == "input_text" else {}),
+                "args": {},
                 "summary": "[REDACTED]",
             }
             for a in state.actions

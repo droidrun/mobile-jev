@@ -21,7 +21,7 @@ from mobilerun_agents.agent.action_selector.base import ActionSelection, ActionS
 from mobilerun_agents.agent.action_selector.llm.models import MODELS
 from mobilerun_agents.agent.action_selector.llm.parsing import ToolCall
 from mobilerun_agents.agent.memory.snapshot import StepSnapshot
-from mobilerun_agents.agent.operators import AgentOperator, ExternalOperator
+from mobilerun_agents.agent.operators import AgentOperator
 from mobilerun_agents.agent.tools.base import complete
 from mobilerun_agents.agent.workflows.core.result import AgentResult
 from mobilerun_agents.agent.workflows.core.state import ActionRecord, AgentState
@@ -203,16 +203,17 @@ async def test_default_operator_uses_real_selector_factory(phone, tmp_path, monk
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("tools,expected", [((), set()), ([], set())])
-async def test_default_selector_and_delegation_tools(phone, config, monkeypatch, tools, expected):
+async def test_setup_default_and_delegation_tools(phone, config, monkeypatch, tools, expected):
     import mobilerun_agents.agent.operators.agent as module
+    from mobilerun_agents.agent.action_selector.loader import SetupSpec
 
     config.checkpoints.enabled = False
-    loader = AsyncMock(return_value=DelegatingSelector(Selector(), Selector()))
-    monkeypatch.setattr(module, "default_selector", loader)
+    loader = AsyncMock(return_value=SetupSpec(selector=DelegatingSelector(Selector(), Selector())))
+    monkeypatch.setattr(module, "default_setup", loader)
     flow = Scripted()
     monkeypatch.setattr(module, "AgentWorkflow", lambda **_: flow)
     result = await AgentOperator(tools=tools).execute(phone, "count")
-    loader.assert_awaited_once_with("agent")
+    loader.assert_awaited_once_with()
     assert flow.bindings == expected and not phone.extensions
     assert flow.run_tools == {"delegate"}
     assert result.trajectory_path is None and not config.checkpoints.folder.exists()
@@ -307,7 +308,7 @@ async def test_scripted_stream_notifies_consumers(phone, config, monkeypatch, ca
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("cancel", [True, False])
-async def test_interrupted_run_releases_tools(phone, config, cancel, monkeypatch):
+async def test_interrupted_run_releases_tools(phone, config, cancel, monkeypatch, caplog):
     entered, stopped = asyncio.Event(), asyncio.Event()
     flow = Scripted(timeout=5 if cancel else 0.5)
     flow.entered, flow.stopped = entered, stopped
@@ -316,10 +317,14 @@ async def test_interrupted_run_releases_tools(phone, config, cancel, monkeypatch
     task = asyncio.create_task(op.execute(phone, "wait", timeout=5 if cancel else 0.5))
     await asyncio.wait_for(entered.wait(), 4)
     if cancel:
+        caplog.set_level(logging.INFO, logger="mobilerun_agents.agent.logs.console")
         task.cancel()
     with pytest.raises(asyncio.CancelledError if cancel else TimeoutError):
         await task
     assert stopped.is_set() and not phone.extensions
+    if cancel:
+        assert "✗ cancelled (0 steps · " in caplog.text
+        assert str(config.checkpoints.folder) in caplog.text
 
 
 class Choices(ActionSelector):
@@ -376,7 +381,7 @@ async def test_attempted_typing_and_primitive_guards(phone, config, fails):
 
 
 @pytest.mark.anyio
-async def test_extension_macro_replays_public_call(phone, config):
+async def test_extension_macro_replays_public_call(phone, config, caplog):
     from mobilerun.macro.player import MacroPlayer
 
     class Echo(Extension):
@@ -393,6 +398,7 @@ async def test_extension_macro_replays_public_call(phone, config):
             return value
 
     await Echo().bind(phone)
+    caplog.set_level(logging.INFO, logger="mobilerun_agents.agent.logs.console")
     result = await AgentOperator(
         selector=Choices(
             ToolCall("echo__say", {"value": "ok"}),
@@ -403,6 +409,7 @@ async def test_extension_macro_replays_public_call(phone, config):
     player = MacroPlayer(phone, delay_between_actions=0)
     macro = player.load_macro_from_file(recorded_macro(result.trajectory_path))
     assert "fixture-private" not in json.dumps(macro)
+    assert "echo.private ***" in caplog.text and "fixture-private" not in caplog.text
     assert await player.replay_macro(macro)
     assert phone.inputs == ["ok", "after", "ok", "after"]
 
@@ -410,18 +417,25 @@ async def test_extension_macro_replays_public_call(phone, config):
 @pytest.mark.anyio
 @pytest.mark.parametrize("encode", [str, lambda s: json.dumps(s)[1:-1], lambda s: repr(s)[1:-1]])
 async def test_macro_masks_goal_and_drops_only_secret_echo_guards(phone, config, encode):
+    from mobilerun.core.credentials import DictCredentials
     from mobilerun.macro.player import MacroPlayer
 
     private = "fixture-'yes'-\"quote\"\nmarker"
     provider = phone.state._resolved_provider
     safe_state = UIState(
-        [{"index": 1, "text": "public", "className": "TextView"}], "", "", {}, 100, 100
+        [{"index": 1, "text": "public", "className": "TextView"}],
+        "",
+        "",
+        {"focusedElement": {"index": 1}, "isEditable": True},
+        100,
+        100,
     )
     echo_state = UIState(
         [{"index": 1, "text": encode(private), "className": "TextView"}], "", "", {}, 100, 100
     )
     provider.get_state.return_value = safe_state
     phone._supported_operations = {"input_text", "open_url"}
+    await DictCredentials({"shop": private}).bind(phone)
 
     async def type_and_echo(text, *args, **kwargs):
         assert text == private
@@ -434,37 +448,21 @@ async def test_macro_masks_goal_and_drops_only_secret_echo_guards(phone, config,
     phone._input_text_raw = type_and_echo
     phone.open_url = open_url
     public = ToolCall("open_url", {"url": "https://example.invalid/"})
-    result = await AgentOperator(
-        Choices(public, ToolCall("input_text", {"text": private}), public)
-    ).execute(phone, f"Type {encode(private)}", max_steps=3)
+    vault = ToolCall("vault__type_field", {"package": None, "field": "password", "name": "shop"})
+    result = await AgentOperator(Choices(public, vault, public)).execute(
+        phone, f"Type {encode(private)}", max_steps=3
+    )
     path = recorded_macro(result.trajectory_path)
     macro = json.loads(path.read_text())
     assert macro["description"] == "Type ***"
-    first, last = macro["actions"]
+    first, credential, last = macro["actions"]
     assert first["pre_state"] is not None
+    assert credential["arguments"]["name"] == "shop"
     assert last["pre_state"] is None
     provider.get_state.return_value = safe_state
     player = MacroPlayer(phone, delay_between_actions=0, state_threshold=1, state_timeout=0)
     assert await player.replay_macro(player.load_macro_from_file(path))
-    assert player.executed_steps == 2
-
-
-@pytest.mark.anyio
-async def test_external_operator_uses_plugin_defaults_only(phone, config, monkeypatch):
-    from mobilerun_agents.agent.workflows.external import Plugin
-
-    async def run(**kwargs):
-        assert kwargs["config"] == {"mode": "demo"} and not phone.extensions
-        return dict(success=True, reason="complete", answer="ok", output={"count": 2}, steps=1)
-
-    monkeypatch.setattr(
-        "mobilerun_agents.agent.workflows.external.load_plugin",
-        lambda name: Plugin(run=run, config={"mode": "demo"}),
-    )
-    result = await ExternalOperator("x").execute(phone, "demo", output=Answer)
-    assert result.output == Answer(count=2)
-    assert result.trajectory_path is None
-    assert not Path(get_macro_settings().macro_directory).exists()
+    assert player.executed_steps == 3
 
 
 @pytest.mark.anyio
@@ -533,9 +531,11 @@ async def test_model_coordinates_converted_by_configured_provider(
 
     selector = Choices(ToolCall("tap", {"x": 200, "y": 100}))
     if configured:
+        from mobilerun_agents.agent.action_selector.loader import SetupSpec
+
         monkeypatch.setattr(
-            "mobilerun_agents.agent.operators.agent.default_selector",
-            AsyncMock(return_value=selector),
+            "mobilerun_agents.agent.operators.agent.default_setup",
+            AsyncMock(return_value=SetupSpec(selector=selector)),
         )
     await AgentOperator(selector=None if configured else selector).execute(
         phone, "tap center", max_steps=1
@@ -573,7 +573,7 @@ def test_run_vision_controls_image_and_coordinate_registry(
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fixture-key")
     cfg = MobileConfig(
-        llm_profiles={
+        profiles={
             "default": LLMProfile(provider="anthropic", model="claude-sonnet-4-5", vision=profile)
         }
     )
@@ -607,7 +607,7 @@ def test_run_vision_controls_image_and_coordinate_registry(
     result = CliRunner().invoke(run, ["goal", "serial", *flags])
     assert result.exit_code == 0, result.exception
     assert phone.screenshot.await_count == int(enabled)
-    assert ConfigLoader.load().llm_profiles["default"].vision == profile
+    assert ConfigLoader.load().profiles["default"].vision == profile
 
 
 @pytest.mark.parametrize("entry", ["operator", "cli", "user_selector"])
@@ -633,7 +633,7 @@ def test_anthropic_token_budget_sets_screenshot_and_tap_space(config, monkeypatc
     image = BytesIO()
     Image.new("RGB", (1440, 1920)).save(image, format="PNG")
     phone.screenshot = AsyncMock(return_value=image.getvalue())
-    config.llm_profiles["default"] = LLMProfile(provider="anthropic", model="claude-sonnet-4-5")
+    config.profiles["default"] = LLMProfile(provider="anthropic", model="claude-sonnet-4-5")
     calls = []
 
     async def chat(self, messages, **kwargs):
@@ -662,7 +662,7 @@ def test_anthropic_token_budget_sets_screenshot_and_tap_space(config, monkeypatc
         assert result.exit_code == 0, result.exception
     elif entry == "user_selector":
         llm = Anthropic(model="claude-sonnet-4-5", api_key="unit-key")
-        config.llm_profiles["default"].provider = "ollama"
+        config.profiles["default"].provider = "ollama"
         op = AgentOperator(selector=LlamaIndexLLMSelector(llm))
         assert asyncio.run(op.execute(phone, "tap center")).success
     else:
@@ -774,7 +774,7 @@ async def test_operator_adds_custom_tool_without_binding_or_exporting_it(phone, 
     first = selector.requests[0]
     assert first.registry.has_sensitive and "read_label" in first.by_name
     assert selector.requests[1].history[-1].ok
-    assert selector.requests[1].history[-1].args == {"label": "[REDACTED]"}
+    assert selector.requests[1].history[-1].args == {"label": "local-only"}
     assert json.loads(recorded_macro(result.trajectory_path).read_text())["actions"] == []
 
 
@@ -793,9 +793,9 @@ def test_base_does_not_import_agent_workflows():
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("kind", ["agent", "planning", "external"])
+@pytest.mark.parametrize("kind", ["agent", "planning"])
 async def test_concrete_operator_starts_its_own_workflow(phone, config, monkeypatch, kind):
-    from mobilerun_agents.agent.operators import agent, external, planning
+    from mobilerun_agents.agent.operators import agent, planning
     from mobilerun_agents.agent.operators._run import RunSpec
 
     workflow = Mock()
@@ -804,17 +804,14 @@ async def test_concrete_operator_starts_its_own_workflow(phone, config, monkeypa
     from mobilerun_agents import LlamaIndexPlanner
 
     planner = LlamaIndexPlanner(MockLLM())
-    if kind == "external":
-        monkeypatch.setattr(external, "ExternalWorkflow", workflow)
-        operator = external.ExternalOperator("inventory")
-    elif kind == "planning":
+    if kind == "planning":
         monkeypatch.setattr(planning, "PlanningWorkflow", workflow)
         operator = planning.PlanningOperator(planner=planner, executor=executor)
     else:
         monkeypatch.setattr(agent, "AgentWorkflow", workflow)
         operator = agent.AgentOperator(selector=selector)
     assert await operator._start(run) is workflow.return_value.run.return_value
-    constructors = {"external": ("inventory",), "planning": (planner, executor), "agent": ()}
+    constructors = {"planning": (planner, executor), "agent": ()}
     workflow.assert_called_once_with(*constructors[kind], timeout=3.5)
     inputs = workflow.return_value.run.call_args.kwargs
     assert inputs["device"] is phone and inputs["goal"] == "count items"
@@ -822,10 +819,8 @@ async def test_concrete_operator_starts_its_own_workflow(phone, config, monkeypa
     if kind == "planning":
         assert "action_selector" not in inputs
         assert inputs["memory_factory"]() is not inputs["memory_factory"]()
-    elif kind == "agent":
-        assert inputs["action_selector"] is selector
     else:
-        assert "action_selector" not in inputs
+        assert inputs["action_selector"] is selector
 
 
 @pytest.mark.anyio
@@ -878,8 +873,11 @@ def test_cli_real_steps_visible_without_transport_or_sensitive_args(
         "mobilerun_agents.cli.agent.run.AgentOperator",
         lambda **kwargs: AgentOperator(**kwargs, tools=[authorize]),
     )
+    from mobilerun_agents.agent.action_selector.loader import SetupSpec
+
     monkeypatch.setattr(
-        "mobilerun_agents.cli.agent.run.default_selector", AsyncMock(return_value=selector)
+        "mobilerun_agents.cli.agent.run.build_setup",
+        AsyncMock(return_value=SetupSpec(selector=selector)),
     )
     out = CliRunner().invoke(
         cli, (["--debug"] if debug else []) + ["agent", "run", "battery", "emulator-5554"]

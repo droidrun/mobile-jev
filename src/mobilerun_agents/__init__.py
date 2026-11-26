@@ -18,7 +18,6 @@ from .agent.tools import Tool, ToolRegistry, tool
 from .agent.tools.base import Source
 from .agent.workflows.agent import AgentWorkflow
 from .agent.workflows.core.result import AgentResult
-from .agent.workflows.external import ExternalWorkflow
 from .config.user_config import MobileConfig
 
 if TYPE_CHECKING:
@@ -49,7 +48,6 @@ __all__ = [
     "AgentWorkflow",
     "DecisionSelector",
     "DelegatingSelector",
-    "ExternalWorkflow",
     "FallbackSelector",
     "LLMSelector",
     "LlamaIndexLLMSelector",

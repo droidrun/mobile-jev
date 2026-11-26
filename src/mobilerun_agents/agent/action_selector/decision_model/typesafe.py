@@ -21,10 +21,14 @@ from mobilerun_agents.agent.logs.diagnostics import (
     DecisionOptions,
     Detail,
     decision_sink,
-    private_values,
     protect,
     safe_text,
     sink,
+)
+from mobilerun_agents.agent.logs.redaction import (
+    redact_run_text,
+    redact_run_value,
+    run_sensitive_values,
 )
 from mobilerun_agents.agent.tools.base import RegistryTool
 from mobilerun_agents.config.prompts import render_selector_prompt
@@ -60,18 +64,22 @@ class _Result(BaseModel):
     boxes: dict[str, _Target] = Field(default_factory=dict)
 
 
+def _choice_text(text: str, limit: int | None = 200) -> str:
+    return safe_text(redact_run_text(text), limit)
+
+
 def _choice_label(request: DecisionInput, index: int, option: ActionCandidate) -> str:
     action = option.action
-    name = safe_text(action.name, 60)
+    name = _choice_text(action.name, 60)
     if option.point_space is not None:
         return f"{index + 1} tap on screen"
-    match request.registry.by_name.get(action.name):
+    match request.registry.get(action.name):
         case RegistryTool(action=tool) if tool and tool.sensitive_parameters:
             return f'{index + 1} {name} "***"'
-    description = safe_text(option.description, limit=None)
+    description = _choice_text(option.description, limit=None)
     match action.parameters.get("index"):
         case int() as element_index if type(element_index) is int:
-            prefix = f"{index + 1} {name} [{element_index}]"
+            prefix = f"{index + 1} {name} [{_choice_text(str(element_index))}]"
             # Indexed candidate descriptions can include text-field contents and state notes.
             description = description.removeprefix("Click ").removeprefix("Long press ")
             if _private_element(request.state, element_index):
@@ -115,44 +123,37 @@ def _log_input(
 def _safe_choice_value(value: JSONValue) -> JSONValue:
     match value:
         case str():
-            return safe_text(value)
+            return _choice_text(value)
         case list():
             return [_safe_choice_value(item) for item in value]
         case dict():
-            return {safe_text(key): _safe_choice_value(item) for key, item in value.items()}
+            return {_choice_text(key): _safe_choice_value(item) for key, item in value.items()}
         case _:
-            return value
+            return redact_run_value(value)
 
 
 def _recorded_choices(
-    request: DecisionInput, options: tuple[ActionCandidate, ...], completion: bool
+    request: DecisionInput, options: tuple[ActionCandidate, ...], abstain: bool
 ) -> list[dict[str, JSONValue]]:
     rows: list[dict[str, JSONValue]] = []
     for i, option in enumerate(options):
         action = option.action
         sensitive: frozenset[str] = frozenset()
-        match request.registry.by_name.get(action.name):
+        match request.registry.get(action.name):
             case RegistryTool(action=tool) if tool is not None:
                 sensitive = tool.sensitive_parameters
         args = {
-            safe_text(key): "***" if key in sensitive else _safe_choice_value(value)
+            _choice_text(key): "***" if key in sensitive else _safe_choice_value(value)
             for key, value in action.parameters.items()
         }
         rows.append(
             {
                 "label": _choice_label(request, i, option),
-                "tool_call": {"name": safe_text(action.name), "parameters": args},
+                "tool_call": {"name": _choice_text(action.name), "parameters": args},
             }
         )
-    if completion:
-        for kind, success in (("complete_success", True), ("complete_failure", False)):
-            rows.append(
-                {
-                    "label": kind,
-                    "tool_call": {"name": "complete", "parameters": {"success": success}},
-                }
-            )
-    rows.append({"label": "abstain", "tool_call": {"name": "abstain", "parameters": {}}})
+    if abstain:
+        rows.append({"label": "abstain", "tool_call": {"name": "abstain", "parameters": {}}})
     return rows
 
 
@@ -194,10 +195,15 @@ class TypeSafeDecisionModel:
         return self.config.max_options
 
     async def decide(self, request: DecisionInput) -> Decision | None:
-        completion = "complete" in request.registry.by_name
-        if not request.options and not completion:
+        if not request.options:
             raise ValueError("TypeSafe decisions require non-empty action options")
-        indices = {f"action_{i}": i for i in range(len(request.options))}
+        indices = {}
+        for i, candidate in enumerate(request.options):
+            action = candidate.action
+            label = f"action_{i}"
+            if action.name == "complete":
+                label = "complete_success" if action.parameters["success"] else "complete_failure"
+            indices[label] = i
         criteria: dict[str, Any] = {
             label: {
                 "description": request.options[i].description,
@@ -207,10 +213,11 @@ class TypeSafeDecisionModel:
             }
             for label, i in indices.items()
         }
-        criteria["abstain"] = render_selector_prompt(self.config.criteria_prompt, kind="abstain")
-        if completion:
-            for kind in ("complete_success", "complete_failure"):
-                criteria[kind] = render_selector_prompt(self.config.criteria_prompt, kind=kind)
+        abstain = not any(option.action.name == "delegate" for option in request.options)
+        if abstain:
+            criteria["abstain"] = render_selector_prompt(
+                self.config.criteria_prompt, kind="abstain"
+            )
         if len(criteria) > self.config.max_choices:
             raise ValueError(
                 f"TypeSafe accepts at most {self.config.max_choices} choices, got {len(criteria)}"
@@ -220,6 +227,8 @@ class TypeSafeDecisionModel:
             "memory": request.memory,
             "history": TypeAdapter(list[Any]).dump_python(request.history, mode="json"),
         }
+        if request.intent:
+            state["intent"] = request.intent
         locating = request.screenshot is not None and any(o.point_space for o in request.options)
         if request.state is not None:
             state.update(
@@ -255,20 +264,21 @@ class TypeSafeDecisionModel:
         if diagnostic:
             _log_input(diagnostic, request, dimensions, locating)
         if diagnostic or save:
-            scope = private_values.set({api_key}) if private_values.get() is None else None
+            # Include the provider key without adding it to the run's tracked device inputs.
+            scope = run_sensitive_values.set((run_sensitive_values.get() or set()) | {api_key})
             try:
-                groups = Counter(safe_text(option.action.name) for option in request.options)
+                groups = Counter(_choice_text(option.action.name) for option in request.options)
                 grouped = ", ".join(f"{name} {count}" for name, count in groups.most_common())
-                special = "+complete/abstain" if completion else "+abstain"
-                summary = f"{len(request.options)} · {grouped} · {special}"
+                summary = f"{len(request.options)} · {grouped}"
+                if abstain:
+                    summary += " · +abstain"
                 if save:
-                    choices = _recorded_choices(request, request.options, completion)
+                    choices = _recorded_choices(request, request.options, abstain)
                     save(DecisionOptions(summary=summary, choices=choices))
                 elif diagnostic:
                     diagnostic(Detail(section="jev choices", text=summary))
             finally:
-                if scope is not None:
-                    private_values.reset(scope)
+                run_sensitive_values.reset(scope)
         started = monotonic() if diagnostic else 0.0
         try:
             async with AsyncTypeSafeClient(**options) as client:
@@ -363,12 +373,13 @@ class TypeSafeDecisionModel:
                 diagnostic(Detail(section="jev abstain", text=reason))
         if reason is not None:
             return None
-        if answer.choice in {"complete_success", "complete_failure"}:
-            success = answer.choice == "complete_success"
+        if option is not None and option.action.name == "complete":
             return Decision(
+                option_index=index,
                 confidence=confidence,
-                success=success,
-                message=render_selector_prompt(self.config.completion_prompt, success=success),
+                message=render_selector_prompt(
+                    self.config.completion_prompt, success=option.action.parameters["success"]
+                ),
             )
         return Decision(option_index=index, confidence=confidence, point=point)
 

@@ -13,20 +13,20 @@ from mobilerun_agents.agent.action_selector.decision_model.typesafe import TypeS
 from mobilerun_agents.config.loader import ConfigLoader
 from mobilerun_agents.config.user_config import (
     DecisionProfile,
-    DelegationConfig,
     LLMProfile,
     MobileConfig,
+    SetupConfig,
 )
 
 
-@pytest.mark.parametrize("primary", [None, "decision"])
-def test_typesafe_primary_builds_only_delegate_llm(primary, monkeypatch):
-    config = MobileConfig()
-    config.agent.selector = "selected"
-    config.decision_profiles[primary or config.agent.selector] = DecisionProfile()
-    config.llm_profiles["helper"] = LLMProfile(provider="openai", model="helper-model")
-    config.agent.delegation = DelegationConfig(
-        primary=primary, delegate="helper", min_confidence=0.8
+def test_typesafe_primary_builds_only_delegate_llm(monkeypatch):
+    monkeypatch.setenv("TYPESAFE_API_KEY", "fake")
+    config = MobileConfig(
+        profiles={
+            "selected": DecisionProfile(provider="typesafe", min_confidence=0.8),
+            "helper": LLMProfile(provider="openai", model="helper-model"),
+        },
+        setups={"jev": SetupConfig(selector="selected", delegate="helper")},
     )
     shared = MockLLM()
     calls = []
@@ -36,7 +36,8 @@ def test_typesafe_primary_builds_only_delegate_llm(primary, monkeypatch):
         return shared
 
     monkeypatch.setattr(loader, "build_llm", fake_build)
-    selector = asyncio.run(loader.build_selector(config))
+    with ConfigLoader.override(config):
+        selector = asyncio.run(loader.build_setup("jev")).selector
     assert calls == [("openai", "helper-model")]
     assert type(selector) is DelegatingSelector
     assert type(selector.primary) is DecisionSelector
@@ -47,13 +48,18 @@ def test_typesafe_primary_builds_only_delegate_llm(primary, monkeypatch):
 @pytest.mark.parametrize("role", ["agent", "executor"])
 @pytest.mark.parametrize("vision", [None, "only"])
 def test_default_jev_and_llm_use_profile_vision_or_run_override(monkeypatch, role, vision):
+    monkeypatch.setenv("TYPESAFE_API_KEY", "fake")
     config = MobileConfig(
-        default_llm="local",
-        llm_profiles={"local": LLMProfile(provider="ollama", model="fake")},
-        decision_profiles={"jev": DecisionProfile()},
+        profiles={
+            "local": LLMProfile(provider="ollama", model="fake"),
+            "jev": DecisionProfile(provider="typesafe"),
+        },
+        setups={
+            "straight": SetupConfig(selector="jev", delegate="local"),
+            "planned": SetupConfig(planner="local", executor="jev", delegate="local"),
+        },
+        default_setup="straight" if role == "agent" else "planned",
     )
-    config.agent.selector = "jev"
-    config.agent.delegation = DelegationConfig(delegate="local")
     path = ConfigLoader.save(config)
     saved = path.read_bytes()
 
@@ -61,7 +67,8 @@ def test_default_jev_and_llm_use_profile_vision_or_run_override(monkeypatch, rol
         return MockLLM()
 
     monkeypatch.setattr(loader, "build_llm", fake_build)
-    selector = asyncio.run(loader.default_selector(role, vision))
+    spec = asyncio.run(loader.build_setup(None, vision))
+    selector = spec.selector if role == "agent" else spec.executor
     assert type(selector) is DelegatingSelector
     assert type(selector.primary) is DecisionSelector
     assert type(selector.primary.model) is TypeSafeDecisionModel
@@ -69,8 +76,8 @@ def test_default_jev_and_llm_use_profile_vision_or_run_override(monkeypatch, rol
     assert selector.min_confidence == 0.7
     assert (selector.primary.vision, selector.delegate.vision) == (vision or "on", vision or "off")
     assert path.read_bytes() == saved and b"vision:" not in saved
-    planner = asyncio.run(loader.default_planner())
-    assert type(planner) is loader.LlamaIndexPlanner and type(planner.llm) is MockLLM
+    if role == "executor":
+        assert type(spec.planner) is loader.LlamaIndexPlanner and type(spec.planner.llm) is MockLLM
 
 
 @pytest.mark.parametrize("provider,expected", [("openai", "on"), ("ollama", "off")])
@@ -79,7 +86,8 @@ def test_unset_profile_vision_resolves_to_provider_default_offline(monkeypatch, 
         return MockLLM()
 
     monkeypatch.setattr(loader, "build_llm", fake_build)
-    config = MobileConfig(llm_profiles={"default": LLMProfile(provider=provider, model="unlisted")})
-    selector = asyncio.run(loader.build_selector(config))
+    config = MobileConfig(profiles={"default": LLMProfile(provider=provider, model="unlisted")})
+    with ConfigLoader.override(config):
+        selector = asyncio.run(loader.default_setup()).selector
     assert type(selector) is LlamaIndexLLMSelector
     assert selector.vision == expected

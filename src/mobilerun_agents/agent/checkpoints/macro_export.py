@@ -44,11 +44,6 @@ def macro_data(
         validate_vault_reference(action)
         if not action.ok or not action.replayable:
             continue
-        if (
-            action.name in {"input_text", "set_clipboard"}
-            and action.args.get("text") == "[REDACTED]"
-        ):
-            continue
         payload: dict[str, JSONValue] = (
             {"action_type": "extension_call", "name": action.name, "arguments": action.args}
             if "." in action.name

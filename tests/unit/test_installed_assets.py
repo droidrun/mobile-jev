@@ -69,9 +69,11 @@ assert "example.settings" in render_selector_prompt("assets/prompts/tools/choose
 @pytest.mark.parametrize(
     ("args", "expected"),
     [
-        (["agent", "--help"], ("run", "setup", "logout", "task")),
-        (["agent", "setup", "--help"], ("--provider", "--model", "--api-key-stdin", "--vision")),
-        (["agent", "run", "--help"], ("--steps",)),
+        (["agent", "--help"], ("configure", "profiles", "providers", "run", "task")),
+        (["agent", "providers", "add", "--help"], ("--api-key-stdin",)),
+        (["agent", "profiles", "add", "--help"], ("--model", "--reasoning", "--min-confidence")),
+        (["agent", "configure", "--help"], ("--selector", "--planner", "--executor", "--delegate")),
+        (["agent", "run", "--help"], ("--steps", "--setup", "--vision")),
         (["macro-agent", "--help"], ("replay",)),
     ],
 )

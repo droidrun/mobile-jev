@@ -26,5 +26,5 @@ async def resolve(provider: str, api_key: str | None = None) -> Credential:
         return Credential(provider, saved.api_key)
     raise CredentialMissing(
         f"No API key for {provider}: pass api_key or set {env}. "
-        "You can also save a provider key with `mobilerun agent setup`."
+        "You can also save a key with `mobilerun agent providers add`."
     )

@@ -77,7 +77,7 @@ async def test_checkpoint_snapshots_event_step_and_exports_recorded_pre_states(t
     saved = AgentState.model_validate_json(checkpoint.read_bytes())
     assert saved.step == 1
     assert len(saved.actions) == 2
-    assert saved.actions[1].args["text"] == "[REDACTED]"
+    assert saved.actions[1].args == {}
     assert 'example "text"' not in saved.actions[1].summary
     assert (folder / saved.actions[1].screenshot).read_bytes() == image
     assert saved.actions[0].ui_state == "ui_states/0001.json"

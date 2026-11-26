@@ -3,9 +3,11 @@
 from time import monotonic
 from typing import Annotated
 
+from llama_index.core.base.llms.types import ImageBlock
 from llama_index.core.llms import LLM, ChatMessage, ChatResponse
 from llama_index.core.tools import FunctionTool
 from mobilerun.models.context import JSONValue
+from mobilerun.utils.images import image_dimensions
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError, create_model
 
 from mobilerun_agents.agent.action_selector.llm.calls import (
@@ -14,8 +16,13 @@ from mobilerun_agents.agent.action_selector.llm.calls import (
     achat,
     usage_from_response,
 )
+from mobilerun_agents.agent.action_selector.llm.factory import (
+    adapter_capabilities,
+    llm_diagnostic_name,
+)
 from mobilerun_agents.agent.action_selector.llm.parsing import parse_native_tool_calls
-from mobilerun_agents.agent.logs.diagnostics import Detail, ModelCall, redact, sink
+from mobilerun_agents.agent.logs.diagnostics import Detail, ModelCall, Retry, redact, sink
+from mobilerun_agents.agent.logs.redaction import redact_run_text
 from mobilerun_agents.config.prompts import render_selector_prompt
 
 from .base import Finish, Plan, Planner, PlanningInput
@@ -40,7 +47,7 @@ class _Complete(BaseModel):
 
 def _decision(response: ChatResponse, error: str) -> Plan | Finish:
     parsed = parse_native_tool_calls(response.message)
-    if (diagnostic := sink.get()) and (thought := redact(parsed.thought)[:290]):
+    if (diagnostic := sink.get()) and (thought := redact(redact_run_text(parsed.thought))[:290]):
         diagnostic(Detail(section="planning", text=f"reasoning: {thought}"))
     if len(parsed.calls) != 1:
         raise InvalidResponse(error)
@@ -63,7 +70,11 @@ def _decision(response: ChatResponse, error: str) -> Plan | Finish:
 
 
 async def _request(
-    llm: LLM, request: PlanningInput, messages: list[ChatMessage], tools: list[FunctionTool]
+    llm: LLM,
+    request: PlanningInput,
+    messages: list[ChatMessage],
+    tools: list[FunctionTool],
+    image: tuple[int, int] | None,
 ) -> ChatResponse:
     diagnostic = sink.get()
     started = monotonic()
@@ -87,8 +98,8 @@ async def _request(
         if diagnostic:
             diagnostic(
                 ModelCall(
-                    name=llm.metadata.model_name,
-                    image=None,
+                    name=llm_diagnostic_name(llm),
+                    image=image,
                     seconds=monotonic() - started,
                     inputs=usage.request_tokens,
                     outputs=usage.response_tokens,
@@ -101,6 +112,10 @@ async def _request(
 class LlamaIndexPlanner(Planner):
     def __init__(self, llm: LLM) -> None:
         self.llm = llm
+
+    @property
+    def supports_images(self) -> bool:
+        return adapter_capabilities(self.llm).vision
 
     async def plan(self, request: PlanningInput) -> Plan | Finish:
         config = request.config.decision
@@ -139,18 +154,21 @@ class LlamaIndexPlanner(Planner):
                 ),
             )
         ]
-        error = render_selector_prompt(config.invalid_arguments_prompt)
         diagnostic = sink.get()
+        image = None
+        if request.screenshot and self.supports_images:
+            messages[0].blocks.append(ImageBlock(image=request.screenshot))
+            if diagnostic:
+                image = image_dimensions(request.screenshot)
+        error = render_selector_prompt(config.invalid_arguments_prompt)
         for attempt in range(1, config.max_response_repair_attempts + 1):
             try:
-                return _decision(await _request(self.llm, request, messages, tools), error)
+                return _decision(await _request(self.llm, request, messages, tools, image), error)
             except InvalidResponse as exc:
-                if diagnostic:
-                    diagnostic(
-                        Detail(section="repair", text=f"{attempt}: Invalid planner tool call")
-                    )
                 if attempt == config.max_response_repair_attempts:
                     raise
+                if diagnostic:
+                    diagnostic(Retry(attempt=attempt + 1, reason="Invalid planner tool call"))
                 messages = [
                     messages[0],
                     ChatMessage(

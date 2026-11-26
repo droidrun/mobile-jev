@@ -20,7 +20,6 @@ def _isolation_environment(root):
         "APPDATA": str(root / "appdata"),
         "LOCALAPPDATA": str(root / "localappdata"),
         "MOBILERUN_USER_CONFIG_DIR": str(config),
-        "MOBILERUN_CONFIG": str(config / "config.yaml"),
     }
 
 
@@ -113,6 +112,7 @@ _collection_home = tempfile.TemporaryDirectory(prefix="mobilerun-pytest-")
 for _key in _secret_names():
     if not _key.startswith("MOBILERUN_SMOKE_"):
         os.environ.pop(_key, None)
+os.environ.pop("MOBILERUN_CONFIG", None)  # base treats a set-but-missing override as an error
 os.environ.update(_isolation_environment(Path(_collection_home.name)))
 
 
@@ -121,6 +121,7 @@ def isolate_user_configuration(tmp_path, monkeypatch, request):
     for key in _secret_names():
         if not (key.startswith("MOBILERUN_SMOKE_") and request.node.get_closest_marker("smoke")):
             monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("MOBILERUN_CONFIG", raising=False)
     for key, value in _isolation_environment(tmp_path).items():
         monkeypatch.setenv(key, value)
 

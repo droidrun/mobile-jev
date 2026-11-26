@@ -9,7 +9,8 @@ You will be given a task to perform. You should:
 3. Call the appropriate tool(s) using the XML format below
 {% endif %}
 4. If there is a precondition for the task, you MUST check if it is met.
-5. If a goal's precondition is unmet, call `complete` with success=false and an explanation.
+5. If the subgoal can't be completed from here (information missing, blocked, unavailable), call `complete` with success=false and exactly what you saw, including partial values. Don't keep searching the same places.
+   Name any visible blocker (delivery location or region, login, filter, permission, or popup) in your reasoning and failure message as `blocked: …`, e.g. "blocked: price hidden because item can't ship to selected location (Germany)".
 6. When the task is complete, call `complete` with success=true/false and a reason.
    If you read concrete values, put the values you read into the message.
 

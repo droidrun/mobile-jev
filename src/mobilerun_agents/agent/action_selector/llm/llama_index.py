@@ -15,7 +15,7 @@ from mobilerun_agents.agent.action_selector.llm.base import LLMSelector
 from mobilerun_agents.config.user_config import DecisionConfig
 
 from .calls import achat, usage_from_response
-from .factory import adapter_capabilities
+from .factory import adapter_capabilities, llm_diagnostic_name
 from .models import Capabilities
 from .parsing import ToolCall, ToolCallParseResult, ToolCallParseStatus
 
@@ -23,15 +23,7 @@ from .parsing import ToolCall, ToolCallParseResult, ToolCallParseStatus
 class LlamaIndexLLMSelector(LLMSelector):
     @property
     def diagnostic_name(self) -> str:
-        metadata = self.llm.metadata
-        adapter = type(self.llm)
-        module = adapter.__module__.split(".")
-        provider = (
-            module[2]
-            if module[:2] == ["llama_index", "llms"] and len(module) > 2
-            else adapter.__name__
-        )
-        return f"llm:{provider}/{metadata.model_name}"
+        return llm_diagnostic_name(self.llm)
 
     def __init__(
         self,
@@ -44,8 +36,9 @@ class LlamaIndexLLMSelector(LLMSelector):
     ) -> None:
         super().__init__(vision, config)
         self.llm = llm
-        self._image_limits = image_limits or adapter_capabilities(llm)
-        declared = native_tool_api
+        capabilities = adapter_capabilities(llm)
+        self._image_limits = image_limits or capabilities
+        declared = native_tool_api or capabilities.tool_call_format
         if supports_native and declared is None:
             from llama_index.llms.anthropic import Anthropic
             from llama_index.llms.google_genai import GoogleGenAI

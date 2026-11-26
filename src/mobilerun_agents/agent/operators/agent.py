@@ -3,7 +3,7 @@ from collections.abc import Sequence
 from workflows.handler import WorkflowHandler
 
 from mobilerun_agents.agent.action_selector import ActionSelector, DelegatingSelector
-from mobilerun_agents.agent.action_selector.loader import default_selector
+from mobilerun_agents.agent.action_selector.loader import default_setup
 from mobilerun_agents.agent.memory.blocks.device_context import DeviceContextBlock
 from mobilerun_agents.agent.memory.memory import build_memory
 from mobilerun_agents.agent.tools.base import Tool, delegate
@@ -40,5 +40,10 @@ class AgentOperator(_Operator):
         self._tools = tuple(tools)
 
     async def _start(self, run: RunSpec) -> WorkflowHandler:
-        selector = self._selector or await default_selector("agent")
+        selector = self._selector
+        if selector is None:
+            setup = await default_setup()
+            selector = setup.selector or setup.executor
+            if selector is None:
+                raise ValueError("The default setup has no action selector.")
         return start_agent(AgentWorkflow(timeout=run.timeout), run, selector, self._tools)

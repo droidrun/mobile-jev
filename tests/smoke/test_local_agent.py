@@ -39,7 +39,7 @@ def test_installed_agent_operates_local_device(real_env, android_sdk_for_smoke, 
             await device.connect()
             connected = True
             config = MobileConfig()
-            config.llm_profiles[config.agent.selector] = LLMProfile(provider=provider, model=model)
+            config.profiles["default"] = LLMProfile(provider=provider, model=model)
             monkeypatch.setattr("mobilerun_agents.config.loader.ConfigLoader.load", lambda: config)
             result = await device.do(
                 "Open the Settings app",

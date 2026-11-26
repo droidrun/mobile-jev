@@ -45,6 +45,7 @@ class ConfigLoader:
             try:
                 # exclude_unset would also discard edits made inside a default section.
                 choices = config.model_dump(mode="json", exclude_defaults=True)
+                MobileConfig.model_validate(choices)
                 yaml.safe_dump(choices, file, sort_keys=False)  # type: ignore[no-untyped-call]
                 file.close()
                 temp.replace(path)

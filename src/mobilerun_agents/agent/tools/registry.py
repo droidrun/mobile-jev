@@ -3,11 +3,11 @@
 import hashlib
 import inspect
 import re
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Any, overload
+from typing import Any
 
 from llama_index.core.tools import BaseTool
 from mobilerun.core.devices.base import Device
@@ -17,13 +17,12 @@ from mobilerun.core.extensions.actions import Declaration
 from mobilerun.utils.redaction import secret_scope
 from pydantic import BaseModel, ConfigDict, create_model
 
-from mobilerun_agents.agent.logs.diagnostics import safe_text
+from mobilerun_agents.agent.logs.redaction import observe_secret_inputs
 from mobilerun_agents.agent.run import Run
 from mobilerun_agents.config.prompts import render_selector_prompt
-from mobilerun_agents.config.user_config import DecisionConfig, Vision
 from mobilerun_agents.errors.descriptions import describe_error
 
-from .atomic import AtomicTool, atomic_tools
+from .atomic import AtomicTool, expand_atomic_tools
 from .base import ActionMetadata, ActionResult, RegistryTool, Source, Tool, complete, tool
 from .helpers import check_point, coordinate_pairs
 
@@ -53,10 +52,9 @@ DEVICE_TOOL_DENYLIST = frozenset(
         "get_clipboard",
     }
 )
-NATIVE_SENSITIVE_PARAMETERS = {
-    "input_text": frozenset({"text"}),
-    "set_clipboard": frozenset({"text"}),
-}
+# The cloud driver forwards the base float unchanged to this integer wire field.
+# Keep the device's model-facing schema; normalize only at the cloud boundary.
+_CLOUD_INTEGER_MINIMUMS = {"swipe": {"duration_ms": 10}}
 
 
 def model_name(action: Action) -> str:
@@ -104,26 +102,29 @@ def _device_entries(device: Device, state_capabilities: Collection[str]) -> tupl
             ),
             name=name,
         )
-    return tuple(
-        (
-            replace(action, sensitive_parameters=NATIVE_SENSITIVE_PARAMETERS[model_name(action)])
-            if action.owner == "device"
-            and not action.sensitive_parameters
-            and model_name(action) in NATIVE_SENSITIVE_PARAMETERS
-            else action
-        )
-        for action in entries.values()
-    )
+    return tuple(entries.values())
+
+
+def _cloud_arguments(name: str, validated: dict[str, Any]) -> str | None:
+    for parameter, minimum in _CLOUD_INTEGER_MINIMUMS.get(name, {}).items():
+        value = validated[parameter]
+        if type(value) is float and value.is_integer():
+            value = int(value)
+        if type(value) is not int:
+            return f"CloudValidationError: {parameter} must be an integer"
+        if value < minimum:
+            return f"CloudValidationError: {parameter} must be at least {minimum}"
+        validated[parameter] = value
+    return None
 
 
 async def _invoke_device(run: Run, action: Action, arguments: dict[str, Any]) -> ActionResult:
     name = model_name(action)
-    masked = {
-        key: "[REDACTED]" if key in action.sensitive_parameters else value
-        for key, value in arguments.items()
-    }
     try:
         validated = action.validate(arguments)
+        if action.owner == "device" and run.device._is_cloud:
+            if issue := _cloud_arguments(name, validated):
+                return ActionResult(False, issue)
         for x, y in coordinate_pairs(validated):
             if validated[x] is not None and validated[y] is not None:
                 try:
@@ -165,8 +166,7 @@ async def _invoke_device(run: Run, action: Action, arguments: dict[str, Any]) ->
                     {"action_type": "extension_call", "name": action.name, "arguments": arguments},
                     pre_ui=pre_ui,
                 )
-        shown = "[REDACTED]" if action.sensitive_parameters else repr(result)
-        return ActionResult(result is not False, safe_text(f"{name} {masked} → {shown}"))
+        return ActionResult(result is not False, f"{name} {arguments} → {result!r}")
     except Exception as exc:
         return ActionResult(False, type(exc).__name__)
 
@@ -226,7 +226,7 @@ def build_registry(
             exposed = project(action)
             if exposed is not None:
                 members.append(_route(action, exposed, from_device, output_model, run))
-    return ToolRegistry(tuple(members))
+    return ToolRegistry(run, tuple(members))
 
 
 def _route(
@@ -237,9 +237,10 @@ def _route(
     run: Run,
 ) -> RegistryTool:
     async def invoke(**args: Any) -> object:
-        if from_device:
-            return await _invoke_device(run, action, args)
-        return action.validate_result(await action._call(**action.validate(args)))
+        with observe_secret_inputs(run.device):
+            if from_device:
+                return await _invoke_device(run, action, args)
+            return action.validate_result(await action._call(**action.validate(args)))
 
     schema = action._arguments
     if not issubclass(schema, BaseModel):
@@ -282,56 +283,39 @@ def _route(
 
 
 @dataclass(frozen=True)
-class ToolRegistry(Sequence[BaseTool]):
-    """Immutable membership; extending or filtering never changes an earlier registry."""
+class ToolRegistry:
+    """Run-owned actions with transient selector projections."""
 
-    tools: tuple[BaseTool, ...] = ()
+    run: Run = field(repr=False, compare=False)
+    _members: tuple[BaseTool, ...] = ()
     by_name: Mapping[str, BaseTool] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        tools = tuple(self.tools)
         names: dict[str, BaseTool] = {}
-        for member in tools:
+        for member in self._members:
             name = member.metadata.get_name()
             if name in names:
                 raise ValueError(f"Duplicate tool name: {name}")
             names[name] = member
-        object.__setattr__(self, "tools", tools)
         object.__setattr__(self, "by_name", MappingProxyType(names))
-
-    @overload
-    def __getitem__(self, index: int) -> BaseTool: ...
-    @overload
-    def __getitem__(self, index: slice) -> tuple[BaseTool, ...]: ...
-    def __getitem__(self, index: int | slice) -> BaseTool | tuple[BaseTool, ...]:
-        return self.tools[index]
-
-    def __len__(self) -> int:
-        return len(self.tools)
 
     @property
     def has_sensitive(self) -> bool:
-        for t in self.tools:
+        for t in self._members:
             match t:
                 case RegistryTool(action=action) if action and action.sensitive_parameters:
                     return True
         return False
 
-    async def atomic(
-        self, run: Run, vision: Vision = "on", config: DecisionConfig | None = None
+    def tools(
+        self, exclude: Collection[str] = (), include: Sequence[BaseTool] = ()
+    ) -> tuple[BaseTool, ...]:
+        members = dict(self.by_name)
+        for member in include:
+            members[member.metadata.get_name()] = member
+        return tuple(member for name, member in members.items() if name not in exclude)
+
+    async def atomic_tools(
+        self, exclude: Collection[str] = (), include: Sequence[BaseTool] = ()
     ) -> tuple[AtomicTool, ...]:
-        return await atomic_tools(self.by_name, run, vision=vision, config=config)
-
-    def extend(
-        self, extra: Iterable[BaseTool], exclude: Iterable[str | Source] = ()
-    ) -> "ToolRegistry":
-        excluded = frozenset(exclude)
-
-        def keep(member: BaseTool) -> bool:
-            source: Source | str = Source.RUN
-            match member.metadata:
-                case ActionMetadata(source=origin):
-                    source = origin
-            return member.metadata.get_name() not in excluded and source not in excluded
-
-        return ToolRegistry(tuple(filter(keep, (*self.tools, *extra))))
+        return await expand_atomic_tools(self.tools(exclude, include), self.run)

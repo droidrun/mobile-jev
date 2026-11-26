@@ -1,26 +1,28 @@
 import asyncio
+import json
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from llama_index.core.base.llms.types import ToolCallBlock
 from llama_index.core.llms import ChatMessage, ChatResponse, MockLLM
 
 from mobilerun_agents.agent.action_selector import LlamaIndexLLMSelector
-from mobilerun_agents.agent.action_selector.loader import build_selector
+from mobilerun_agents.agent.action_selector.llm.factory import build_llm
+from mobilerun_agents.agent.action_selector.llm.models import MODELS
+from mobilerun_agents.agent.action_selector.loader import default_setup
+from mobilerun_agents.config.loader import ConfigLoader
 from mobilerun_agents.config.user_config import LLMProfile, MobileConfig
 from tests.unit.agent.selector_fixtures import selection_run
 from tests.unit.device_fixtures import fake_tools
 
 
-def configured_selector(provider, model):
+def configured_selector(monkeypatch, provider, model):
+    monkeypatch.setenv(MODELS[provider].env_var, "fake")
     config = MobileConfig()
-    options = {"api_key": "fake"}
-    if provider == "gemini":
-        options.update(max_tokens=2048, context_window=8192)
-    config.llm_profiles[config.agent.selector] = LLMProfile(
-        provider=provider, model=model, kwargs=options
-    )
-    return asyncio.run(build_selector(config))
+    config.profiles["default"] = LLMProfile(provider=provider, model=model)
+    with ConfigLoader.override(config):
+        return asyncio.run(default_setup()).selector
 
 
 @pytest.mark.parametrize(
@@ -33,8 +35,8 @@ def configured_selector(provider, model):
         ("gemini", "gemini-3.8-flash", None),
     ],
 )
-def test_native_provider_declarations(provider, model, api):
-    selector = configured_selector(provider, model)
+def test_native_provider_declarations(monkeypatch, provider, model, api):
+    selector = configured_selector(monkeypatch, provider, model)
     assert selector.supports_native_tool_calls is (api is not None)
     if api is not None:
         assert selector.native_tool_api == api
@@ -49,24 +51,101 @@ def test_undeclared_external_llm_is_not_guessed():
     assert not LlamaIndexLLMSelector(AdvertisesGenericFunctions()).supports_native_tool_calls
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_direct_gpt6_selector_sends_native_tools_and_keeps_function_call(stream):
+    requests = []
+    output = [
+        {"type": "reasoning", "id": "rs_unit", "summary": []},
+        {
+            "type": "message",
+            "id": "msg_unit",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Wait for the screen.", "annotations": []}],
+        },
+        {
+            "type": "function_call",
+            "id": "fc_unit",
+            "call_id": "call_unit",
+            "name": "wait",
+            "arguments": "{}",
+            "status": "completed",
+        },
+    ]
+    response = {
+        "id": "resp_unit",
+        "object": "response",
+        "created_at": 0,
+        "status": "completed",
+        "model": "gpt-6-luna",
+        "output": output,
+        "parallel_tool_calls": True,
+        "tool_choice": "required",
+        "tools": [],
+        "usage": {
+            "input_tokens": 20,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 12,
+            "output_tokens_details": {"reasoning_tokens": 4},
+            "total_tokens": 32,
+        },
+    }
+
+    def send(request):
+        requests.append((request.url.path, json.loads(request.content)))
+        if stream:
+            event = {"type": "response.completed", "sequence_number": 1, "response": response}
+            return httpx.Response(
+                200,
+                text=f"data: {json.dumps(event)}\n\n",
+                headers={"Content-Type": "text/event-stream"},
+            )
+        return httpx.Response(200, json=response)
+
+    async def select():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(send)) as client:
+            llm = await build_llm("openai", "gpt-6-luna", api_key="fake", async_http_client=client)
+            return await LlamaIndexLLMSelector(llm, vision="on").select(
+                selection_run(goal="Wait", tools=fake_tools("wait"), stream=stream)
+            )
+
+    selection = asyncio.run(select())
+    [(path, body)] = requests
+    assert path == "/v1/responses"
+    assert body.get("tool_choice") == "required", {
+        "tool_choice": body.get("tool_choice"),
+        "tool_count": len(body.get("tools") or []),
+        "selected_actions": len(selection.actions),
+        "xml_prompt": "<function_calls>" in json.dumps(body["input"]),
+    }
+    assert [(tool["type"], tool["name"]) for tool in body["tools"]] == [("function", "wait")]
+    assert body["stream"] is stream and body["parallel_tool_calls"] is True
+    assert "<function_calls>" not in json.dumps(body["input"])
+    assert selection.thought == "Wait for the screen."
+    assert [(action.name, action.call_id) for action in selection.actions] == [
+        ("wait", "call_unit")
+    ]
+    assert selection.usage.reasoning_tokens == 4
+
+
 @pytest.mark.parametrize("provider", ["openai_like", "ollama", "gemini"])
 def test_profile_base_url_reaches_provider_options(monkeypatch, provider):
     from mobilerun_agents.agent.action_selector import loader
 
     url = "https://unit.invalid/v1"
     config = MobileConfig()
-    config.llm_profiles["default"] = LLMProfile(
+    config.profiles["default"] = LLMProfile(
         provider=provider,
         model="test",
         base_url=url,
-        kwargs={"http_options": {"timeout": 123}} if provider == "gemini" else {},
     )
     build = AsyncMock(return_value=MockLLM())
     monkeypatch.setattr(loader, "build_llm", build)
-    asyncio.run(build_selector(config))
+    with ConfigLoader.override(config):
+        asyncio.run(default_setup())
     options = build.await_args.kwargs
     if provider == "gemini":
-        assert (options["http_options"].base_url, options["http_options"].timeout) == (url, 123)
+        assert options["http_options"].base_url == url
     else:
         assert options["api_base" if provider == "openai_like" else "base_url"] == url
 
@@ -76,7 +155,7 @@ def test_profile_base_url_reaches_provider_options(monkeypatch, provider):
     [("deepseek", "deepseek-flash", "auto"), ("openai", "gpt-4o", "required")],
 )
 def test_declared_native_api_controls_wire_shape(provider, model, choice, monkeypatch):
-    selector = configured_selector(provider, model)
+    selector = configured_selector(monkeypatch, provider, model)
     reply = ChatResponse(
         message=ChatMessage(
             role="assistant", blocks=[ToolCallBlock(tool_name="wait", tool_kwargs={})]
@@ -110,6 +189,8 @@ def test_declared_native_api_controls_wire_shape(provider, model, choice, monkey
     "arguments,valid",
     [
         ({"index": 3}, True),
+        ({"index": 3.0}, True),
+        ({"index": 3.5}, False),
         ('{"index":3', False),
         ({}, False),
         ({"index": 3, "other": 0}, False),
@@ -129,7 +210,7 @@ def test_native_adapters_preserve_decoded_arguments_and_reject_invalid_calls(
 
     run = selection_run(goal="Choose")
     run.registry = build_registry(run, [choose], None)
-    llm = configured_selector(provider, model).shared_llm
+    llm = configured_selector(monkeypatch, provider, model).shared_llm
     selector = LlamaIndexLLMSelector(llm, native_tool_api=api)
     message = ChatMessage(
         role="assistant",
@@ -146,7 +227,7 @@ def test_native_adapters_preserve_decoded_arguments_and_reject_invalid_calls(
 
 
 def test_single_tool_policy_does_not_silently_discard_second_native_call(monkeypatch):
-    selector = configured_selector("deepseek", "deepseek-flash")
+    selector = configured_selector(monkeypatch, "deepseek", "deepseek-flash")
     reply = ChatResponse(
         message=ChatMessage(
             role="assistant",

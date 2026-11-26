@@ -15,6 +15,14 @@ class ActionRecord(BaseModel):
     ui_state: str | None
 
 
+class ActionRepeat(BaseModel):
+    name: str
+    signature: str
+    screen: str
+    location: str
+    count: int
+
+
 class AgentState(BaseModel):
     max_steps: int = DEFAULT_MAX_STEPS
     notes: list[str] = Field(default_factory=list)
@@ -23,3 +31,4 @@ class AgentState(BaseModel):
     actions: list[ActionRecord] = Field(default_factory=list)
     repair_attempts: int = 0
     output_attempts: int = 0
+    repeat: ActionRepeat | None = None
