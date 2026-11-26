@@ -10,7 +10,8 @@
 - `app_cards.py` — app-specific guidance.
 - `device_context.py` — context published by the device and its extensions.
 - `retriever.py` — relevant material from a LlamaIndex retriever.
-- `run_notes.py` — render notes from `snapshot.notes`, with no mutable note storage.
+- `repeat.py` — prior action on the current screen and repeat guidance.
+- `run_notes.py` — render the goal and notes without storing them in chat.
 
 **Examples:** `from mobilerun_agents.agent.memory.blocks.device_context import DeviceContextBlock`; pass `DeviceContextBlock()` in the block list to `build_memory`.
 

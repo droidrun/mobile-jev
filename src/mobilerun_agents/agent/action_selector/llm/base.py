@@ -25,11 +25,11 @@ from mobilerun_agents.agent.action_selector.llm.parsing import (
     parse_tool_calls_detailed,
 )
 from mobilerun_agents.agent.logs.diagnostics import ModelCall, sink
+from mobilerun_agents.agent.memory.messages import text_messages
 from mobilerun_agents.agent.run import Run
 from mobilerun_agents.agent.tools.base import RegistryTool
 from mobilerun_agents.agent.tools.helpers import visual_tool_names
-from mobilerun_agents.agent.workflows.core.state import AgentState
-from mobilerun_agents.config.prompts import render_selector_prompt
+from mobilerun_agents.config.prompts import render_prompt
 from mobilerun_agents.config.user_config import DecisionConfig
 
 from .calls import InvalidResponse, Usage, usage_from_response
@@ -64,10 +64,9 @@ class LLMSelector(ActionSelector):
             exclude |= indexed
         tools = run.registry.tools(exclude=exclude, include=run.selection_include)
         by_name = {member.metadata.get_name(): member for member in tools}
-        state = run.state
         data = None if self.vision == "off" else await run.screenshot()
         image = await asyncio.to_thread(prepare_image, run, self._image_limits, data)
-        messages = await self._build_messages(run, state, image, by_name)
+        messages = await self._build_messages(run, image, by_name)
         kwargs: dict[str, Any] = {"stream": run.config.streaming, "timeout": self.config.timeout}
         for tool in tools:
             match tool:
@@ -107,7 +106,7 @@ class LLMSelector(ActionSelector):
             return ActionSelection(abstained=True)
         parsed = self._parse(response)
         if parsed.parse_result and parsed.parse_result.status == ToolCallParseStatus.MALFORMED:
-            parsed.parse_error = render_selector_prompt(self.config.invalid_arguments_prompt)
+            parsed.parse_error = render_prompt(self.config.invalid_arguments_prompt)
         if has_run_tools and not parsed.parse_error:
             for call in parsed.actions:
                 member = by_name.get(call.name)
@@ -126,7 +125,7 @@ class LLMSelector(ActionSelector):
                     )
                     image.to_device(call, member.metadata.fn_schema.model_fields.keys())
                 except (KeyError, ValueError, TypeError):
-                    parsed.parse_error = render_selector_prompt(
+                    parsed.parse_error = render_prompt(
                         self.config.invalid_arguments_prompt
                     )
                     break
@@ -134,9 +133,9 @@ class LLMSelector(ActionSelector):
         return self._to_selection(response, parsed)
 
     async def _build_messages(
-        self, run: Run, state: AgentState, image: ModelImage, names: Mapping[str, BaseTool]
+        self, run: Run, image: ModelImage, names: Mapping[str, BaseTool]
     ) -> list[ChatMessage]:
-        system = render_selector_prompt(
+        system = render_prompt(
             run.config.system_prompt,
             platform=run.device.platform,
             native_tools=self.supports_native_tool_calls,
@@ -152,7 +151,7 @@ class LLMSelector(ActionSelector):
         )
         screen = "" if self.vision == "only" else run.ui.formatted_text
         if image.data:
-            screen = render_selector_prompt(
+            screen = render_prompt(
                 "assets/prompts/llm/model_screen.jinja2",
                 state=screen,
                 screenshot_only=self.vision == "only"
@@ -161,17 +160,21 @@ class LLMSelector(ActionSelector):
                 height=image.height,
                 normalized=image.normalized,
             )
-        text = render_selector_prompt(
+        text = render_prompt(
             self.config.llm_request_prompt,
-            goal=state.goal,
-            memory="",
-            history=[a.model_dump() for a in state.actions[-run.config.context_history_window :]],
             state=screen,
         )
-        user = ChatMessage(role="user", content=text)
+        user = ChatMessage(role="user", content=text or "Current screen unavailable.")
         if image.data:
             user.blocks.append(ImageBlock(image=image.data))
-        return [ChatMessage(role="system", content=system), *await run.history(), user]
+        memory = await run.history()
+        if not self.supports_native_tool_calls or self.native_tool_api == "gemini":
+            # Synthetic tool calls do not have Gemini's provider-issued thought signature.
+            memory = text_messages(memory)
+        system_message = ChatMessage(role="system", content=system)
+        if memory and memory[0].role == "system":
+            system_message.blocks.extend(memory.pop(0).blocks)
+        return [system_message, *memory, user]
 
     @abstractmethod
     async def _achat(self, messages: list[ChatMessage], **kwargs: Any) -> ChatResponse | None: ...

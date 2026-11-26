@@ -16,39 +16,19 @@ def configured_model(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "unit-key")
 
 
-@pytest.mark.parametrize(
-    ("interactive", "answer", "yes", "allowed"),
-    [
-        (False, False, False, False),
-        (True, False, False, False),
-        (True, True, False, True),
-        (False, False, True, True),
-        (True, False, True, True),
-    ],
-)
-def test_cloud_agent_requires_consent_before_connect(
-    monkeypatch, interactive, answer, yes, allowed
-):
+def test_cloud_agent_runs_without_additional_consent(monkeypatch):
     module = importlib.import_module("mobilerun_agents.cli.agent.run")
-    monkeypatch.setattr(menu, "is_interactive", lambda: interactive)
-    prompt = Mock(return_value=answer)
+    prompt = Mock(return_value=True)
     monkeypatch.setattr(safety, "confirm_prompt", prompt)
     connect = AsyncMock(return_value=AsyncMock())
     run = AsyncMock(return_value=SimpleNamespace(success=True, error=None, answer="ok"))
     monkeypatch.setattr(selection, "connect_target", connect)
     monkeypatch.setattr(module.AgentOperator, "execute", run)
-    args = ["run", "goal", "phone-id", "--cloud"] + (["--yes"] if yes else [])
-    result = CliRunner().invoke(agent, args)
-    assert connect.await_count == int(allowed)
-    assert run.await_count == int(allowed)
-    assert result.exit_code == (1 if not interactive and not yes else 0), result.output
-    assert "Interactive prompt failed" not in result.output
-    assert prompt.call_count == int(interactive and not yes)
-    if interactive:
-        assert "may incur charges." in result.output
-    if not interactive and not yes:
-        assert result.exit_code == 1
-        assert "Refusing to run a cloud task without confirmation; pass --yes." in result.output
+    result = CliRunner().invoke(agent, ["run", "goal", "phone-id", "--cloud"])
+    assert connect.await_count == 1
+    assert run.await_count == 1
+    assert result.exit_code == 0, result.output
+    assert prompt.call_count == 0
 
 
 @pytest.mark.parametrize(
@@ -95,16 +75,5 @@ def test_local_agent_does_not_require_consent(monkeypatch):
     run = AsyncMock(return_value=SimpleNamespace(success=True, error=None, answer="ok"))
     monkeypatch.setattr(module.AgentOperator, "execute", run)
     result = CliRunner().invoke(agent, ["run", "goal", "serial", "--android"])
-    assert result.exit_code == 0
-    run.assert_awaited_once()
-
-
-def test_short_yes_option_approves_cloud_run(monkeypatch):
-    module = importlib.import_module("mobilerun_agents.cli.agent.run")
-    monkeypatch.setattr(menu, "is_interactive", lambda: False)
-    monkeypatch.setattr(selection, "connect_target", AsyncMock(return_value=AsyncMock()))
-    run = AsyncMock(return_value=SimpleNamespace(success=True, error=None, answer="ok"))
-    monkeypatch.setattr(module.AgentOperator, "execute", run)
-    result = CliRunner().invoke(agent, ["run", "goal", "phone-id", "--cloud", "-y"])
     assert result.exit_code == 0
     run.assert_awaited_once()

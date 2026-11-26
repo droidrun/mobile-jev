@@ -2,7 +2,7 @@
 
 from collections.abc import Iterable
 
-from mobilerun.macro.models import MACRO_SCHEMA_VERSION
+from mobilerun.macro.models import MACRO_SCHEMA_VERSION, build_screen_snapshot
 from mobilerun.models.context import JSONValue
 
 from mobilerun_agents.agent.logs.redaction import redact_run_arguments, redact_run_value
@@ -36,11 +36,9 @@ def _redact_macro(
     }
 
 
-def macro_data(
-    goal: str, actions_with_guards: Iterable[tuple[ActionRecord, dict[str, JSONValue] | None]]
-) -> dict[str, object]:
+def macro_data(goal: str, records: Iterable[ActionRecord]) -> dict[str, object]:
     actions: list[dict[str, JSONValue]] = []
-    for action, guard in actions_with_guards:
+    for action in records:
         validate_vault_reference(action)
         if not action.ok or not action.replayable:
             continue
@@ -49,5 +47,8 @@ def macro_data(
             if "." in action.name
             else {**action.args, "action_type": action.name}
         )
-        actions.append({**payload, "pre_state": guard})
+        guard = build_screen_snapshot(action.before.ui)
+        # A device without accessible UI must not be asked to match an empty guard.
+        has_evidence = guard["nodes"] or any(guard["phone_state"].values())
+        actions.append({**payload, "pre_state": guard if has_evidence else None})
     return _redact_macro({"description": goal}, actions)

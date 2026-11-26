@@ -13,7 +13,7 @@ from mobilerun.core.extensions import Action
 from mobilerun.core.extensions.actions import Declaration
 
 from mobilerun_agents.agent.run import Run
-from mobilerun_agents.config.prompts import render_selector_prompt
+from mobilerun_agents.config.prompts import render_prompt
 
 from .helpers.usage import IndexedToolMetadata
 
@@ -99,7 +99,7 @@ async def complete(
 @tool
 async def delegate(run: Run) -> None:
     """Ask the delegate model to choose the next action when you need its capabilities."""
-    raise RuntimeError(render_selector_prompt("assets/prompts/tools/action_result.jinja2"))
+    raise RuntimeError(render_prompt("assets/prompts/tools/action_result.jinja2"))
 
 
 class Source(Enum):

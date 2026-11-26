@@ -11,7 +11,6 @@ from filelock import FileLock
 from mobilerun.config.user_config import TelemetryConfig
 from posthog import Posthog
 
-from mobilerun_agents.agent.memory.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.result import AgentResult
 from mobilerun_agents.config.settings import get_agent_settings
 
@@ -71,19 +70,16 @@ class RunAnalytics:
             except Exception:
                 _log.warning("Unable to capture %s", name)
 
-    def on_observe(self, snapshot: StepSnapshot) -> None:
+    def on_observe(self, package: str | None, activity: str | None, step: int) -> None:
         if self._finished or self._client is None:
             return
-        package, activity = snapshot.package, snapshot.activity
         if not package or (package, activity) == self._previous:
             return
         self._previous = package, activity
         self._packages.add(package)
         if activity:
             self._activities.add((package, activity))
-        self._capture(
-            "app_visited", package_name=package, activity_name=activity, step_number=snapshot.step
-        )
+        self._capture("app_visited", package_name=package, activity_name=activity, step_number=step)
 
     async def finish(self, result: AgentResult[T]) -> None:
         if self._finished or self._client is None:

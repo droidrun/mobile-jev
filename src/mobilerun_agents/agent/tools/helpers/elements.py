@@ -8,7 +8,7 @@ from typing import Any
 from mobilerun.core.state.ui_state import UIState
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
-from mobilerun_agents.config.prompts import render_selector_prompt
+from mobilerun_agents.config.prompts import render_prompt
 from mobilerun_agents.config.user_config import DecisionConfig
 
 
@@ -257,7 +257,7 @@ def element_targets(
         options.append(
             (
                 e.index,
-                render_selector_prompt(
+                render_prompt(
                     config.candidate_prompt,
                     kind="element",
                     index=e.index,

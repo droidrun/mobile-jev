@@ -19,7 +19,7 @@ from mobilerun_agents.agent.action_selector.llm.parsing import (
 from mobilerun_agents.agent.logs.diagnostics import Detail, sink
 from mobilerun_agents.agent.run import Run
 from mobilerun_agents.agent.tools.base import RegistryTool
-from mobilerun_agents.config.prompts import render_selector_prompt
+from mobilerun_agents.config.prompts import render_prompt
 from mobilerun_agents.config.user_config import DelegationConfig
 
 
@@ -96,7 +96,7 @@ class DelegatingSelector(ActionSelector):
             ):
                 return self._invalid(
                     selection,
-                    render_selector_prompt(self.config.invalid_prompt, kind="parameters"),
+                    render_prompt(self.config.invalid_prompt, kind="parameters"),
                 )
             finished = next((a for a in actions if a.name == "complete"), None)
             if complete is not None and finished is not None:
@@ -122,7 +122,7 @@ class DelegatingSelector(ActionSelector):
             if completion_reason and len(actions) != 1:
                 return self._invalid(
                     selection,
-                    render_selector_prompt(self.config.invalid_prompt, kind="parameters"),
+                    render_prompt(self.config.invalid_prompt, kind="parameters"),
                 )
         if diagnostic:
             if explicit:
@@ -180,7 +180,7 @@ class DelegatingSelector(ActionSelector):
         if any(call.name == "delegate" for call in selection.actions):
             return self._invalid(
                 selection,
-                render_selector_prompt(self.config.invalid_prompt, kind="recursive"),
+                render_prompt(self.config.invalid_prompt, kind="recursive"),
                 repairable=True,
             )
         return selection

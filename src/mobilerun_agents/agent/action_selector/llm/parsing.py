@@ -13,7 +13,7 @@ from mobilerun.models.context import JSONValue
 from pydantic import FiniteFloat, TypeAdapter, ValidationError
 
 from mobilerun_agents.agent.action_selector.llm.calls import InvalidResponse
-from mobilerun_agents.config.prompts import render_selector_prompt
+from mobilerun_agents.config.prompts import render_prompt
 
 
 class ToolCallParseStatus(str, Enum):
@@ -288,7 +288,7 @@ def coerce_arguments(
         }
     except (ValueError, KeyError):
         raise InvalidResponse(
-            render_selector_prompt("assets/prompts/llm/invalid_arguments.jinja2")
+            render_prompt("assets/prompts/llm/invalid_arguments.jinja2")
         ) from None
 
 
@@ -315,7 +315,7 @@ def _to_tool_call(block: ToolCallBlock) -> ToolCall:
     except ValidationError:
         return ToolCall(
             name=name,
-            error=render_selector_prompt("assets/prompts/llm/invalid_arguments.jinja2"),
+            error=render_prompt("assets/prompts/llm/invalid_arguments.jinja2"),
             call_id=call_id,
         )
     return ToolCall(name=name, parameters=parameters, call_id=call_id)

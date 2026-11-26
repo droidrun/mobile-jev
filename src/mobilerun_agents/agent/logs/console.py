@@ -13,7 +13,7 @@ from typing import Any
 from workflows.events import Event
 
 from mobilerun_agents.agent.workflows.core.result import AgentResult
-from mobilerun_agents.agent.workflows.core.state import ActionRecord
+from mobilerun_agents.agent.workflows.core.state import ActionOutcome
 from mobilerun_agents.errors import SelectorCannotServe, UnknownModel
 
 from .diagnostics import ActionDetail, Detail, ModelCall, Retry, Screen, private_values
@@ -138,7 +138,7 @@ class ConsoleLog:
         # Parse errors can contain the raw model response and tool parameters.
         _LOGGER.info("Retrying invalid selection", extra={"color": "dim"})
 
-    def on_action(self, record: ActionRecord, delegated: bool = False) -> None:
+    def on_action(self, record: ActionOutcome, delegated: bool = False) -> None:
         if self._step != record.step:
             self.flush_step()
         self._step = record.step
@@ -166,9 +166,10 @@ class ConsoleLog:
             if isinstance(text, str):
                 detail = f' "{_safe(text, 40)}"'
         self._delegated |= delegated
-        self._actions.append(
-            (f"{_safe(record.name)}{detail} {'✓' if record.ok else '✗'}", self._details)
-        )
+        status = "✓" if record.ok else "✗"
+        if record.screen_changed is False:
+            status += " · no change"
+        self._actions.append((f"{_safe(record.name)}{detail} {status}", self._details))
         self._details = []
 
     def on_subgoal(self, text: str) -> None:
@@ -190,12 +191,23 @@ class ConsoleLog:
         self._details.clear()
 
     def on_result(
-        self, result: AgentResult[Any], folder: str | None = None, macro_path: Path | None = None
+        self,
+        result: AgentResult[Any],
+        folder: str | None = None,
+        macro_path: Path | None = None,
+        images_folder: Path | None = None,
     ) -> None:
         message = result.reason
         if result.answer and (result.success or result.reason == "complete"):
             message = result.answer
-        self._finish(result.success, message, result.steps, folder, macro_path=macro_path)
+        self._finish(
+            result.success,
+            message,
+            result.steps,
+            folder,
+            macro_path=macro_path,
+            images_folder=images_folder,
+        )
 
     def on_error(self, error: BaseException, steps: int, folder: str | None = None) -> None:
         # Provider exceptions can include full requests; never log their raw text.
@@ -217,6 +229,7 @@ class ConsoleLog:
         steps: int,
         folder: str | None,
         macro_path: Path | None = None,
+        images_folder: Path | None = None,
     ) -> None:
         self.flush_step()
         display_folder = _display_path(folder) if folder else None
@@ -231,6 +244,8 @@ class ConsoleLog:
             )
             if macro_path is not None:
                 _LOGGER.debug("  macro: %s", _display_path(macro_path))
+            if images_folder is not None:
+                _LOGGER.debug("  images folder: %s", _display_path(images_folder))
         _LOGGER.info(
             "%s %s (%s %s%s)",
             "✓" if success else "✗",

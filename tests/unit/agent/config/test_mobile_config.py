@@ -5,7 +5,7 @@ from pydantic import ValidationError
 
 from mobilerun_agents.agent.action_selector.llm.models import MODELS
 from mobilerun_agents.config.loader import ConfigLoader
-from mobilerun_agents.config.user_config import PROVIDER_KINDS, MobileConfig
+from mobilerun_agents.config.user_config import PROVIDER_KINDS, MobileConfig, OldConfigKeys
 
 
 def test_llm_profiles_validate_the_same_providers_the_loader_supports():
@@ -15,13 +15,22 @@ def test_llm_profiles_validate_the_same_providers_the_loader_supports():
 def test_clean_config_round_trip(tmp_path):
     path = tmp_path / "agent.yaml"
     path.write_text(
-        "agent: {max_steps: 7}\ncheckpoints: {folder: runs}\nmemory: {token_limit: 9000}\n"
+        "agent: {max_steps: 7}\ncheckpoints: {enabled: true}\nmemory: {token_limit: 9000}\n"
     )
     config = ConfigLoader.load(str(path))
     assert config.agent.max_steps == 7 and config.memory.token_limit == 9000
-    assert str(config.checkpoints.folder) == "runs"
+    assert config.checkpoints.enabled
     assert config.profiles == {} and config.setups == {} and config.default_setup is None
     assert MobileConfig.model_validate(config.model_dump(mode="json")) == config
+
+
+def test_rejects_removed_checkpoints_folder_with_replacement(tmp_path):
+    path = tmp_path / "agents.yaml"
+    path.write_text("checkpoints: {enabled: true, folder: old-runs}\n")
+    with pytest.raises(
+        OldConfigKeys, match=r"old keys.*checkpoints\.folder.*MOBILERUN_AGENT_RUNS_DIR"
+    ):
+        ConfigLoader.load(str(path))
 
 
 def test_run_budgets():
@@ -30,6 +39,25 @@ def test_run_budgets():
     assert config.planning_max_steps == 40
     assert config.decision.timeout == 120
     assert config.workflow_timeout is None
+
+
+@pytest.mark.parametrize("value", [None, "", "override"])
+def test_agent_output_directories_resolve_at_run_time(monkeypatch, tmp_path, value):
+    from mobilerun_agents.config.settings import get_agent_settings
+
+    monkeypatch.setenv("MOBILERUN_USER_CONFIG_DIR", str(tmp_path / "base"))
+    for env, name in [
+        ("MOBILERUN_AGENT_RUNS_DIR", "runs"),
+        ("MOBILERUN_AGENT_IMAGES_DIR", "images"),
+    ]:
+        if value is None:
+            monkeypatch.delenv(env, raising=False)
+        else:
+            monkeypatch.setenv(env, str(tmp_path / name) if value else "")
+        assert (
+            getattr(get_agent_settings(), f"{name}_dir")
+            == (tmp_path if value else tmp_path / "base") / name
+        )
 
 
 def test_scoped_config_is_nested_and_task_local():
@@ -100,7 +128,7 @@ def test_agent_assets_do_not_fall_back_to_the_base_package(tmp_path, monkeypatch
         resolve_prompt_path("assets/skills/README.md")
 
 
-def test_local_prompt_overrides_the_bundled_default(tmp_path, monkeypatch):
+def test_cwd_prompt_does_not_override_bundled_default(tmp_path, monkeypatch):
     from mobilerun_agents.config.paths import resolve_prompt_path
 
     monkeypatch.chdir(tmp_path)
@@ -108,5 +136,37 @@ def test_local_prompt_overrides_the_bundled_default(tmp_path, monkeypatch):
     local = tmp_path / asset
     local.parent.mkdir(parents=True)
     local.write_text("Local prompt")
-    assert resolve_prompt_path(asset) == local
+    assert resolve_prompt_path(asset) != local
     assert resolve_prompt_path(local) == local
+
+
+def test_missing_relative_prompt_does_not_resolve_from_cwd(tmp_path, monkeypatch):
+    from mobilerun_agents.config.paths import resolve_prompt_path
+
+    monkeypatch.chdir(tmp_path)
+    local = tmp_path / "custom.jinja2"
+    local.write_text("Local prompt")
+    with pytest.raises(FileNotFoundError):
+        resolve_prompt_path("custom.jinja2")
+
+
+def test_render_prompt_caches_compiled_template(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from mobilerun_agents.config.prompts import render_prompt
+
+    prompt = tmp_path / "custom.jinja2"
+    prompt.write_text("Hello {{ name }}")
+    read_text = Path.read_text
+    reads = 0
+
+    def counted_read_text(path, *args, **kwargs):
+        nonlocal reads
+        if path == prompt:
+            reads += 1
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counted_read_text)
+    assert render_prompt(str(prompt), name="one") == "Hello one"
+    assert render_prompt(str(prompt), name="two") == "Hello two"
+    assert reads == 1

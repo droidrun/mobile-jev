@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 from mobilerun.core.state.ui_state import UIState
 
 from mobilerun_agents import ToolRegistry
+from mobilerun_agents.agent.memory.messages import text_messages
 from mobilerun_agents.agent.workflows.core.state import AgentState
 from mobilerun_agents.config.user_config import AgentConfig
 from tests.unit.device_fixtures import tool_run
@@ -28,8 +29,7 @@ async def captured_turn(run):
     state = run.state
     return SimpleNamespace(
         goal=state.goal,
-        history=list(state.actions),
-        memory="\n".join(m.content or "" for m in await run.history()),
+        memory="\n".join(m.content or "" for m in text_messages(await run.history())),
         by_name={
             tool.metadata.get_name(): tool
             for tool in run.registry.tools(run.selection_exclude, run.selection_include)

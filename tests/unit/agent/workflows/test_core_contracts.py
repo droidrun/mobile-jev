@@ -1,8 +1,9 @@
+from mobilerun.core.state.ui_state import UIState
 from pydantic import BaseModel
 
 from mobilerun_agents.agent.action_selector.base import ActionSelection
-from mobilerun_agents.agent.memory.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.result import AgentResult
+from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.state import ActionRecord, AgentState
 from mobilerun_agents.agent.workflows.events import (
     Act,
@@ -26,11 +27,15 @@ def test_core_contracts():
         args={"index": 3},
         ok=True,
         summary="ok",
-        screenshot=None,
-        ui_state=None,
+        before=StepSnapshot(
+            goal="count", step=1, ui=UIState([], "", "", {}, 0, 0), device_context=[]
+        ),
     )
     state = AgentState(goal="count", actions=[record])
-    assert AgentState.model_validate_json(state.model_dump_json()) == state
+    assert (
+        AgentState.model_validate_json(state.model_dump_json()).model_dump_json()
+        == state.model_dump_json()
+    )
     result = AgentResult[Answer](
         success=True, reason="done", answer="three", output=Answer(count=3), steps=1
     )
@@ -38,13 +43,10 @@ def test_core_contracts():
     snapshot = StepSnapshot(
         goal="count",
         step=1,
-        last_actions=[record],
-        package=None,
-        activity=None,
-        ui_elements=[],
+        ui=UIState([], "", "", {}, 0, 0),
         device_context=[],
     )
-    assert Select(snapshot=snapshot).snapshot == snapshot
+    assert snapshot.fingerprint[1] == "" and Select() is not None
     assert Act(selection=ActionSelection()).selection.actions == []
     assert Done(result=result).result.answer == "three"
     assert Invalid(error="bad").error == "bad"

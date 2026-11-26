@@ -17,7 +17,13 @@ from workflows.errors import WorkflowCancelledByUser
 from mobilerun_agents.agent.action_selector.base import ActionSelection, ActionSelector
 from mobilerun_agents.agent.action_selector.llm.parsing import ToolCall
 from mobilerun_agents.agent.workflows.agent import AgentWorkflow
-from mobilerun_agents.agent.workflows.events import Act, Invalid, Select, StepFinished, UserMessage
+from mobilerun_agents.agent.workflows.events import (
+    Act,
+    Invalid,
+    Observed,
+    StepFinished,
+    UserMessage,
+)
 from tests.unit.agent.selector_fixtures import captured_turn
 from tests.unit.device_fixtures import MemoryDevice
 
@@ -63,6 +69,299 @@ class Selector(ActionSelector):
 
 
 @pytest.mark.anyio
+async def test_screenshots_are_path_only_and_temporary_store_is_cleaned():
+    from datetime import timedelta
+
+    from mobilerun_agents.agent.memory.memory import SnapshotBlock, build_memory
+    from mobilerun_agents.config.user_config import MemoryConfig
+
+    seen = []
+
+    class Inspect(SnapshotBlock):
+        name: str = "inspect_snapshot"
+
+        async def render(self, snapshot):
+            seen.append(snapshot)
+            assert snapshot.ui.elements
+            assert snapshot.screenshot is None  # The model sees bytes before disk persistence.
+            return ""
+
+    class CaptureSelector(Selector):
+        async def select(self, run):
+            await run.screenshot()
+            await run.screenshot()
+            assert run.snapshot.screenshot is None
+            return await super().select(run)
+
+    args = await resources()
+    args["device"].screenshot = AsyncMock(return_value=b"fake-png")
+    flow = AgentWorkflow(CaptureSelector(ToolCall("tap_element", {"index": 3}), complete()))
+    handler = flow.run(**args, memory_factory=lambda: build_memory(MemoryConfig(), [Inspect()]))
+    events = [event async for event in handler.stream_events()]
+    assert (await handler).success
+    state = await handler.ctx.store.get_state()
+    first, last = (record.before for record in state.actions)
+    assert first.at.utcoffset() == last.at.utcoffset() == timedelta(0)
+    assert first.at <= last.at
+    assert [item.fingerprint for item in seen] == [first.fingerprint, last.fingerprint]
+    assert first.screenshot.image is last.screenshot.image is None
+    assert not first.screenshot.path.parent.exists()
+    assert args["device"].screenshot.await_count == 2
+    assert "fake-png" not in repr(events)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("end", ["error", "cancel", "protected", "long"])
+async def test_run_image_lifetime_is_bounded(monkeypatch, tmp_path, end):
+    from mobilerun_agents.agent.logs.redaction import protect_run_value
+    from mobilerun_agents.config.user_config import ToolsConfig
+
+    images_dir = tmp_path / "test-images"
+    monkeypatch.setenv("MOBILERUN_AGENT_IMAGES_DIR", str(images_dir))
+    started = asyncio.Event()
+    args = await resources()
+    phone = args["device"]
+    phone.screenshot = AsyncMock(return_value=b"fake-png")
+    provider = phone.state._resolved_provider
+    turn = 0
+
+    class TestSelector(ActionSelector):
+        async def select(self, run):
+            nonlocal turn
+            turn += 1
+            if end == "protected":
+                protect_run_value("synthetic-protected-screen")
+            assert await run.screenshot() == await run.screenshot() == b"fake-png"
+            assert run.snapshot.screenshot is None
+            started.set()
+            if end == "cancel":
+                await asyncio.Future()
+            if end == "error":
+                raise ValueError("fake failure")
+            if end != "long" or turn == 20:
+                return ActionSelection(actions=[complete()])
+            provider.get_state.return_value = UIState(
+                [{"index": 3, "text": f"turn {turn}"}], "screen", "", {}, 100, 100
+            )
+            return ActionSelection(actions=[ToolCall("wait")])
+
+    args["tool_config"] = ToolsConfig(wait_duration=0.001)
+    handler = AgentWorkflow(TestSelector()).run(**args)
+    await asyncio.wait_for(started.wait(), 5)
+    if end == "cancel":
+        await handler.cancel_run()
+    elif end == "error":
+        with pytest.raises(ValueError, match="fake failure"):
+            await handler
+    else:
+        assert (await handler).success
+        state = await handler.ctx.store.get_state()
+        assert len(state.actions) == turn
+        assert all(r.before.screenshot.image is None for r in state.actions if r.before.screenshot)
+        assert "fake-png" not in str(handler.ctx.to_dict())
+    assert not images_dir.exists() or not list(images_dir.iterdir())
+
+
+@pytest.mark.anyio
+async def test_late_screenshot_protection_never_saves_current_image(monkeypatch, tmp_path):
+    from mobilerun_agents.agent.logs.redaction import protect_run_value
+    from mobilerun_agents.agent.tools.helpers.images import ImageStore
+    from mobilerun_agents.agent.workflows.resources import active_images, trace_image
+
+    monkeypatch.setenv("MOBILERUN_AGENT_IMAGES_DIR", str(tmp_path / "images"))
+    store = ImageStore("test", keep=True)
+    writes, traces = [], []
+    save = store.save
+
+    def track(data):
+        writes.append(data)
+        return save(data)
+
+    monkeypatch.setattr(store, "save", track)
+    marker = "fake-sensitive-value"
+
+    class Visual(Selector):
+        async def select(self, run):
+            data = await run.screenshot()
+            if run.snapshot.step == 2:
+                protect_run_value(marker)
+            selection = await super().select(run)
+            assert data in (b"prior", b"protected")
+            return selection
+
+    args = await resources()
+    args["device"].screenshot = AsyncMock(side_effect=[b"prior", b"protected"])
+    image_token = active_images.set(store)
+    trace_token = trace_image.set(traces.append)
+    try:
+        handler = AgentWorkflow(Visual(ToolCall("tap_element", {"index": 3}), complete())).run(**args)
+        assert (await handler).success
+    finally:
+        trace_image.reset(trace_token)
+        active_images.reset(image_token)
+    assert writes == traces == [b"prior"]
+    assert not list(store.folder.glob("*.png"))
+    assert all(record.before.screenshot is None for record in (await handler.ctx.store.get_state()).actions)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["default", "planning", "overflow"])
+async def test_native_memory_keeps_complete_turns(mode, record_property):
+    import re
+
+    from llama_index.core.storage.chat_store.base_db import MessageStatus
+    from llama_index.core.utils import get_tokenizer
+
+    from mobilerun_agents.agent.action_selector import LlamaIndexLLMSelector
+    from mobilerun_agents.agent.memory.memory import build_memory
+    from mobilerun_agents.agent.memory.messages import text_messages
+    from mobilerun_agents.config.user_config import AgentConfig, MemoryConfig
+    from tests.unit.agent.workflows.test_planning import PlannerLLM
+
+    args = await resources()
+    phone = args["device"]
+    phone._supported_operations = frozenset({"open_url"})
+    provider = phone.state._resolved_provider
+
+    async def open_url(url: str) -> None:
+        provider.get_state.return_value = UIState(
+            [{"index": 3, "text": url}], "CURRENT_SCREEN_ONLY", "", {}, 100, 100
+        )
+
+    phone.open_url = open_url
+    config = AgentConfig(streaming=False)
+    cap = {"default": config.max_steps, "planning": config.planning.subgoal_steps, "overflow": 61}[
+        mode
+    ]
+    calls = [("open_url", {"url": f"https://example.invalid/{i}"}) for i in range(cap - 1)]
+    llm = PlannerLLM(*calls, ("complete", complete().parameters))
+    flow = AgentWorkflow(LlamaIndexLLMSelector(llm, vision="off", native_tool_api="responses"))
+    memory = build_memory(
+        MemoryConfig(token_limit=280) if mode == "overflow" else MemoryConfig(), []
+    )
+    result = await flow.run(
+        **args,
+        max_steps=cap,
+        config=config,
+        memory_factory=lambda: memory,
+    )
+    assert result.success
+    messages, _ = llm._turns[-1]
+    text = "\n".join(message.content or "" for message in messages)
+    steps = set(map(int, re.findall(r"(?m)^(\d+) · open_url", text)))
+    archived = await memory.aget_all(status=MessageStatus.ARCHIVED)
+    if mode == "overflow":
+        assert archived and 1 not in steps and cap - 1 in steps
+    else:
+        assert not archived and steps == set(range(1, cap))
+        turn = (await memory.aget_all())[:3]
+        assert "Thought: Review progress." in turn[-1].content
+        tokens = len(
+            get_tokenizer()("\n".join(f"{m.role.value}: {m.content}" for m in text_messages(turn)))
+        )
+        record_property("measured_step_tokens", tokens)
+        assert cap * tokens < memory.token_limit * memory.chat_history_token_ratio
+    assert any(message.role == "tool" for message in messages)
+    for request, _ in llm._turns:
+        assert request[1].role == "user"
+        for index, message in enumerate(request):
+            if message.role == "tool":
+                assert (
+                    request[index - 1].blocks[0].tool_call_id
+                    == message.additional_kwargs["tool_call_id"]
+                )
+            elif message.role == "assistant":
+                assert request[index + 1].role == "tool"
+    assert "screen changed: yes" in text
+    assert "<history>" not in text and text.count("CURRENT_SCREEN_ONLY") == 1
+
+
+@pytest.mark.anyio
+async def test_no_progress_counts_alternating_actions_and_reports_unchanged(caplog):
+    from mobilerun_agents.agent.logs.console import ConsoleLog
+    from mobilerun_agents.config.user_config import ToolsConfig
+
+    tap = ToolCall("tap_element", {"index": 3})
+    wait = ToolCall("wait")
+    selector = Selector(tap, wait, tap, wait, tap, complete())
+    flow = AgentWorkflow(selector)
+    handler = flow.run(**await resources(), tool_config=ToolsConfig(wait_duration=0.001))
+    caplog.set_level("INFO", logger="mobilerun_agents.agent.logs.console")
+    console = ConsoleLog()
+    records = []
+    async for event in handler.stream_events():
+        if type(event) is StepFinished:
+            records.append(event.action)
+            console.on_action(event.display_action)
+    console.flush_step()
+    result = await handler
+
+    assert (result.reason, result.steps) == ("stuck", 5)
+    assert [record.screen_changed for record in records] == [False] * 5
+    assert "screen unchanged after this action (the element may be disabled or not respond)" in (
+        selector.requests[1].memory
+    )
+    assert "3 consecutive actions" not in selector.requests[2].memory
+    assert "3 consecutive actions" in selector.requests[3].memory
+    assert "<repeat>" in selector.requests[3].memory
+    assert caplog.text.count("✓ · no change") == 5
+
+
+@pytest.mark.anyio
+async def test_revisit_memory_shows_last_action_only_and_masks_public_output(caplog):
+    from mobilerun_agents.agent.logs.diagnostics import private_values
+    from mobilerun_agents.agent.logs.redaction import protect_run_value
+
+    args = await resources()
+    phone = args["device"]
+    provider = phone.state._resolved_provider
+    secret_label = "test-private-screen-label"
+    first = UIState(
+        [{"index": 3, "text": secret_label, "bounds": "0,0,20,20"}], secret_label, "", {}, 100, 100
+    )
+    second = UIState(
+        [{"index": 3, "text": "second", "bounds": "0,0,20,20"}], "second", "", {}, 100, 100
+    )
+    provider.get_state.return_value = first
+
+    async def tap(*args):
+        provider.get_state.return_value = (
+            second if provider.get_state.return_value is first else first
+        )
+
+    phone.tapped.side_effect = tap
+
+    class MaskedSelector(Selector):
+        async def select(self, run):
+            protect_run_value(secret_label)
+            return await super().select(run)
+
+    selector = MaskedSelector(
+        ToolCall("tap_element", {"index": 3}), ToolCall("tap_element", {"index": 3}), complete()
+    )
+    token = private_values.set({secret_label})
+    try:
+        handler = AgentWorkflow(selector).run(**args)
+        events = [event async for event in handler.stream_events()]
+        assert (await handler).success
+        state = await handler.ctx.store.get_state()
+    finally:
+        private_values.reset(token)
+    assert all("Last action here" not in req.memory for req in selector.requests[:2])
+    assert (
+        f'Last action here: tap_element [3] "{secret_label}" ✓ · screen changed.'
+        in selector.requests[2].memory
+    )
+    assert "screen at step 2" not in selector.requests[2].memory
+    first_record, second_record, last_record = state.actions
+    assert first_record.before.fingerprint == last_record.before.fingerprint
+    assert first_record.before.fingerprint != second_record.before.fingerprint
+    assert first_record.screen_changed is second_record.screen_changed is True
+    assert {":".join(record.before.fingerprint) for record in state.actions} == set(state.screens)
+    assert secret_label not in repr(events) and secret_label not in caplog.text
+
+
+@pytest.mark.anyio
 async def test_unchanged_wait_forces_delegation_despite_high_confidence():
     from mobilerun_agents.agent.action_selector import DecisionSelector, DelegatingSelector
     from mobilerun_agents.agent.action_selector.decision_model.base import Decision
@@ -88,10 +387,7 @@ async def test_unchanged_wait_forces_delegation_despite_high_confidence():
     result = await flow.run(**await resources(), tool_config=ToolsConfig(wait_duration=0.001))
     assert result.success and result.steps == 3 and primary.calls == 2
     [request] = delegate.requests
-    assert (
-        "wait" not in request.by_name
-        and "wait repeated 2 times, screen unchanged" in request.memory
-    )
+    assert "wait" not in request.by_name and "wait repeated 2×, screen unchanged" in request.memory
 
 
 @pytest.mark.anyio
@@ -137,7 +433,7 @@ async def test_llm_guard_hides_wait_and_repairs_a_repeat():
     messages, tools = llm._turns[2]
     assert "wait" not in {tool.metadata.get_name() for tool in tools}
     assert any(
-        "wait repeated 2 times, screen unchanged; try something else" in (msg.content or "")
+        "wait repeated 2×, screen unchanged — try something else" in (msg.content or "")
         for msg in messages
     )
     assert sum(isinstance(event, Invalid) for event in events) == 1
@@ -276,7 +572,9 @@ async def test_malformed_call_does_not_echo_private_arguments_in_stream():
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("record_first", [False, True])
-async def test_recorder_primitive_cannot_replay_a_tracked_secret(tmp_path, record_first):
+async def test_recorder_primitive_cannot_replay_a_tracked_secret(
+    tmp_path, record_first, monkeypatch
+):
     from mobilerun_agents import Run, tool
     from mobilerun_agents.agent.operators._consumers import RunConsumers
     from mobilerun_agents.config.user_config import MobileConfig
@@ -298,7 +596,7 @@ async def test_recorder_primitive_cannot_replay_a_tracked_secret(tmp_path, recor
     config = MobileConfig()
     config.analytics.enabled = config.tracing.enabled = False
     config.checkpoints.enabled = True
-    config.checkpoints.folder = tmp_path / "runs"
+    monkeypatch.setenv("MOBILERUN_AGENT_RUNS_DIR", str(tmp_path / "runs"))
     consumers = RunConsumers(config, "privacy-test", 3)
     assert consumers.recorder is not None
     consumers.recorder.macro_path = tmp_path / "macro.json"
@@ -321,7 +619,9 @@ async def test_recorder_primitive_cannot_replay_a_tracked_secret(tmp_path, recor
     if not record_first:
         assert streamed.args == {"url": "https://example.invalid/***"}
         assert not streamed.replayable
-        assert next(a for a in state.actions if a.name == "open_url") == streamed
+        assert next(a for a in state.actions if a.name == "open_url").args == {
+            "url": f"https://example.invalid/{private}"
+        }
 
 
 @pytest.mark.anyio
@@ -387,14 +687,14 @@ async def test_full_run_stream_and_checkpoint():
     events = [e async for e in handler.stream_events()]
     result = await handler
     assert result.success and result.output == Output(count=2) and result.steps == 2
-    assert [type(e) for e in events if isinstance(e, (Select, StepFinished))] == [
-        Select,
+    assert [type(e) for e in events if isinstance(e, (Observed, StepFinished))] == [
+        Observed,
         StepFinished,
-        Select,
+        Observed,
         StepFinished,
     ]
     args["device"].tapped.assert_awaited_once_with(10, 20)
-    assert next(e for e in events if isinstance(e, Select)).screenshot is None
+    assert not hasattr(next(e for e in events if isinstance(e, StepFinished)).action, "before")
     first = next(e.action for e in events if isinstance(e, StepFinished))
     assert first.name == "tap" and first.args == {"x": 10, "y": 20}
     restored = Context.from_dict(flow, handler.ctx.to_dict())
@@ -453,7 +753,7 @@ async def test_failed_plain_text_action_is_visible_but_not_replayed(error):
     assert [(a.name, a.ok) for a in actions[:-1]] == [("input_text", False)]
     assert actions[0].args["text"] == "hello"
     assert not any("ok" in a.args for a in actions)
-    macro = macro_data(args["goal"], ((e.action, e.pre_state) for e in events))
+    macro = macro_data(args["goal"], (e.action for e in events))
     assert macro["actions"] == []
 
 
@@ -499,10 +799,10 @@ async def test_user_message_is_visible_next_turn():
 @pytest.mark.anyio
 async def test_setup_default_and_concurrent_runs(monkeypatch):
     from mobilerun_agents.agent.action_selector.loader import SetupSpec
-    from mobilerun_agents.agent.workflows import resources as workflow_resources
+    from mobilerun_agents.agent.workflows import agent as workflow_agent
 
     factory_mock = AsyncMock(side_effect=lambda: SetupSpec(selector=Selector(complete())))
-    monkeypatch.setattr(workflow_resources, "default_setup", factory_mock)
+    monkeypatch.setattr(workflow_agent, "default_setup", factory_mock)
     flow = AgentWorkflow()
     a, b = await resources(), await resources()
     b["goal"] = "other run"
@@ -515,16 +815,20 @@ async def test_setup_default_and_concurrent_runs(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_run_resource_is_per_invocation_and_state_is_detached():
+@pytest.mark.parametrize("supply_manager", [False, True])
+async def test_device_and_memory_resources_are_per_invocation_and_state_is_detached(supply_manager):
+    from workflows.resource import ResourceManager
+
     from mobilerun_agents import Run, tool
 
     seen = {}
+    histories = {}
 
     @tool
-    async def inspect_run(run: Run) -> str:
+    async def inspect_run(run: Run, value: str) -> str:
         """Verify the resource used for dispatch."""
         assert run is seen[run.state.goal]
-        return "ok"
+        return value
 
     class Inspect(ActionSelector):
         async def select(self, run):
@@ -533,21 +837,99 @@ async def test_run_resource_is_per_invocation_and_state_is_detached():
             assert seen.setdefault(state.goal, run) is run
             state.notes.append("not persisted")
             state.goal = "changed locally"
-            return ActionSelection(actions=[complete() if state.step else ToolCall("inspect_run")])
+            if state.step:
+                histories[run.state.goal] = "\n".join(m.content or "" for m in await run.history())
+                return ActionSelection(actions=[complete()])
+            return ActionSelection(
+                actions=[ToolCall("inspect_run", {"value": f"message:{run.state.goal}"})]
+            )
 
     from mobilerun_agents.agent.tools.base import complete as finish_tool
 
-    flow = AgentWorkflow(Inspect())
+    options = {"resource_manager": ResourceManager()} if supply_manager else {}
+    flow = AgentWorkflow(Inspect(), **options)
     args = await resources()
     first = flow.run(**args, tools=[inspect_run, finish_tool])
-    second = flow.run(**{**args, "goal": "second"}, tools=[inspect_run, finish_tool])
+    second = flow.run(**{**await resources(), "goal": "second"}, tools=[inspect_run, finish_tool])
     assert all(result.success for result in await asyncio.gather(first, second))
-    assert seen["count items"] is not seen["second"]
+    assert seen["count items"].device is not seen["second"].device
+    assert seen["count items"].memory is not seen["second"].memory
+    assert (
+        "message:count items" in histories["count items"]
+        and "message:second" not in histories["count items"]
+    )
+    assert (
+        "message:second" in histories["second"] and "message:count items" not in histories["second"]
+    )
     for handler in (first, second):
         checkpoint = json.dumps(handler.ctx.to_dict())
         assert "not persisted" not in checkpoint and "agent.run" not in checkpoint
         restored = Context.from_dict(flow, json.loads(checkpoint))
         assert (await restored.store.get_state()).goal in seen
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("field", ["focused_text", "focused_element", "missing"])
+async def test_screen_progress_requires_a_comparable_observation(field):
+    from mobilerun_agents.config.user_config import ToolsConfig
+
+    args = await resources()
+    provider = args["device"].state._resolved_provider
+    n = 0
+
+    async def screen():
+        nonlocal n
+        n += 1
+        return UIState(
+            [] if field == "missing" else [{"index": 3}],
+            "screen",
+            f"typed {n}" if field == "focused_text" else "",
+            {"focusedElement": {"index": n}} if field == "focused_element" else {},
+            100,
+            100,
+        )
+
+    provider.get_state.side_effect = screen
+    wait = ToolCall("wait")
+    flow = AgentWorkflow(Selector(*([wait] * 5), complete()))
+    handler = flow.run(**args, tool_config=ToolsConfig(wait_duration=0.001))
+    records = [
+        event.action async for event in handler.stream_events() if type(event) is StepFinished
+    ]
+    assert (await handler).reason == "complete"
+    assert [record.screen_changed for record in records[:-1]] == [
+        None if field == "missing" else True
+    ] * 5
+
+
+@pytest.mark.anyio
+async def test_macro_retains_successful_primitive_from_failed_compound_tool():
+    from mobilerun_agents import Run, tool
+    from mobilerun_agents.agent.checkpoints.macro_export import macro_data
+    from mobilerun_agents.agent.tools.base import ActionResult
+
+    @tool
+    async def partial(run: Run) -> ActionResult:
+        """Record a successful tap then report that the next operation failed."""
+        await run.device.tap(10, 20)
+        run.macro_recorder.record_action({"action_type": "tap", "x": 10, "y": 20})
+        run.macro_recorder.record_action(
+            {"action_type": "input_text", "text": "not entered", "ok": False}
+        )
+        return ActionResult(False, "second operation failed")
+
+    args = await resources()
+    flow = AgentWorkflow(Selector(ToolCall("partial"), complete()))
+    handler = flow.run(**args, tools=[partial])
+    finished = [event async for event in handler.stream_events() if type(event) is StepFinished]
+    assert (await handler).success
+    args["device"].tapped.assert_awaited_once_with(10, 20)
+    assert finished[0].display_action.ok is False
+    state = await handler.ctx.store.get_state()
+    actions = macro_data(state.goal, state.actions)["actions"]
+    assert [(action["action_type"], action["x"], action["y"]) for action in actions] == [
+        ("tap", 10, 20)
+    ]
 
 
 @pytest.mark.anyio
@@ -747,11 +1129,10 @@ async def test_notes_round_trip_in_workflow_state():
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("reason", ["complete", "max_steps"])
-async def test_private_notes_stay_raw_for_model_and_callback_but_not_in_context(reason):
+async def test_private_run_record_round_trips_raw_without_exposing_public_events(reason):
     from mobilerun_agents import Run, tool
 
     secret = "FAKE password / test=84927"
-    reported = []
 
     @tool(sensitive_parameters=frozenset({"token"}))
     async def confidential(run: Run, token: str) -> None:
@@ -769,20 +1150,25 @@ async def test_private_notes_stay_raw_for_model_and_callback_but_not_in_context(
 
     private = ToolCall("confidential", {"token": secret})
     selector = Notes(private, complete() if reason == "complete" else private)
-    handler = AgentWorkflow(selector).run(
-        **await resources(), tools=[confidential], max_steps=2, report_notes=reported.append
-    )
+    flow = AgentWorkflow(selector)
+    args = await resources()
+    args["goal"] = f"Use {secret}"
+    handler = flow.run(**args, tools=[confidential], max_steps=2)
     events = [event async for event in handler.stream_events()]
     assert (await handler).reason == reason
-    assert reported == [(f"raw {secret}", f"later {secret}")]
     assert f"raw {secret}" in selector.requests[1].memory
+    assert selector.requests[1].goal == f"Use {secret}"
+    assert f'"token": "{secret}"' in selector.requests[1].memory
     assert secret not in repr(events)
-    assert secret not in json.dumps(handler.ctx.to_dict())
-    assert (await handler.ctx.store.get_state()).notes == ["raw ***", "later ***"]
+    restored = Context.from_dict(flow, handler.ctx.to_dict())
+    state = await restored.store.get_state()
+    assert state.goal == f"Use {secret}"
+    assert state.notes == [f"raw {secret}", f"later {secret}"]
+    assert state.actions[0].args == {"token": secret}
 
 
 @pytest.mark.anyio
-async def test_inflight_sensitive_tool_argument_is_not_serialized():
+async def test_inflight_sensitive_tool_argument_is_serialized_only_in_internal_context():
     from mobilerun_agents import Run, tool
 
     entered = asyncio.Event()
@@ -805,16 +1191,14 @@ async def test_inflight_sensitive_tool_argument_is_not_serialized():
     finally:
         release.set()
     assert (await handler).success and received == [marker]
-    assert inflight["workers"] and marker not in json.dumps(inflight)
-    assert marker not in json.dumps(handler.ctx.to_dict())
+    assert inflight["workers"] and marker in json.dumps(inflight)
+    assert marker in json.dumps(handler.ctx.to_dict())
 
 
 @pytest.mark.anyio
-async def test_pending_repair_error_is_masked_but_model_gets_raw_feedback(monkeypatch):
+async def test_pending_repair_error_is_masked_but_model_gets_raw_feedback():
     from mobilerun_agents import Run, tool
 
-    entered = asyncio.Event()
-    release = asyncio.Event()
     marker = "FAKE_REPAIR_942691"
 
     @tool(sensitive_parameters=frozenset({"token"}))
@@ -830,24 +1214,11 @@ async def test_pending_repair_error_is_masked_but_model_gets_raw_feedback(monkey
 
     selector = Repairing(ToolCall("authorize", {"token": marker}), complete(), complete())
     flow = AgentWorkflow(selector)
-    remember = Run.remember
-
-    async def pause_repair(self, message):
-        if message.role == "user" and "Invalid value" in (message.content or ""):
-            entered.set()
-            await release.wait()
-        await remember(self, message)
-
-    monkeypatch.setattr(Run, "remember", pause_repair)
     handler = flow.run(**await resources(), tools=[authorize])
-    try:
-        await asyncio.wait_for(entered.wait(), timeout=5)
-        inflight = handler.ctx.to_dict()
-    finally:
-        release.set()
+    errors = [event.error async for event in handler.stream_events() if type(event) is Invalid]
     assert (await handler).success
     assert f"Invalid value {marker}" in selector.requests[-1].memory
-    assert inflight["workers"] and marker not in json.dumps(inflight)
+    assert errors == ["Invalid value ***"]
 
 
 @pytest.mark.anyio
@@ -880,6 +1251,29 @@ async def test_screenshot_progress_is_not_excluded_before_capture():
     assert (await handler).success and actions == 5
     assert images[:3] == [b"image 0", b"image 0", b"image 1"]
     assert not any(isinstance(event, Invalid) for event in events)
+
+
+@pytest.mark.anyio
+async def test_visual_no_progress_compares_the_next_selector_capture():
+    from mobilerun_agents.config.user_config import AgentConfig
+
+    args = await resources()
+    phone = args["device"]
+    phone.state._resolved_provider.get_state.return_value = UIState([], "", "", {}, 100, 100)
+    phone.screenshot = AsyncMock(return_value=b"unchanged")
+
+    class Visual(Selector):
+        async def select(self, run):
+            await run.screenshot()
+            return await super().select(run)
+
+    handler = AgentWorkflow(Visual(ToolCall("wait"), complete())).run(
+        **args, config=AgentConfig(no_progress_fail_after=1)
+    )
+    assert (await handler).reason == "stuck"
+    state = await handler.ctx.store.get_state()
+    assert state.no_progress == 1 and state.actions[0].screen_changed is False
+    assert phone.screenshot.await_count == 2
 
 
 @pytest.mark.anyio
@@ -916,8 +1310,7 @@ async def test_cycle_guard_only_counts_revisits_without_new_screens(productive):
 
 
 @pytest.mark.anyio
-async def test_raw_step_evidence_keeps_invalid_attempt_thought_after_repair():
-    evidence = []
+async def test_action_record_keeps_invalid_attempt_thought_after_repair():
     blocker = "blocked: sign-in dialog hides prices"
 
     class Retry(ActionSelector):
@@ -929,11 +1322,10 @@ async def test_raw_step_evidence_keeps_invalid_attempt_thought_after_repair():
                 return ActionSelection(thought=blocker)
             return ActionSelection(actions=[complete()], thought="Report the partial result")
 
-    handler = AgentWorkflow(Retry()).run(**await resources(), report_evidence=evidence.append)
+    handler = AgentWorkflow(Retry()).run(**await resources())
     assert (await handler).success
-    [steps] = evidence
-    [step] = steps
-    assert step.thought == f"{blocker}\nReport the partial result"
+    [action] = (await handler.ctx.store.get_state()).actions
+    assert action.thought == f"{blocker}\nReport the partial result"
 
 
 @pytest.mark.anyio
@@ -1168,7 +1560,7 @@ async def test_one_console_dedupes_atomic_tool_logs_across_planning_children(cap
 
 
 @pytest.mark.anyio
-async def test_cycle_reports_raw_step_evidence_only_to_the_child_callback():
+async def test_cycle_keeps_raw_thoughts_and_screen_visits_in_state():
     from mobilerun_agents import Run, tool
     from mobilerun_agents.agent.logs.diagnostics import private_values
     from mobilerun_agents.agent.workflows.events import GuardDetail
@@ -1177,7 +1569,6 @@ async def test_cycle_reports_raw_step_evidence_only_to_the_child_callback():
     provider = args["device"].state._resolved_provider
     secret = "FAKE token / run evidence"
     visits = 0
-    evidence = []
 
     def render():
         title = ("Search", "Results", "Product")[visits % 3]
@@ -1207,27 +1598,24 @@ async def test_cycle_reports_raw_step_evidence_only_to_the_child_callback():
     token = private_values.set(set())
     try:
         selector = Loop(*[ToolCall("navigate", {"token": secret}) for _ in range(12)])
-        handler = AgentWorkflow(selector).run(
-            **args, tools=[navigate], report_evidence=evidence.append
-        )
+        handler = AgentWorkflow(selector).run(**args, tools=[navigate])
         events = [event async for event in handler.stream_events()]
         result = await handler
     finally:
         private_values.reset(token)
     assert (result.success, result.reason, result.steps) == (False, "cycle", 11)
-    [steps] = evidence
-    assert [step.step for step in steps] == list(range(1, 13))
-    assert all(step.thought == f"Try again with {secret}" for step in steps[:-1])
-    assert (steps[0].package, steps[0].activity, steps[0].title) == ("shop", "Main", "Search")
-    assert steps[-1].thought is None and steps[-1].fingerprint == steps[2].fingerprint
-    assert len({step.fingerprint for step in steps}) == 3
+    state = await handler.ctx.store.get_state()
+    assert all(action.thought == f"Try again with {secret}" for action in state.actions)
+    assert all(action.screen_changed for action in state.actions)
+    assert [screen.title for screen in state.screens.values()] == ["Search", "Results", "Product"]
+    assert state.screens[state.last_screen].count == 4
     assert any(
         "You have been on this screen 3 times" in request.memory for request in selector.requests
     )
     assert any(
         isinstance(event, GuardDetail) and event.text.startswith("cycle:") for event in events
     )
-    assert secret not in repr(events) and secret not in json.dumps(handler.ctx.to_dict())
+    assert secret not in repr(events)
 
 
 @pytest.mark.anyio

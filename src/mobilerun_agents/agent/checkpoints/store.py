@@ -2,14 +2,17 @@
 
 import asyncio
 import json
-from itertools import chain, repeat
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from mobilerun.macro.models import build_screen_snapshot
 from mobilerun.models.context import JSONValue
 
-from mobilerun_agents.agent.memory.snapshot import StepSnapshot
+from mobilerun_agents.agent.logs.redaction import (
+    redact_run_arguments,
+    redact_run_text,
+    run_sensitive_values,
+)
 from mobilerun_agents.agent.workflows.core.state import ActionRecord, AgentState
 from mobilerun_agents.config.settings import DEFAULT_MAX_STEPS
 
@@ -37,62 +40,46 @@ class RunRecorder:
         self.folder = folder
         self.macro_path = macro_path
         self._state = AgentState(max_steps=max_steps)
-        self._ui_state: list[dict[str, JSONValue]] = []
         self._pre_states: list[dict[str, JSONValue]] = []
-        self._guards: list[dict[str, JSONValue] | None] = []
-        self._screenshot: bytes | None = None
         self._decision_count = 0
 
     async def on_decision(self, choices: list[dict[str, JSONValue]]) -> str:
         """Write one redacted option list per Jev call, including retries."""
         self._decision_count += 1
         path = f"decisions/{self._decision_count:04}.json"
-        await asyncio.to_thread(_atomic, self.folder / path, _json({"choices": choices}))
+        payload = {"choices": [redact_run_arguments(choice) for choice in choices]}
+        await asyncio.to_thread(_atomic, self.folder / path, _json(payload))
         return path
 
-    async def on_observe(
-        self, snapshot: StepSnapshot, screenshot: bytes | None, ui_state: list[dict[str, JSONValue]]
-    ) -> None:
-        """Pin this observation for subsequent actions at the same step."""
-        state = self._state
-        state.goal = snapshot.goal
-        if state.step != snapshot.step:
-            self._pre_states.clear()
-        state.step = snapshot.step
-        self._state = state
-        self._ui_state, self._screenshot = ui_state, screenshot
-
-    async def on_step(
-        self,
-        record: ActionRecord,
-        pre_state: dict[str, JSONValue] | None = None,
-        *,
-        guard_redacted: bool = False,
-    ) -> None:
+    async def on_step(self, record: ActionRecord) -> None:
         validate_vault_reference(record)
         state = self._state
-        if state.step == 0 or state.step != record.step:
-            raise ValueError("Action requires an observation from the same step")
-        image = self._screenshot
+        if state.step != record.step:
+            self._pre_states.clear()
         tree_path = f"ui_states/{record.step:04}.json"
-        image_path = f"screenshots/{record.step:04}.png" if image is not None else None
-        guard = pre_state if pre_state is not None else build_screen_snapshot(self._ui_state)
+        guard = redact_run_arguments(build_screen_snapshot(record.before.ui))
         trees = [*self._pre_states, guard]
-        action = record.model_copy(update={"ui_state": tree_path, "screenshot": image_path})
-        next_state = state.model_copy(update={"actions": [*state.actions, action]})
+        action = record.model_copy(
+            update={
+                "name": redact_run_text(record.name),
+                "args": {},
+                "summary": "[REDACTED]",
+                "thought": None,
+            }
+        )
+        next_state = state.model_copy(
+            update={"step": record.step, "actions": [*state.actions, action]}
+        )
 
         def write() -> None:
             _atomic(
                 self.folder / tree_path,
                 _json(trees[0] if len(trees) == 1 else {"pre_states": trees}),
             )
-            if image_path is not None and image is not None:
-                _atomic(self.folder / image_path, image)
             self._checkpoint(next_state)
 
         await asyncio.to_thread(write)
         self._state, self._pre_states = next_state, trees
-        self._guards.append(None if guard_redacted else guard)
 
     def _checkpoint(self, state: AgentState) -> None:
         # A later step can reveal that earlier free text was sensitive. Publish only
@@ -102,7 +89,15 @@ class RunRecorder:
         )
         payload["actions"] = [
             {
-                **a.model_dump(include={"step", "name", "ok", "screenshot", "ui_state"}),
+                **a.model_dump(include={"step", "name", "ok", "screen_changed"}),
+                "ui_state": f"ui_states/{a.step:04}.json",
+                "screenshot": (
+                    str(a.before.screenshot.path)
+                    if a.before.screenshot is not None
+                    and a.before.screenshot.path is not None
+                    and not run_sensitive_values.get()
+                    else None
+                ),
                 "args": {},
                 "summary": "[REDACTED]",
             }
@@ -111,14 +106,7 @@ class RunRecorder:
         _atomic(self.folder / f"checkpoints/{state.step:04}.json", _json(payload))
 
     async def finish(self, state: AgentState) -> None:
-        recorded = [(a.step, a.name) for a in self._state.actions]
-        if recorded != [(a.step, a.name) for a in state.actions[: len(recorded)]]:
-            raise ValueError("Final action history differs from the recorded steps")
-
-        # Final actions that were not streamed have no observation guard.
-        actions = zip(state.actions, chain(self._guards, repeat(None)), strict=False)
-
         def write() -> None:
-            _atomic(self.macro_path, _json(macro_data(state.goal, actions)))
+            _atomic(self.macro_path, _json(macro_data(state.goal, state.actions)))
 
         await asyncio.to_thread(write)

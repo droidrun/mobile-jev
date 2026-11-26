@@ -199,6 +199,8 @@ class PlanningConfig(Section):
 class AgentConfig(Section):
     stuck_exclude_after: PositiveInt = 2
     stuck_fail_after: PositiveInt = 4
+    no_progress_note_after: PositiveInt = 3
+    no_progress_fail_after: PositiveInt = 5
     cycle_note_after: PositiveInt = 3
     cycle_fail_after: PositiveInt = 4
     max_steps: PositiveInt = DEFAULT_MAX_STEPS
@@ -206,7 +208,6 @@ class AgentConfig(Section):
     planning: PlanningConfig = Field(default_factory=PlanningConfig)
     workflow_timeout: PositiveFloat | None = None
     max_output_validation_attempts: PositiveInt = 2
-    context_history_window: PositiveInt = 5
 
     system_prompt: str = DEFAULT_FAST_SYSTEM_PROMPT
     parallel_tools: bool = True
@@ -230,12 +231,12 @@ class ToolsConfig(Section):
 
 class CheckpointsConfig(Section):
     enabled: bool = True
-    folder: Path | None = None
 
 
 class MemoryConfig(Section):
     token_limit: PositiveInt = DEFAULT_TOKEN_LIMIT
     insert_method: InsertMethod = InsertMethod.USER
+    blocks: list[Literal["app_cards"]] = Field(default_factory=list)
 
 
 class MobileConfig(Section):
@@ -276,6 +277,12 @@ class MobileConfig(Section):
             except yaml.YAMLError:
                 raise ValueError("Invalid agents.yaml syntax") from None
         if type(data) is dict:
+            checkpoints = data.get("checkpoints")
+            if type(checkpoints) is dict and "folder" in checkpoints:
+                raise OldConfigKeys(
+                    "Config uses old keys; remove checkpoints.folder and set "
+                    "MOBILERUN_AGENT_RUNS_DIR instead."
+                )
             agent = data.get("agent")
             if {"llm_profiles", "decision_profiles", "default_" + "llm"} & data.keys() or (
                 type(agent) is dict and {"selector", "delegation"} & agent.keys()

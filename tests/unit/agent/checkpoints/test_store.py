@@ -1,10 +1,13 @@
+import json
 import socket
 
 import pytest
+from llama_index.core.base.llms.types import ImageBlock
+from mobilerun.core.state.ui_state import UIState
 from mobilerun.macro.player import MacroPlayer
 
 from mobilerun_agents.agent.checkpoints.store import RunRecorder
-from mobilerun_agents.agent.memory.snapshot import StepSnapshot
+from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.state import ActionRecord, AgentState
 from tests.unit.device_fixtures import MemoryDevice
 
@@ -18,8 +21,9 @@ def record(step, name, args, **extra):
                 args=args,
                 ok=True,
                 summary="ok",
-                screenshot=None,
-                ui_state=None,
+                before=StepSnapshot(
+                    goal="", step=step, ui=UIState([], "", "", {}, 0, 0), device_context=[]
+                ),
             )
             | extra
         )
@@ -47,43 +51,48 @@ async def test_checkpoint_snapshots_event_step_and_exports_recorded_pre_states(t
     folder = tmp_path / "run"
     macro_path = tmp_path / "macros/run/macro.json"
     image = b"captured PNG"
+    image_path = tmp_path / "shot.png"
+    image_path.write_bytes(image)
     nodes = [{"text": "a" * 20000}]
     snapshot = StepSnapshot(
         goal="search",
         step=1,
-        last_actions=[],
-        package=None,
-        activity=None,
-        ui_elements=nodes,
+        ui=UIState(nodes, "", "", {}, 0, 0),
         device_context=[],
     )
-    tap = record(1, "tap", {"x": 3, "y": 4})
+    tap = record(1, "tap", {"x": 3, "y": 4}, before=snapshot)
     typed = record(
         1,
         "input_text",
         {"text": 'example "text"'},
         summary='typed example "text"',
+        before=snapshot.model_copy(
+            update={
+                "ui": UIState([{"focused": True}], "", "", {}, 0, 0),
+                "screenshot": ImageBlock(path=image_path),
+            }
+        ),
     )
     later = record(2, "wait", {"duration": 0}, ok=False)
     state = AgentState(goal="search", step=2, actions=[tap, typed, later])
     recorder = RunRecorder(folder, macro_path=macro_path)
-    await recorder.on_observe(snapshot, None, nodes)
     assert not folder.exists()
     await recorder.on_step(tap)
-    await recorder.on_observe(snapshot, image, [{"focused": True}])
     await recorder.on_step(typed)
     checkpoint = folder / "checkpoints/0001.json"
     assert checkpoint.stat().st_size < 2000
-    saved = AgentState.model_validate_json(checkpoint.read_bytes())
-    assert saved.step == 1
-    assert len(saved.actions) == 2
-    assert saved.actions[1].args == {}
-    assert 'example "text"' not in saved.actions[1].summary
-    assert (folder / saved.actions[1].screenshot).read_bytes() == image
-    assert saved.actions[0].ui_state == "ui_states/0001.json"
-    assert saved.actions[0].ui_state == saved.actions[1].ui_state
+    saved = json.loads(checkpoint.read_text())
+    entries = saved["actions"]
+    assert saved["step"] == 1
+    assert len(entries) == 2
+    assert entries[1]["args"] == {}
+    assert 'example "text"' not in entries[1]["summary"]
+    assert entries[1]["screenshot"] == str(image_path)
+    assert image_path.read_bytes() == image
+    assert list(folder.rglob("*.png")) == []
+    assert entries[0]["ui_state"] == entries[1]["ui_state"] == "ui_states/0001.json"
     # Inspection files aren't an input to macro export.
-    (folder / saved.actions[0].ui_state).unlink()
+    (folder / entries[0]["ui_state"]).unlink()
     await recorder.finish(state)
     macro = MacroPlayer().load_macro_from_file(macro_path)
     assert macro["description"] == "search" and macro["total_actions"] == 2
@@ -105,7 +114,11 @@ async def test_player_types_plain_text_and_vault_action_exports_only_reference(t
     macro = player.load_macro_from_file(macro_path)
     assert await player.replay_macro(macro, max_steps=1)
     assert device.inputs == ["hello"]
-    assert macro["actions"][1] == {"action_type": "type_secret", **secret.args, "pre_state": None}
+    assert macro["actions"][1] == {
+        "action_type": "type_secret",
+        **secret.args,
+        "pre_state": macro["actions"][0]["pre_state"],
+    }
 
 
 async def test_future_typed_literal_absent_from_every_checkpoint(tmp_path):
@@ -118,25 +131,19 @@ async def test_future_typed_literal_absent_from_every_checkpoint(tmp_path):
         snapshot = StepSnapshot(
             goal=marker,
             step=step,
-            last_actions=[],
-            package=None,
-            activity=None,
-            ui_elements=[],
+            ui=UIState([], "", "", {}, 0, 0),
             device_context=[],
         )
-        await recorder.on_observe(snapshot, None, [])
-        await recorder.on_step(record(step, name, args, summary=marker))
+        await recorder.on_step(record(step, name, args, summary=marker, before=snapshot))
         assert marker not in (tmp_path / f"checkpoints/{step:04}.json").read_text()
     checkpoints = sorted((tmp_path / "checkpoints").glob("*.json"))
     assert [p.stem for p in checkpoints] == ["0001", "0002"]
     assert all(marker not in p.read_text() for p in checkpoints)
 
 
-async def test_missing_sidecar_never_publishes_checkpoint(tmp_path):
-    action = record(1, "tap", {"x": 3, "y": 4}, ui_state="missing.json")
-    with pytest.raises(ValueError, match="observation"):
-        await RunRecorder(tmp_path, macro_path=tmp_path / "macros/run/macro.json").on_step(action)
-    assert not (tmp_path / "checkpoints/0001.json").exists()
+async def test_action_record_requires_observation():
+    with pytest.raises(ValueError, match="before"):
+        ActionRecord(step=1, name="tap", args={"x": 3, "y": 4}, ok=True, summary="ok")
 
 
 async def test_expanded_credential_is_rejected_before_publishing_anything(tmp_path):

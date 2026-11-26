@@ -35,7 +35,6 @@ def test_keyboard_interrupt_exits_with_130_without_traceback(monkeypatch):
 def test_setup_error_precedes_device_discovery_consent_and_open(monkeypatch, args):
     forbidden = Mock(side_effect=AssertionError("device accessed before model resolution"))
     monkeypatch.setattr("mobilerun.cli.devices.base.options.discover_devices", forbidden)
-    monkeypatch.setattr("mobilerun_agents.cli.agent.run.confirm_action", forbidden)
     monkeypatch.setattr(DeviceTarget, "open", forbidden)
     result = CliRunner().invoke(run, ["goal", *args])
     expected = "Unknown setup 'missing'" if "missing" in args else "No model configured."

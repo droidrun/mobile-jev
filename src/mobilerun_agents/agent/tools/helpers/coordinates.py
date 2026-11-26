@@ -5,7 +5,7 @@ from collections.abc import Collection
 from mobilerun.core.state.ui_state import UIState
 
 from mobilerun_agents.agent.run import Run
-from mobilerun_agents.config.prompts import render_selector_prompt
+from mobilerun_agents.config.prompts import render_prompt
 
 
 def coordinate_pairs(fields: Collection[str]) -> tuple[tuple[str, str], ...]:
@@ -28,12 +28,12 @@ def check_point(x: int, y: int, ctx: Run) -> tuple[int, int]:
     provider = ctx.state_provider
     if provider.requires_active_contract_for_coords and not ctx.ui.coordinate_contract_active:
         raise ValueError(
-            render_selector_prompt("assets/prompts/tools/coordinate_error.jinja2", kind="inactive")
+            render_prompt("assets/prompts/tools/coordinate_error.jinja2", kind="inactive")
         )
     width, height = device_dimensions(ctx.ui, provider.requires_coordinate_tools)
     if not (0 <= x < width and 0 <= y < height):
         raise ValueError(
-            render_selector_prompt(
+            render_prompt(
                 "assets/prompts/tools/coordinate_error.jinja2",
                 kind="model_bounds",
                 x=x,

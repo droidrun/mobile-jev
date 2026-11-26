@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from llama_index.core.llms import LLM, ChatMessage
+from llama_index.core.llms import ChatMessage, ImageBlock
 from llama_index.core.memory import Memory
 from llama_index.core.tools import BaseTool
 from mobilerun.core.devices import Device
@@ -17,13 +16,12 @@ from mobilerun.errors import DeviceOperationNotSupported
 from mobilerun.macro.recorder import MacroRecorder
 from pydantic import BaseModel
 
-from mobilerun_agents.agent.workflows.core.state import ActionRecord, AgentState
+from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
+from mobilerun_agents.agent.workflows.core.state import AgentState
 from mobilerun_agents.config.user_config import AgentConfig, ToolsConfig
 
 if TYPE_CHECKING:
-    from mobilerun_agents.agent.action_selector.base import ActionSelector
-
-    from .memory.snapshot import StepSnapshot
+    from .tools.helpers.images import ImageStore
     from .tools.registry import ToolRegistry
 
 
@@ -44,37 +42,27 @@ class Run:
     device: Device
     ui: UIState = field(init=False, repr=False)
     tool_config: ToolsConfig = field(default_factory=ToolsConfig)
-    macro_recorder: MacroRecorder | None = field(default_factory=MacroRecorder)
+    macro_recorder: MacroRecorder | None = None
 
     snapshot: StepSnapshot | None = field(default=None, init=False)
+    images: ImageStore | None = None
     capture: Capture = field(default_factory=Capture, init=False)
     registry: ToolRegistry = field(init=False)
     memory: Memory
+    memory_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     config: AgentConfig
     output: type[BaseModel] | None = None
-    action_selector: ActionSelector | None = None
-    report_completion: Callable[[str], None] | None = field(default=None, repr=False)
     _apps: tuple[InstalledApp, ...] | None = field(default=None, init=False, repr=False)
     atomic_drops: set[str] = field(default_factory=set, init=False, repr=False)
     selection_exclude: frozenset[str] = field(default_factory=frozenset, init=False, repr=False)
     selection_include: tuple[BaseTool, ...] = field(default=(), init=False, repr=False)
     avoid_signature: str = field(default="", init=False, repr=False)
-    model_actions: list[ActionRecord] = field(default_factory=list, init=False, repr=False)
     _state_snapshot: AgentState = field(default_factory=AgentState, init=False, repr=False)
 
     @property
     def state(self) -> AgentState:
         """Detached selection state; changes to this value never enter the workflow store."""
         return self._state_snapshot.model_copy(deep=True)
-
-    @property
-    def selector(self) -> ActionSelector:
-        assert self.action_selector is not None
-        return self.action_selector
-
-    @property
-    def llm(self) -> LLM | None:
-        return self.selector.shared_llm
 
     async def installed_apps(self) -> tuple[InstalledApp, ...]:
         if self._apps is None:
@@ -89,21 +77,30 @@ class Run:
             )
         return self._apps
 
-    _memory_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
-
-    async def remember(self, message: ChatMessage) -> None:
-        async with self._memory_lock:
-            await self.memory.aput(message)
-
     async def history(self) -> list[ChatMessage]:
-        async with self._memory_lock:
-            return await self.memory.aget(snapshot=self.snapshot)
+        async with self.memory_lock:
+            if self.snapshot is not None:
+                self.snapshot._actions = tuple(self._state_snapshot.actions)
+                self.snapshot._thresholds = (
+                    self.config.stuck_exclude_after,
+                    self.config.no_progress_note_after,
+                    self.config.cycle_note_after,
+                )
+            try:
+                return await self.memory.aget(snapshot=self.snapshot)
+            finally:
+                if self.snapshot is not None:
+                    self.snapshot._actions = ()
 
     async def screenshot(self) -> bytes:
         async with self.capture.lock:
             if self.capture.image is None:
                 self.capture.image = await self.device.screenshot()
             return self.capture.image
+
+    def save_screenshot(self) -> None:
+        if self.snapshot is not None and self.images is not None and self.capture.image:
+            self.snapshot.attach_screenshot(ImageBlock(path=self.images.save(self.capture.image)))
 
     @property
     def state_provider(self) -> StateProvider:

@@ -1,10 +1,5 @@
-{{ goal }}
-{% if memory %}
-<memory>{{ memory }}</memory>
-{% endif %}
-{% if history %}
-<history>{{ history | tojson }}</history>
-{% endif %}
 {% if state %}
 <device_state>{{ state }}</device_state>
+{% else %}
+Current screen observation.
 {% endif %}

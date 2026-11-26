@@ -5,9 +5,7 @@ from functools import wraps
 from typing import Any
 
 import click
-from mobilerun.cli.base.safety import confirm_action
 from mobilerun.cli.devices.base.options import DeviceTarget, device_command
-from mobilerun.config.settings import get_settings
 from mobilerun.errors import CloudAuthRequired
 from mobilerun.models.results import ExecutionResult
 from pydantic import BaseModel
@@ -38,7 +36,6 @@ def _device_target(target: DeviceTarget) -> DeviceTarget:
     type=click.Choice(VISION_MODES),
     help="Override selector vision for this run.",
 )
-@click.option("--yes", "-y", is_flag=True, help="Confirm cloud device charges.")
 @wraps(_device_target, assigned=())
 def run(
     goal: str,
@@ -46,7 +43,6 @@ def run(
     setup: str | None,
     steps: int | None,
     vision: Vision | None,
-    yes: bool,
     **device_options: Any,
 ) -> None:
     """Run GOAL on a mobile device."""
@@ -64,13 +60,6 @@ def run(
             except (CredentialMissing, UnknownModel, ValueError) as exc:
                 raise click.ClickException(str(exc)) from None
             target = _device_target(**device_options)
-            if target.kind == "cloud":
-                confirm_action(
-                    "run a cloud task",
-                    get_settings().MOBILERUN_BILLING.value,
-                    f"Using {target} may incur charges.",
-                    yes=yes,
-                )
             try:
                 loop.run(_execute(operator, target, goal, steps))
             except CloudAuthRequired as exc:

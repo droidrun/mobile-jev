@@ -1,10 +1,10 @@
 from mobilerun_agents.agent.memory.memory import SnapshotBlock
-from mobilerun_agents.agent.memory.snapshot import StepSnapshot
+from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 
 
 class DeviceContextBlock(SnapshotBlock):
     name: str = "device_context"
-    priority: int = 4
+    priority: int = 0
 
     async def render(self, snapshot: StepSnapshot) -> str:
         if not snapshot.device_context:

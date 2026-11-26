@@ -20,12 +20,13 @@ from mobilerun_agents.agent.action_selector import DelegatingSelector
 from mobilerun_agents.agent.action_selector.base import ActionSelection, ActionSelector
 from mobilerun_agents.agent.action_selector.llm.models import MODELS
 from mobilerun_agents.agent.action_selector.llm.parsing import ToolCall
-from mobilerun_agents.agent.memory.snapshot import StepSnapshot
 from mobilerun_agents.agent.operators import AgentOperator
 from mobilerun_agents.agent.tools.base import complete
 from mobilerun_agents.agent.workflows.core.result import AgentResult
-from mobilerun_agents.agent.workflows.core.state import ActionRecord, AgentState
-from mobilerun_agents.agent.workflows.events import Act, Invalid, Select, StepFinished
+from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
+from mobilerun_agents.agent.workflows.core.state import ActionOutcome, ActionRecord, AgentState
+from mobilerun_agents.agent.workflows.events import Act, Invalid, Observed, StepFinished
+from mobilerun_agents.config.settings import get_agent_settings
 from mobilerun_agents.config.user_config import LLMProfile, MobileConfig
 from tests.unit.agent.selector_fixtures import captured_turn
 from tests.unit.device_fixtures import MemoryDevice
@@ -101,10 +102,7 @@ class Scripted(Workflow):
         snapshot = StepSnapshot(
             goal=ev.goal,
             step=1,
-            last_actions=[],
-            package=None,
-            activity=None,
-            ui_elements=[],
+            ui=UIState([], "", "", {}, 0, 0),
             device_context=[],
         )
         record = ActionRecord(
@@ -113,14 +111,16 @@ class Scripted(Workflow):
             args={},
             ok=True,
             summary="finished",
+            before=snapshot,
             screenshot=None,
             ui_state=None,
         )
+        outcome = ActionOutcome.model_validate(record.model_dump(exclude={"before"}))
         for event in [
             Invalid(error="repair"),
-            Select(snapshot=snapshot, screenshot=b"image"),
+            Observed(step=1, package=None, activity=None),
             Act(selection=ActionSelection(actions=[ToolCall("complete")])),
-            StepFinished(action=record, display_action=record),
+            StepFinished(action=outcome, display_action=outcome),
         ]:
             ctx.write_event_to_stream(event)
         await ctx.store.set_state(AgentState(goal=ev.goal, step=1, actions=[record]))
@@ -150,9 +150,8 @@ def phone():
 
 @pytest.fixture
 def config(tmp_path, monkeypatch):
-    cfg = MobileConfig.model_validate(
-        {"analytics": {"enabled": False}, "checkpoints": {"folder": str(tmp_path / "runs")}}
-    )
+    cfg = MobileConfig.model_validate({"analytics": {"enabled": False}})
+    monkeypatch.setenv("MOBILERUN_AGENT_RUNS_DIR", str(tmp_path / "runs"))
 
     monkeypatch.setattr("mobilerun_agents.config.loader.ConfigLoader.load", lambda *_: cfg)
     return cfg
@@ -168,7 +167,7 @@ async def test_default_operator_uses_real_selector_factory(phone, tmp_path, monk
             assert api_key == "unit-key" and http_options.retry_options.attempts == 1
 
         async def astream_chat(self, messages, **kwargs):
-            assert "count items" in messages[-1].content
+            assert any("count items" in (message.content or "") for message in messages[:-1])
 
             async def chunks():
                 yield ChatResponse(
@@ -216,7 +215,7 @@ async def test_setup_default_and_delegation_tools(phone, config, monkeypatch, to
     loader.assert_awaited_once_with()
     assert flow.bindings == expected and not phone.extensions
     assert flow.run_tools == {"delegate"}
-    assert result.trajectory_path is None and not config.checkpoints.folder.exists()
+    assert result.trajectory_path is None and not get_agent_settings().runs_dir.exists()
 
 
 @pytest.mark.anyio
@@ -234,7 +233,7 @@ async def test_recording_uses_base_stores(phone, config, tmp_path, monkeypatch, 
     if override:
         monkeypatch.setenv("MOBILERUN_MACRO_DIRECTORY", str(macro_root))
     else:
-        config.checkpoints = MobileConfig().checkpoints
+        monkeypatch.delenv("MOBILERUN_AGENT_RUNS_DIR")
 
     result = await AgentOperator(selector=Selector()).execute(phone, "count", output=Answer)
 
@@ -273,10 +272,14 @@ async def test_operator_records_maps_and_leaves_caller_binding(phone, config, ca
         Answer(count=3),
     )
     folder = Path(result.trajectory_path)
-    image = folder / "screenshots/0001.png"
+    image = get_agent_settings().images_dir / folder.name / "0001.png"
     assert image.exists() == capture
     if capture:
         assert image.read_bytes() == b"image"
+        checkpoint = json.loads((folder / "checkpoints/0001.json").read_text())
+        assert checkpoint["actions"][0]["screenshot"] == str(image)
+        assert list(image.parent.iterdir()) == [image]
+    assert not (folder / "screenshots").exists()
     assert phone.screenshot.await_count == int(capture)
     assert recorded_macro(result.trajectory_path).is_file()
     assert list(phone.extensions) == ["extra"]
@@ -324,7 +327,7 @@ async def test_interrupted_run_releases_tools(phone, config, cancel, monkeypatch
     assert stopped.is_set() and not phone.extensions
     if cancel:
         assert "✗ cancelled (0 steps · " in caplog.text
-        assert str(config.checkpoints.folder) in caplog.text
+        assert str(get_agent_settings().runs_dir) in caplog.text
 
 
 class Choices(ActionSelector):
@@ -700,7 +703,7 @@ async def test_sensitive_tool_input_is_not_replayed(phone, config):
     macro = player.load_macro_from_file(recorded_macro(result.trajectory_path))
     assert [entry["action_type"] for entry in macro["actions"]] == ["wait"]
     assert "synthetic-marker" not in json.dumps(macro)
-    assert not selector.requests[1].history[-1].replayable
+    assert "enter_password" in selector.requests[1].memory
     assert await player.replay_macro(macro)
     assert phone.inputs == ["synthetic-marker"]
 
@@ -773,8 +776,8 @@ async def test_operator_adds_custom_tool_without_binding_or_exporting_it(phone, 
     assert result.success and phone.actions.list() == before
     first = selector.requests[0]
     assert first.registry.has_sensitive and "read_label" in first.by_name
-    assert selector.requests[1].history[-1].ok
-    assert selector.requests[1].history[-1].args == {"label": "local-only"}
+    assert 'read_label({"label": "local-only"})' in selector.requests[1].memory
+    assert "1 · read_label ✓" in selector.requests[1].memory
     assert json.loads(recorded_macro(result.trajectory_path).read_text())["actions"] == []
 
 
@@ -861,11 +864,18 @@ def test_cli_real_steps_visible_without_transport_or_sensitive_args(
         logging.getLogger("mobilerun").debug("Getting state (attempt 1/7)")
         yield phone
 
-    config.checkpoints.folder = Path.home() / "run output"
+    monkeypatch.setenv("MOBILERUN_AGENT_RUNS_DIR", str(Path.home() / "run output"))
+    monkeypatch.setenv("MOBILERUN_AGENT_IMAGES_DIR", str(Path.home() / "captured images"))
     monkeypatch.setenv("MOBILERUN_MACRO_DIRECTORY", str(Path.home() / "saved macros"))
     monkeypatch.delenv("MOBILERUN_LOG_LEVEL", raising=False)
     monkeypatch.setattr(DeviceTarget, "open", opened)
-    selector = Choices(
+
+    class CaptureChoices(Choices):
+        async def select(self, run):
+            await run.screenshot()
+            return await super().select(run)
+
+    selector = CaptureChoices(
         ToolCall("authorize", {"token": "fixture-private"}),
         ToolCall("complete", {"message": message, "success": success}),
     )
@@ -886,9 +896,10 @@ def test_cli_real_steps_visible_without_transport_or_sensitive_args(
     assert out.exit_code == (0 if success else 1), out.output
     assert "1 · authorize *** ✓" in out.output and f"2 · complete {mark}" in out.output
     assert out.output.count(f"{mark} {message}") == 1 and "2 steps" in out.output
-    run_id = next(config.checkpoints.folder.iterdir()).name
+    run_id = next(get_agent_settings().runs_dir.iterdir()).name
     assert out.stdout.splitlines()[-1] == f"{mark} {message} (2 steps · ~/run output/{run_id})"
     assert (f"~/saved macros/{run_id}/macro.json" in out.stderr) is debug
+    assert (f"images folder: ~/captured images/{run_id}" in out.stderr) is debug
     assert "Getting state" not in out.output and "fixture-private" not in out.output
 
 

@@ -10,6 +10,7 @@ You will be given a task to perform. You should:
 {% endif %}
 4. If there is a precondition for the task, you MUST check if it is met.
 5. If the subgoal can't be completed from here (information missing, blocked, unavailable), call `complete` with success=false and exactly what you saw, including partial values. Don't keep searching the same places.
+   If the screen can't answer the goal (for example there is nothing to compare), complete with what you see instead of repeating actions.
    Name any visible blocker (delivery location or region, login, filter, permission, or popup) in your reasoning and failure message as `blocked: …`, e.g. "blocked: price hidden because item can't ship to selected location (Germany)".
 6. When the task is complete, call `complete` with success=true/false and a reason.
    If you read concrete values, put the values you read into the message.
@@ -53,8 +54,7 @@ The following context is given to you for analysis:
 - **screenshots**: A visual screenshot of the current screen. Screenshots aren't saved in history, so note key details you'll need later.
 {%- endif %}
 - **phone_state**: The current app you are navigating in. This tells you which application context you're working within.
-- **memory**: Your accumulated memory from previous steps (shown in `<memory>` tags). Use this to recall important facts without scanning history.
-- **chat history**: You are also given the history of your actions (if any) from your previous steps.
+- **memory**: Your goal, notes, previous action results, and guidance when revisiting a screen.
 - **tool results**: The result of your last tool call
 
 {% if not native_tools %}

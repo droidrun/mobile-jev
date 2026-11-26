@@ -10,7 +10,6 @@ from urllib.parse import quote_plus
 import click
 import httpx2
 import pytest
-from llama_index.core.base.llms.types import ChatMessage, ToolCallBlock
 from mobilerun.config.user_config import TelemetryConfig
 from mobilerun.core.state.ui_state import UIState
 from PIL import Image
@@ -212,28 +211,13 @@ def test_typesafe_wire_state_includes_current_delegate_intent(sdk):
     assert client.system_one.call_args.kwargs["state"]["intent"] == turn.intent
 
 
-def test_native_history_preserves_tool_call_and_result_identity(sdk):
+def test_request_contains_memory_without_a_separate_history(sdk):
     client, _, _ = sdk
-    history = [
-        ChatMessage(
-            role="assistant",
-            blocks=[
-                ToolCallBlock(
-                    tool_name="click",
-                    tool_call_id="native-call-7",
-                    tool_kwargs={"index": 7},
-                )
-            ],
-        ),
-        ChatMessage(
-            role="tool", content="Clicked", additional_kwargs={"tool_call_id": "native-call-7"}
-        ),
-    ]
-    asyncio.run(TypeSafeDecisionModel().decide(request(history=history)))
-    serialized = client.system_one.call_args.kwargs["state"]["history"]
-    assert serialized[0]["blocks"][0]["tool_call_id"] == "native-call-7"
-    assert serialized[0]["blocks"][0]["tool_kwargs"] == {"index": 7}
-    assert serialized[1]["additional_kwargs"]["tool_call_id"] == "native-call-7"
+    memory = 'click({"index": 7})\n7 · click [7] ✓\nClicked'
+    asyncio.run(TypeSafeDecisionModel().decide(request(memory=memory)))
+    state = client.system_one.call_args.kwargs["state"]
+    assert state["memory"] == memory
+    assert "history" not in state
 
 
 @pytest.mark.timeout(5)
@@ -495,16 +479,17 @@ def test_jev_debug_does_not_log_provider_error_text(sdk, jev_console, capsys):
 
 @pytest.mark.parametrize("enabled,debug", [(True, True), (True, False), (False, True)])
 def test_jev_records_full_masked_decisions_only_with_checkpoints(
-    sdk, capsys, tmp_path, enabled, debug
+    sdk, capsys, tmp_path, enabled, debug, monkeypatch
 ):
     from tests.unit.agent.workflows.test_run import resources
 
     client, _, _ = sdk
     client.system_one.return_value.choices["action"].choice = "abstain"
     config = MobileConfig(
-        checkpoints=CheckpointsConfig(enabled=enabled, folder=tmp_path),
+        checkpoints=CheckpointsConfig(enabled=enabled),
         analytics=TelemetryConfig(enabled=False),
     )
+    monkeypatch.setenv("MOBILERUN_AGENT_RUNS_DIR", str(tmp_path))
 
     async def run():
         args = await resources()
@@ -544,7 +529,7 @@ def test_jev_records_full_masked_decisions_only_with_checkpoints(
 
 
 @pytest.mark.parametrize("debug", [False, True])
-def test_jev_sidecar_masks_tracked_values_in_ordinary_arguments(sdk, tmp_path, debug):
+def test_jev_sidecar_masks_tracked_values_in_ordinary_arguments(sdk, tmp_path, debug, monkeypatch):
     from mobilerun_agents import Run, tool
     from mobilerun_agents.agent.action_selector.base import ActionSelection, ActionSelector
     from tests.unit.agent.workflows.test_run import complete, resources
@@ -579,9 +564,10 @@ def test_jev_sidecar_masks_tracked_values_in_ordinary_arguments(sdk, tmp_path, d
             return ActionSelection(actions=[complete()])
 
     config = MobileConfig(
-        checkpoints=CheckpointsConfig(folder=tmp_path),
+        checkpoints=CheckpointsConfig(),
         analytics=TelemetryConfig(enabled=False),
     )
+    monkeypatch.setenv("MOBILERUN_AGENT_RUNS_DIR", str(tmp_path))
     config.tracing.enabled = False
 
     async def run():

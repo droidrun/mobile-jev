@@ -45,6 +45,28 @@ def test_typesafe_primary_builds_only_delegate_llm(monkeypatch):
     assert selector.min_confidence == 0.8
 
 
+def test_unset_default_uses_first_profile_as_straight_agent(monkeypatch):
+    config = MobileConfig(
+        profiles={
+            "first": LLMProfile(provider="ollama", model="first-model"),
+            "second": LLMProfile(provider="ollama", model="second-model"),
+        },
+        setups={"configured": SetupConfig(selector="second")},
+    )
+
+    models = []
+
+    async def fake_build(provider, model, **options):
+        models.append(model)
+        return MockLLM()
+
+    monkeypatch.setattr(loader, "build_llm", fake_build)
+    with ConfigLoader.override(config):
+        spec = asyncio.run(loader.build_setup(None))
+    assert type(spec.selector) is LlamaIndexLLMSelector
+    assert models == ["first-model"]
+
+
 @pytest.mark.parametrize("role", ["agent", "executor"])
 @pytest.mark.parametrize("vision", [None, "only"])
 def test_default_jev_and_llm_use_profile_vision_or_run_override(monkeypatch, role, vision):

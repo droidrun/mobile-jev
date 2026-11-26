@@ -18,7 +18,7 @@
 
 | Setting | Default |
 |---|---|
-| Model | Use `default_setup`, or the first setup if no default was chosen. With no setups, use the first LLM profile. With no LLM profiles, use the first provider with an environment or saved key: OpenAI (`gpt-5-mini`), Anthropic (`claude-sonnet-5`), Gemini (`gemini-3.8-flash`), then OpenRouter (`openai/gpt-5-mini`). |
+| Model | Use `default_setup` when set. Otherwise use a straight agent with the first LLM profile; if there are no LLM profiles, use the first provider with an environment or saved key: OpenAI (`gpt-5-mini`), Anthropic (`claude-sonnet-5`), Gemini (`gemini-3.8-flash`), then OpenRouter (`openai/gpt-5-mini`). |
 | Reasoning effort | Planner: high; executor: low; agent: medium. An LLM profile can override `reasoning` for supported OpenAI models. |
 | Vision | On for OpenAI, Anthropic, Gemini and TypeSafe; off for other providers unless configured. Use `vision: off`, `on`, or `only` on a profile. |
 | Step budget | Agent: 25 (`agent.max_steps`); planning: 40 (`agent.planning_max_steps`). |
@@ -49,6 +49,6 @@ default_setup: fast
 
 If `run` reports removed keys, set the old file aside and recreate profiles and setups with the new commands. There is no automatic migration.
 
-`checkpoints.folder` overrides the default `<Mobilerun config dir>/runs` parent directory. `ExecutionResult.trajectory_path` locates the run. Macros are saved separately as `<macro directory>/<run_id>/macro.json`, using Mobilerun's macro directory (`MOBILERUN_MACRO_DIRECTORY`, otherwise `<Mobilerun config dir>/macros`). Set `checkpoints.enabled: false` to skip recording both.
+`MOBILERUN_AGENT_RUNS_DIR` and `MOBILERUN_AGENT_IMAGES_DIR` override the parent directories for run records and screenshots. Empty values use the defaults `<MOBILERUN_USER_CONFIG_DIR>/runs` and `<MOBILERUN_USER_CONFIG_DIR>/images`; each run is stored under `<run_id>/`. Screenshots use `NNNN.png` filenames. `ExecutionResult.trajectory_path` locates run data. Macros use `MOBILERUN_MACRO_DIRECTORY`. When checkpoints are disabled, run data is not retained and the run's image directory is deleted at the end.
 
-**Depends on / used by:** Depends on shared base configuration and Pydantic. Asset lookup checks the working directory, then the add-on package. Providers, services, workflows and entry points consume these models.
+**Depends on / used by:** Depends on shared base configuration and Pydantic. Relative prompt paths resolve only inside the add-on package; set a prompt field to an absolute path to override a bundled prompt. Providers, services, workflows and entry points consume these models.

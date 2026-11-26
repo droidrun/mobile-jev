@@ -8,7 +8,7 @@ from mobilerun_agents.agent.logs.console import ToolDetail
 from mobilerun_agents.agent.logs.diagnostics import safe_text, sink
 from mobilerun_agents.agent.logs.redaction import redact_run_text
 from mobilerun_agents.agent.run import Run
-from mobilerun_agents.config.prompts import render_selector_prompt
+from mobilerun_agents.config.prompts import render_prompt
 
 from ..base import RegistryTool
 from .exceptions import ATOMIC_EXCEPTIONS
@@ -64,7 +64,7 @@ async def expand_atomic_tools(members: Sequence[BaseTool], run: Run) -> tuple[At
             options.append(
                 AtomicTool(
                     name,
-                    label=render_selector_prompt(
+                    label=render_prompt(
                         run.config.decision.criteria_prompt, kind="delegate"
                     ),
                 )

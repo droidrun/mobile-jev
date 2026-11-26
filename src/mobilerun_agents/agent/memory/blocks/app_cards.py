@@ -6,7 +6,7 @@ import httpx
 from pydantic import BaseModel, PrivateAttr, TypeAdapter, ValidationError
 
 from mobilerun_agents.agent.memory.memory import SnapshotBlock
-from mobilerun_agents.agent.memory.snapshot import StepSnapshot
+from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 
 _MAPPING = TypeAdapter(dict[str, str])
 
@@ -38,7 +38,7 @@ class AppCardBlock(SnapshotBlock):
             return ""
 
     async def render(self, snapshot: StepSnapshot) -> str:
-        if not (package := snapshot.package):
+        if not (package := snapshot.ui.phone_state.get("packageName")):
             return ""
         key = package, snapshot.goal
         if key in self._cache:

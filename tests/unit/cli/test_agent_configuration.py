@@ -325,11 +325,71 @@ def test_configure_can_save_the_suggested_default_name(monkeypatch):
     assert ConfigLoader.load().default_setup == "default"
 
 
+def test_interactive_configure_can_clear_existing_default(monkeypatch):
+    add_llm("luna")
+    ok("configure", "fast", "--selector", "luna")
+    ok("configure", "default", "fast")
+
+    def no_default(options):
+        assert "None (no default)" in [option.value for option in options]
+        return "None (no default)"
+
+    terminal(
+        monkeypatch,
+        [
+            ("Setup structure", "Straight"),
+            ("Selector profile", "luna"),
+            ("Make default?", no_default),
+            ("Save setup?", "Done"),
+        ],
+    )
+    output = ok("configure", "new")
+    assert "Default setup cleared" in output
+    assert ConfigLoader.load().default_setup is None
+
+
 def test_configure_default_command_and_default_setup_name_are_distinct():
     add_llm("luna")
     ok("configure", "default", "--selector=luna")
     ok("configure", "default", "default")
     assert ConfigLoader.load().default_setup == "default"
+
+
+def test_configure_default_unset_removes_yaml_choice_and_reports_fallback():
+    add_llm("luna")
+    ok("configure", "fast", "--selector", "luna")
+    ok("configure", "default", "fast")
+    output = ok("configure", "default", "--unset")
+    assert (
+        output.strip()
+        == "Default setup cleared; agent run uses a straight agent with the first LLM profile."
+    )
+    assert "default_setup" not in yaml.safe_load(ConfigLoader.get_user_config_path().read_text())
+    assert "Default setup: (none)" in ok("configure", "show")
+
+
+def test_configure_default_picker_can_clear_default(monkeypatch):
+    add_llm("luna")
+    ok("configure", "fast", "--selector", "luna")
+    ok("configure", "default", "fast")
+
+    def no_default(options):
+        assert any(row.label == "None (no default)" for row in options)
+        return ""
+
+    terminal(monkeypatch, [("Default setup", no_default)])
+    output = ok("configure", "default")
+    assert "Default setup cleared" in output
+    assert "default_setup" not in yaml.safe_load(ConfigLoader.get_user_config_path().read_text())
+
+
+def test_configure_remove_current_default_reports_clearing():
+    add_llm("luna")
+    ok("configure", "fast", "--selector", "luna")
+    ok("configure", "default", "fast")
+    output = ok("configure", "remove", "fast")
+    assert "Default setup cleared" in output
+    assert "default_setup" not in yaml.safe_load(ConfigLoader.get_user_config_path().read_text())
 
 
 def test_provider_submenu_prompts_for_provider_with_key_status(monkeypatch):

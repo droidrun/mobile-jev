@@ -17,10 +17,11 @@ from mobilerun_agents.agent.action_selector.base import (
     action_signature,
 )
 from mobilerun_agents.agent.action_selector.llm.parsing import ToolCall
+from mobilerun_agents.agent.memory.messages import text_messages
 from mobilerun_agents.agent.run import Run
 from mobilerun_agents.agent.tools.atomic import has_device_atomic_exception
 from mobilerun_agents.agent.tools.helpers import device_dimensions, visual_tool_names
-from mobilerun_agents.config.prompts import render_selector_prompt
+from mobilerun_agents.config.prompts import render_prompt
 from mobilerun_agents.config.user_config import DecisionConfig
 from mobilerun_agents.errors import SelectorCannotServe
 
@@ -30,7 +31,6 @@ class DecisionInput:
     goal: str
     state: UIState | None = None
     memory: str = ""
-    history: list[Any] = field(default_factory=list)
     screenshot: bytes | None = None
     registry: Mapping[str, BaseTool] = field(default_factory=dict)
     options: tuple[ActionCandidate, ...] = ()
@@ -126,7 +126,7 @@ class DecisionSelector(ActionSelector):
                 options += (
                     ActionCandidate(
                         ToolCall("tap"),
-                        render_selector_prompt(self.config.candidate_prompt, kind="tap"),
+                        render_prompt(self.config.candidate_prompt, kind="tap"),
                         space,
                     ),
                 )
@@ -138,13 +138,12 @@ class DecisionSelector(ActionSelector):
             goal=goal,
             state=None if only else run.ui,
             screenshot=screenshot,
-            history=list(state.actions[-run.config.context_history_window :]),
-            memory="\n".join(m.content or "" for m in await run.history()),
+            memory="\n".join(m.content or "" for m in text_messages(await run.history())),
             registry=registry,
             options=self._cap_options(options, self.model.max_options),
             intent=intent,
         )
-        model_request.instructions = render_selector_prompt(
+        model_request.instructions = render_prompt(
             self.config.system_prompt, **model_request.get_decision_prompt_variables()
         )
         decision = await asyncio.wait_for(self.model.decide(model_request), self.timeout)
@@ -198,7 +197,7 @@ class DecisionSelector(ActionSelector):
         elif option.point_space is not None:
             x, y = self._place(decision.point, option.point_space)
             action = ToolCall(action.name, {**action.parameters, "x": x, "y": y})
-            description = render_selector_prompt(
+            description = render_prompt(
                 self.config.candidate_prompt, kind="located", x=x, y=y
             )
         return ActionSelection(

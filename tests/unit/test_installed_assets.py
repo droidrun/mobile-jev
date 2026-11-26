@@ -48,8 +48,8 @@ for name, digest in assets.items():
     assert resolved.is_relative_to(purelib)
     assert all(not resolved.is_relative_to(checkout) for checkout in checkouts)
     assert hashlib.sha256(resolved.read_bytes()).hexdigest() == digest, name
-from mobilerun_agents.config.prompts import render_selector_prompt
-assert "example.settings" in render_selector_prompt("assets/prompts/tools/choose_app.jinja2", apps_list="example.settings", app_description="open settings")
+from mobilerun_agents.config.prompts import render_prompt
+assert "example.settings" in render_prompt("assets/prompts/tools/choose_app.jinja2", apps_list="example.settings", app_description="open settings")
 """
     result = subprocess.run(
         [

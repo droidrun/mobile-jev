@@ -114,7 +114,11 @@ async def test_profile_effort_on_wire(monkeypatch, role, model, override, expect
         if role == "agent"
         else SetupConfig(planner="chosen", executor="chosen")
     )
-    ConfigLoader.save(MobileConfig(profiles={"chosen": profile}, setups={"current": setup}))
+    ConfigLoader.save(
+        MobileConfig(
+            profiles={"chosen": profile}, setups={"current": setup}, default_setup="current"
+        )
+    )
     built = await default_setup()
     llm = {
         "planner": lambda: built.planner.llm,
@@ -139,6 +143,7 @@ async def test_anthropic_without_offline_thinking_capability(monkeypatch):
         MobileConfig(
             profiles={"main": LLMProfile(provider="anthropic", model="claude-sonnet-5")},
             setups={"planned": SetupConfig(planner="main", executor="main")},
+            default_setup="planned",
         )
     )
     await achat((await default_setup()).planner.llm, [ChatMessage(content="test")])
@@ -172,6 +177,7 @@ async def test_openai_planner_requires_one_native_tool_on_the_wire(monkeypatch):
         MobileConfig(
             profiles={"main": LLMProfile(provider="openai", model="gpt-5-mini")},
             setups={"planned": SetupConfig(planner="main", executor="main")},
+            default_setup="planned",
         )
     )
     assert await (await default_setup()).planner.plan(request) == Plan(("Check status",))

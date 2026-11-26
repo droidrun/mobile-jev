@@ -23,7 +23,7 @@ from mobilerun_agents.agent.action_selector.llm.factory import (
 from mobilerun_agents.agent.action_selector.llm.parsing import parse_native_tool_calls
 from mobilerun_agents.agent.logs.diagnostics import Detail, ModelCall, Retry, redact, sink
 from mobilerun_agents.agent.logs.redaction import redact_run_text
-from mobilerun_agents.config.prompts import render_selector_prompt
+from mobilerun_agents.config.prompts import render_prompt
 
 from .base import Finish, Plan, Planner, PlanningInput
 
@@ -133,13 +133,13 @@ class LlamaIndexPlanner(Planner):
                 _SetPlan,
                 name="set_plan",
                 fn_schema=_SetPlan,
-                description=render_selector_prompt("assets/prompts/planning/set_plan.jinja2"),
+                description=render_prompt("assets/prompts/planning/set_plan.jinja2"),
             ),
             FunctionTool.from_defaults(
                 completion,
                 name="complete",
                 fn_schema=completion,
-                description=render_selector_prompt(
+                description=render_prompt(
                     "assets/prompts/complete/description.jinja2",
                     output_schema=request.output.model_json_schema() if request.output else None,
                 ),
@@ -148,7 +148,7 @@ class LlamaIndexPlanner(Planner):
         messages = [
             ChatMessage(
                 role="user",
-                content=render_selector_prompt(
+                content=render_prompt(
                     "assets/prompts/planning/turn.jinja2",
                     request=request,
                 ),
@@ -160,7 +160,7 @@ class LlamaIndexPlanner(Planner):
             messages[0].blocks.append(ImageBlock(image=request.screenshot))
             if diagnostic:
                 image = image_dimensions(request.screenshot)
-        error = render_selector_prompt(config.invalid_arguments_prompt)
+        error = render_prompt(config.invalid_arguments_prompt)
         for attempt in range(1, config.max_response_repair_attempts + 1):
             try:
                 return _decision(await _request(self.llm, request, messages, tools, image), error)
@@ -173,7 +173,7 @@ class LlamaIndexPlanner(Planner):
                     messages[0],
                     ChatMessage(
                         role="user",
-                        content=render_selector_prompt(
+                        content=render_prompt(
                             "assets/prompts/providers/repair.jinja2",
                             error=str(exc),
                         ),

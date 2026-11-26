@@ -82,7 +82,11 @@ def _edit_setup(
 
 
 def _save_setup(
-    config: MobileConfig, name: str, setup: SetupConfig, make_default: bool = False
+    config: MobileConfig,
+    name: str,
+    setup: SetupConfig,
+    make_default: bool = False,
+    clear_default: bool = False,
 ) -> None:
     if not name.strip() or name in {"show", "remove"} or name.startswith("-"):
         raise click.UsageError("Choose a nonempty setup name other than show or remove.")
@@ -99,10 +103,18 @@ def _save_setup(
             raise click.UsageError(str(exc)) from None
     if make_default:
         config.default_setup = name
+    elif clear_default:
+        config.default_setup = None
     save_config(config)
     click.echo(f"Setup saved: {name}")
     if make_default:
         click.echo(f"Default setup: {name}")
+    elif clear_default:
+        _echo_default_cleared()
+
+
+def _echo_default_cleared() -> None:
+    click.echo("Default setup cleared; agent run uses a straight agent with the first LLM profile.")
 
 
 def _profile_choices(config: MobileConfig) -> tuple[list[SelectChoice], list[SelectChoice]]:
@@ -149,7 +161,7 @@ def _interactive(name: str | None) -> None:
             ).strip()
             if not name:
                 raise click.Abort()
-        make_default = pick("Make default?", ["No", "Yes"]) == "Yes"
+        default_choice = pick("Make default?", ["No", "Yes", "None (no default)"])
         if pick("Save setup?", ["Done", "Cancel"]) != "Done":
             raise click.Abort()
     except (click.Abort, KeyboardInterrupt, EOFError):
@@ -164,7 +176,8 @@ def _interactive(name: str | None) -> None:
             executor=action if planning else None,
             delegate=delegate,
         ),
-        make_default,
+        default_choice == "Yes",
+        default_choice == "None (no default)",
     )
 
 
@@ -196,15 +209,33 @@ def show(name: str | None) -> None:
     }
     click.echo(yaml.safe_dump(output, sort_keys=False).rstrip())  # type: ignore[no-untyped-call]
     if name is None:
-        default = config.default_setup or next(iter(setups), None)
-        click.echo(f"Default setup: {default or '(first LLM profile or provider fallback)'}")
+        click.echo(f"Default setup: {config.default_setup or '(none)'}")
 
 
 @configure.command()
-@click.argument("name")
-def default(name: str) -> None:
-    """Use NAME when run does not specify --setup."""
+@click.argument("name", required=False)
+@click.option("--unset", "unset_default", is_flag=True, help="Clear the default setup.")
+def default(name: str | None, unset_default: bool) -> None:
+    """Use NAME when run does not specify --setup, or clear it with --unset."""
     config = load_config()
+    if unset_default:
+        if name is not None:
+            raise click.UsageError("NAME cannot be used with --unset.")
+        config.default_setup = None
+        save_config(config)
+        _echo_default_cleared()
+        return
+    if name is None:
+        if not menu.is_interactive():
+            raise click.UsageError("Supply a setup name, --unset, or open configure in a terminal.")
+        choices = [SelectChoice("", "None (no default)")]
+        choices.extend(SelectChoice(key, key) for key in config.setups)
+        name = pick_choice("Default setup", choices)
+        if not name:
+            config.default_setup = None
+            save_config(config)
+            _echo_default_cleared()
+            return
     if name not in config.setups:
         raise click.UsageError(f"Unknown setup {name!r}")
     config.default_setup = name
@@ -219,8 +250,11 @@ def remove(name: str) -> None:
     config = load_config()
     if name not in config.setups:
         raise click.UsageError(f"Unknown setup {name!r}")
-    if config.default_setup == name:
+    was_default = config.default_setup == name
+    if was_default:
         config.default_setup = None
     del config.setups[name]
     save_config(config)
     click.echo(f"Setup removed: {name}")
+    if config.default_setup is None and was_default:
+        _echo_default_cleared()

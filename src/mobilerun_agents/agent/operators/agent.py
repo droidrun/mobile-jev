@@ -4,8 +4,7 @@ from workflows.handler import WorkflowHandler
 
 from mobilerun_agents.agent.action_selector import ActionSelector, DelegatingSelector
 from mobilerun_agents.agent.action_selector.loader import default_setup
-from mobilerun_agents.agent.memory.blocks.device_context import DeviceContextBlock
-from mobilerun_agents.agent.memory.memory import build_memory
+from mobilerun_agents.agent.memory.memory import build_run_memory
 from mobilerun_agents.agent.tools.base import Tool, delegate
 from mobilerun_agents.agent.workflows.agent import AgentWorkflow
 
@@ -30,7 +29,7 @@ def start_agent(
         tools=available,
         tool_config=run.config.tools,
         config=run.config.agent,
-        memory=build_memory(run.config.memory, [DeviceContextBlock()]),
+        memory_factory=lambda: build_run_memory(run.config.memory, run.device.platform),
     )
 
 

@@ -3,7 +3,7 @@
 from collections.abc import Awaitable, Callable
 
 from mobilerun_agents.agent.run import Run
-from mobilerun_agents.config.prompts import render_selector_prompt
+from mobilerun_agents.config.prompts import render_prompt
 
 from ..helpers import device_dimensions, element_targets
 from .schema import AtomicTool
@@ -35,7 +35,7 @@ async def _apps(run: Run) -> list[AtomicTool]:
         AtomicTool(
             "start_app",
             {"package": app.identifier},
-            render_selector_prompt(
+            render_prompt(
                 run.config.decision.candidate_prompt,
                 kind="app",
                 label=app.label,
@@ -64,7 +64,7 @@ async def _scrolls(run: Run) -> list[AtomicTool]:
                 "y2": round((height - 1) * end[1]),
                 "duration_ms": config.swipe_duration * 1000,
             },
-            render_selector_prompt(
+            render_prompt(
                 run.config.decision.candidate_prompt, kind="scroll", direction=direction
             ),
         )
@@ -77,7 +77,7 @@ async def _completion(run: Run) -> list[AtomicTool]:
         AtomicTool(
             "complete",
             {"success": success},
-            render_selector_prompt(run.config.decision.criteria_prompt, kind=kind),
+            render_prompt(run.config.decision.criteria_prompt, kind=kind),
         )
         for success, kind in ((True, "complete_success"), (False, "complete_failure"))
     ]

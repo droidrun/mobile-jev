@@ -30,6 +30,7 @@ mobilerun agent configure fast --selector luna
 mobilerun agent configure deep --planner sol --executor jev-on --delegate luna
 mobilerun agent configure show deep
 mobilerun agent configure default fast
+mobilerun agent configure default --unset
 mobilerun agent run "Open Settings" DEVICE --setup deep --vision off
 mobilerun agent task status TASK_ID --json
 mobilerun agent configure remove deep
@@ -38,8 +39,10 @@ mobilerun agent profiles remove jev-on
 
 LLM profiles require `--model` and can specify a credential-free `--base-url`. Model-ID validation for OpenAI and Anthropic is offline. Decision model profiles (currently TypeSafe/Jev) don't take a model ID or reasoning setting. To use Jev, set `TYPESAFE_API_KEY` or save a key with `agent providers add typesafe`. Only a decision model selector or executor can have a delegate. The planner and delegate must be LLM profiles.
 
-In a terminal, `agent` opens a menu. The `providers` and `profiles` submenus offer add, list and remove. In `configure [NAME]`, choose **Straight** or **Manager + executor**, then pick profiles for the roles. The menu asks about delegation only if the selected action profile is a decision model. Choose a name and whether to make it the default. **Done** saves both choices; **Cancel** or Esc writes nothing. `run --setup NAME` chooses a setup for one run, and `--vision off|on|only` overrides its action selector and delegate for that run. Without any setups, the first LLM profile is used, or a credential-based fallback if there is no LLM profile.
+In a terminal, `agent` opens a menu. The `providers` and `profiles` submenus offer add, list and remove. In `configure [NAME]`, choose **Straight** or **Manager + executor**, then pick profiles for the roles. The menu asks about delegation only if the selected action profile is a decision model. Choose a name and whether to make it the default; **None (no default)** clears the current default. **Done** saves both choices; **Cancel** or Esc writes nothing. `configure default` lets you choose a named setup or **None (no default)**, while `configure default --unset` clears it directly. `run --setup NAME` chooses a setup for one run, and `--vision off|on|only` overrides its action selector and delegate for that run. Without a default setup, runs use a straight agent with the first LLM profile, or a credential-based fallback if there are no LLM profiles.
 
 See [the YAML schema](../../config/README.md). Profiles referenced by any setup cannot be removed until those setups are updated or removed.
+
+Cloud agent runs do not prompt separately for device charges; the base CLI enforces the `MOBILERUN_BILLING` setting. The run command has no `--yes` option. Stopping a cloud task still requires confirmation, or `--yes` in non-interactive use.
 
 **Depends on / used by:** Uses base CLI prompts and device selection, provider credentials, model metadata and agent configuration. Base loads it through a CLI entry point.

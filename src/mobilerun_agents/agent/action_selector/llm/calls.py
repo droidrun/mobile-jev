@@ -21,7 +21,7 @@ from openai.types.responses.response_create_params import ResponseCreateParamsBa
 from openinference.instrumentation import suppress_tracing
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
-from mobilerun_agents.config.prompts import render_selector_prompt
+from mobilerun_agents.config.prompts import render_prompt
 from mobilerun_agents.config.user_config import DecisionConfig
 
 _DEFAULT_TIMEOUT = DecisionConfig().timeout
@@ -301,7 +301,7 @@ async def achat(
         )
     ):
         error_reply = InvalidResponse(
-            render_selector_prompt("assets/prompts/providers/empty_response.jinja2")
+            render_prompt("assets/prompts/providers/empty_response.jinja2")
         )
         error_reply.usage = usage_from_response(reply)
         raise error_reply

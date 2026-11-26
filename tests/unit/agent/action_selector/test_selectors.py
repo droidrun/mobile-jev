@@ -196,6 +196,72 @@ def test_llm_diagnostic_name_maps_openai_adapter():
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "adapter", ["responses", "chat_completions", "anthropic", "gemini", "openai_like", "xml"]
+)
+async def test_step_memory_survives_request_conversion(monkeypatch, adapter):
+    from llama_index.core.llms.mock import MockLLM
+    from llama_index.llms.anthropic.utils import messages_to_anthropic_messages
+    from llama_index.llms.google_genai.utils import chat_message_to_gemini
+    from llama_index.llms.openai.utils import (
+        to_openai_message_dict,
+        to_openai_responses_message_dict,
+    )
+
+    from mobilerun_agents.agent.action_selector import LlamaIndexLLMSelector
+    from mobilerun_agents.agent.memory.messages import action_messages
+    from mobilerun_agents.agent.workflows.core.state import ActionOutcome
+
+    run = selection_run("Tap", tools=fake_tools("tap_element"), elements=[{"index": 7}])
+    run.memory.aget.return_value = action_messages(
+        ActionOutcome(
+            step=7,
+            name="tap_element",
+            args={"index": 7},
+            ok=True,
+            screenshot=None,
+            ui_state=None,
+            summary="Tapped",
+            screen_changed=False,
+            thought="Try the row",
+        ),
+        "tap_element",
+    )
+    captured = []
+
+    async def chat(self, messages, **kwargs):
+        captured.extend(messages)
+
+    monkeypatch.setattr(LlamaIndexLLMSelector, "_achat", chat)
+    api = "chat_completions" if adapter in {"openai_like", "xml"} else adapter
+    await LlamaIndexLLMSelector(
+        MockLLM(), "off", supports_native=adapter != "xml", native_tool_api=api
+    ).select(run)
+    assert captured[-1].content == "<device_state>screen</device_state>"
+    assert "<history>" not in str(captured)
+    assistant, result = captured[2:4]
+    assert "screen changed: no" in result.content and "Try the row" in result.content
+    if adapter == "responses":
+        call = to_openai_responses_message_dict(assistant)[0]
+        outcome = to_openai_responses_message_dict(result)
+        assert call["type"] == "function_call" and outcome["type"] == "function_call_output"
+        assert call["call_id"] == outcome["call_id"]
+    elif adapter in {"chat_completions", "openai_like"}:
+        call = to_openai_message_dict(assistant)["tool_calls"][0]
+        assert call["id"] == to_openai_message_dict(result)["tool_call_id"]
+    elif adapter == "anthropic":
+        converted, _ = messages_to_anthropic_messages([assistant, result])
+        call, outcome = [message["content"][0] for message in converted]
+        assert call["id"] == outcome["tool_use_id"]
+    else:
+        assert assistant.role == result.role == "assistant"
+        assert 'tap_element({"index": 7})' in assistant.content
+        if adapter == "gemini":
+            converted, _ = await chat_message_to_gemini(assistant)
+            assert converted.parts[0].text == assistant.content
+
+
+@pytest.mark.anyio
 async def test_jev_off_delegates_to_llm_on_before_fetching_screenshot(monkeypatch):
     from llama_index.core.llms.mock import MockLLM
 

@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, create_model
 
 from mobilerun_agents.agent.logs.redaction import observe_secret_inputs
 from mobilerun_agents.agent.run import Run
-from mobilerun_agents.config.prompts import render_selector_prompt
+from mobilerun_agents.config.prompts import render_prompt
 from mobilerun_agents.errors.descriptions import describe_error
 
 from .atomic import AtomicTool, expand_atomic_tools
@@ -163,7 +163,12 @@ async def _invoke_device(run: Run, action: Action, arguments: dict[str, Any]) ->
             result = await view.actions.call(action.name, validated, audience="operator")
             if recorder is not None and not sensitive:
                 recorder.record_action(
-                    {"action_type": "extension_call", "name": action.name, "arguments": arguments},
+                    {
+                        "action_type": "extension_call",
+                        "name": action.name,
+                        "arguments": arguments,
+                        "ok": result is not False,
+                    },
                     pre_ui=pre_ui,
                 )
         return ActionResult(result is not False, f"{name} {arguments} → {result!r}")
@@ -190,7 +195,7 @@ def build_registry(
         description = action.description
         if action.name == "complete":
             schema = output_model.model_json_schema() if output_model else None
-            description = render_selector_prompt(
+            description = render_prompt(
                 "assets/prompts/complete/description.jinja2", output_schema=schema
             )
             properties = dict(action.input_schema.get("properties", {}))

@@ -8,7 +8,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 import mobilerun_agents
 from mobilerun_agents.agent.action_selector import ActionSelector, DelegatingSelector
-from mobilerun_agents.config.prompts import render_selector_prompt
+from mobilerun_agents.config.prompts import render_prompt
 from mobilerun_agents.config.user_config import DecisionConfig, DelegationConfig
 
 
@@ -33,7 +33,7 @@ def test_prompt_loader_rejects_missing_override_variables(tmp_path):
     prompt = tmp_path / "custom.jinja2"
     prompt.write_text("{{ missing_variable }}")
     with pytest.raises(UndefinedError, match="missing_variable"):
-        render_selector_prompt(str(prompt))
+        render_prompt(str(prompt))
 
 
 TEMPLATES = {
@@ -55,7 +55,7 @@ TEMPLATES = {
         "notes": [],
         "unnamed_class": "Button",
     },
-    "llm/selection_request.jinja2": {"goal": "Tap", "memory": "", "history": [], "state": ""},
+    "llm/selection_request.jinja2": {"state": ""},
     "llm/invalid_arguments.jinja2": {},
 }
 
@@ -71,7 +71,7 @@ def test_templates_ship_in_installed_wheel_and_render_strict(name, variables):
 
 @pytest.mark.parametrize("kind", ["tap", "located", "schema", "app", "element", "scroll"])
 def test_candidate_template_branches_render_strict(kind):
-    assert render_selector_prompt(
+    assert render_prompt(
         DecisionConfig().candidate_prompt,
         kind=kind,
         x=10,
@@ -134,6 +134,10 @@ def test_fast_agent_prompt_reports_partial_results_and_visible_blockers():
     assert "site-packages" in str(path), "Check the installed wheel, not the checkout"
     prompt = path.read_text()
     assert "including partial values. Don't keep searching the same places." in prompt
+    assert (
+        "If the screen can't answer the goal (for example there is nothing to compare), complete with what you see instead of repeating actions."
+        in prompt
+    )
     assert "Name any visible blocker" in prompt
     assert (
         '"blocked: price hidden because item can\'t ship to selected location (Germany)"' in prompt

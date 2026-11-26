@@ -4,7 +4,6 @@ from pathlib import Path
 from types import TracebackType
 from typing import Self
 
-from mobilerun.config.settings import get_settings
 from mobilerun.macro.settings import get_macro_settings
 from pydantic import BaseModel
 from workflows.errors import WorkflowTimeoutError
@@ -17,23 +16,25 @@ from mobilerun_agents.agent.checkpoints.store import RunRecorder
 from mobilerun_agents.agent.logs import ConsoleLog
 from mobilerun_agents.agent.logs.diagnostics import DecisionOptions, Detail, record_decisions
 from mobilerun_agents.agent.logs.redaction import redact_run_text, run_sensitive_values
+from mobilerun_agents.agent.tools.helpers.images import ImageStore
 from mobilerun_agents.agent.workflows.core.result import AgentResult
 from mobilerun_agents.agent.workflows.core.state import AgentState
-from mobilerun_agents.agent.workflows.events import Invalid, Select, StepFinished, Subgoal
-from mobilerun_agents.agent.workflows.planning import PlannerScreenshot, PlanningState
+from mobilerun_agents.agent.workflows.events import Invalid, Observed, StepFinished, Subgoal
+from mobilerun_agents.agent.workflows.planning import PlanningState
+from mobilerun_agents.agent.workflows.resources import active_images, record_action, trace_image
+from mobilerun_agents.config.settings import get_agent_settings
 from mobilerun_agents.config.user_config import MobileConfig
 
 
 class RunConsumers:
     def __init__(self, config: MobileConfig, run_id: str, max_steps: int) -> None:
         self.recorder: RunRecorder | None = None
+        self.images = ImageStore(run_id, keep=config.checkpoints.enabled)
         if config.checkpoints.enabled:
-            folder = config.checkpoints.folder
-            if folder is None:
-                folder = get_settings().MOBILERUN_USER_CONFIG_DIR / "runs"
+            folder = get_agent_settings().runs_dir
             macro_directory = Path(get_macro_settings().macro_directory).expanduser().absolute()
             self.recorder = RunRecorder(
-                folder.expanduser().absolute() / run_id,
+                folder / run_id,
                 macro_path=macro_directory / run_id / "macro.json",
                 max_steps=max_steps,
             )
@@ -48,6 +49,9 @@ class RunConsumers:
         self.trace = await self._scope.__aenter__()
         self._decisions_token = record_decisions.set(self.recorder is not None)
         self._privacy_token = run_sensitive_values.set(set())
+        self._images_token = active_images.set(self.images)
+        self._record_token = record_action.set(self.recorder.on_step if self.recorder else None)
+        self._trace_token = trace_image.set(self.trace.screenshot)
         return self
 
     async def __aexit__(
@@ -56,10 +60,14 @@ class RunConsumers:
         try:
             await self._scope.__aexit__(typ, error, tb)
         finally:
+            record_action.reset(self._record_token)
+            trace_image.reset(self._trace_token)
+            active_images.reset(self._images_token)
             if self._decisions_token is not None:
                 record_decisions.reset(self._decisions_token)
             if self._privacy_token is not None:
                 run_sensitive_values.reset(self._privacy_token)
+            self.images.close()
 
     async def consume(self, handler: WorkflowHandler) -> tuple[AgentResult[object], str | None]:
         try:
@@ -89,31 +97,17 @@ class RunConsumers:
                     self.console.on_event(
                         Detail(section="jev choices", text=f"{event.summary} (full list: {path})")
                     )
-            case Select(snapshot=snapshot, screenshot=image):
-                # Text masks cannot safely scrub arbitrary screenshot pixels.
-                if run_sensitive_values.get():
-                    image = None
+            case Observed(step=step, package=package, activity=activity):
                 self.console.flush_step()
-                self.analytics.on_observe(snapshot)
-                if self.recorder:
-                    await self.recorder.on_observe(snapshot, image, snapshot.ui_elements)
-                if image:
-                    self.trace.screenshot(image)
-            case PlannerScreenshot(image=image):
-                if not run_sensitive_values.get():
-                    self.trace.screenshot(image)
+                self.analytics.on_observe(package, activity, step)
             case Invalid():
                 self.console.on_repair()
             case Subgoal(text=text):
                 self.console.on_subgoal(text)
-            case StepFinished(action=record, pre_state=pre_state):
+            case StepFinished(action=record):
                 self.steps = record.step
                 if event.display_action is not None:
                     self.console.on_action(event.display_action, delegated=event.delegated)
-                if self.recorder:
-                    await self.recorder.on_step(
-                        record, pre_state, guard_redacted=event.guard_redacted
-                    )
             case _:
                 self.console.on_event(event)
 
@@ -145,5 +139,10 @@ class RunConsumers:
             await self.recorder.finish(AgentState.model_validate(state))
             path = str(self.recorder.folder)
             macro_path = self.recorder.macro_path
-        self.console.on_result(result, path, macro_path=macro_path)
+        self.console.on_result(
+            result,
+            path,
+            macro_path=macro_path,
+            images_folder=self.images.folder if self.images.folder.exists() else None,
+        )
         return path

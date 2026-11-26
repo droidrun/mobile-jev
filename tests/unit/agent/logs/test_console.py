@@ -14,7 +14,7 @@ from mobilerun_agents.agent.logs.diagnostics import (
     private_values,
 )
 from mobilerun_agents.agent.workflows.core.result import AgentResult
-from mobilerun_agents.agent.workflows.core.state import ActionRecord
+from mobilerun_agents.agent.workflows.core.state import ActionOutcome
 from mobilerun_agents.errors import SelectorCannotServe, UnknownModel
 
 
@@ -24,7 +24,7 @@ def test_console_log_formats_event_summary_without_sensitive_fields(caplog):
 
     consumer.on_repair()
     consumer.on_action(
-        ActionRecord(
+        ActionOutcome(
             step=1,
             name="type",
             args={"text": "password"},
@@ -52,7 +52,7 @@ def test_console_progress_order_and_safe_details(caplog):
     caplog.set_level(logging.INFO, logger="mobilerun_agents.agent.logs.console")
 
     def record(step, name, args, summary):
-        return ActionRecord(
+        return ActionOutcome(
             step=step,
             name=name,
             args=args,
@@ -109,7 +109,7 @@ def test_console_marks_every_action_in_a_delegated_step(caplog, debug):
     console = ConsoleLog()
 
     def action(name, args):
-        return ActionRecord(
+        return ActionOutcome(
             step=13,
             name=name,
             args=args,
@@ -141,7 +141,7 @@ def test_console_masks_sensitive_typed_text(caplog):
     caplog.set_level(logging.INFO, logger="mobilerun_agents.agent.logs.console")
     console = ConsoleLog()
     console.on_action(
-        ActionRecord(
+        ActionOutcome(
             step=1,
             name="input_text",
             args={"text": "***"},
@@ -225,7 +225,7 @@ def test_debug_log_format_regressions(capsys):
             )
         )
         console.on_action(
-            ActionRecord(
+            ActionOutcome(
                 step=1,
                 name="tap_element",
                 args={"index": 21},

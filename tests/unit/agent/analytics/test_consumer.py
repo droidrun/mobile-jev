@@ -6,7 +6,6 @@ import pytest
 from mobilerun.config.user_config import TelemetryConfig
 
 from mobilerun_agents.agent.analytics import consumer
-from mobilerun_agents.agent.memory.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.result import AgentResult
 
 
@@ -19,17 +18,7 @@ def test_visits_and_outcome_share_run_and_anonymous_identity(monkeypatch):
     monkeypatch.setattr(consumer, "_client", lambda: client)
     sink = consumer.RunAnalytics(TelemetryConfig(), "run")
     for step, activity in enumerate(["Home", "Home", "Settings", "Home"]):
-        sink.on_observe(
-            StepSnapshot(
-                goal="secret",
-                step=step,
-                last_actions=[],
-                package="app",
-                activity=activity,
-                ui_elements=[],
-                device_context=[],
-            )
-        )
+        sink.on_observe("app", activity, step)
     asyncio.run(sink.finish(result()))
     asyncio.run(sink.finish(result()))
     calls = client.capture.call_args_list

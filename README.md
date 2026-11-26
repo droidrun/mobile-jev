@@ -11,7 +11,7 @@ mobilerun agent configure fast --selector luna
 mobilerun agent run "Open Settings and read the Android version" DEVICE --setup fast
 ```
 
-Set the provider API key in the environment or save it with `agent providers add`. Profiles name reusable models, including Jev (TypeSafe). Setups choose a selector or a planner and executor, with optional LLM delegation for Jev. See the [agent CLI guide](src/mobilerun_agents/cli/agent/README.md). Agent runs may send screen contents to a model and incur provider charges.
+Set the provider API key in the environment or save it with `agent providers add`. Profiles name reusable models, including Jev (TypeSafe). Setups choose a selector or a planner and executor, with optional LLM delegation for Jev. See the [agent CLI guide](src/mobilerun_agents/cli/agent/README.md). Agent runs may send screen contents to a model and incur provider charges; cloud-device charges follow the base CLI's `MOBILERUN_BILLING` setting without an additional run prompt.
 
 ## Operators
 
@@ -52,7 +52,14 @@ Export a no-argument subclass of `mobilerun.core.operator.Operator`, or an alrea
 
 ## Saved data and diagnostics
 
-Run evidence is stored at `<MOBILERUN_USER_CONFIG_DIR>/runs/<id>/`; macros are stored in the base Mobilerun macro directory. Treat screenshots, UI state and macros as private device data.
+Run data is organized by run ID. Empty directory overrides use the defaults.
+
+| Data | Environment override | Default | Layout |
+|---|---|---|---|
+| Run records and checkpoints | `MOBILERUN_AGENT_RUNS_DIR` | `<MOBILERUN_USER_CONFIG_DIR>/runs` | `<runs>/<run_id>/` |
+| Screenshots | `MOBILERUN_AGENT_IMAGES_DIR` | `<MOBILERUN_USER_CONFIG_DIR>/images` | `<images>/<run_id>/NNNN.png` |
+
+The screenshot reference in a step snapshot points to its saved image; only the current turn keeps image bytes in memory. When checkpoints are disabled, the run's image directory is deleted at the end. Macros use the base Mobilerun macro directory. Treat run data, screenshots, UI state and macros as private device data.
 
 Use `mobilerun agent run --debug` (or the root CLI `--debug`) for selector choices, model-call diagnostics, safe run details and tracebacks. Jev decision sidecars are saved with checkpoints; debug output points to their relative paths. Secret values are masked in outputs, not sent masked to the model. Typed text is not secret by default; vault credentials and explicitly sensitive parameters are protected.
 

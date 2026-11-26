@@ -1,54 +1,54 @@
-"""Resolve the current invocation's live objects, never its serializable state."""
+"""The two live dependencies resolved for a workflow invocation."""
 
-import asyncio
-from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
 from typing import Annotated
+from uuid import uuid4
 
+from llama_index.core.memory import Memory
+from mobilerun.core.devices import Device
 from workflows.resource import Resource
 
-from mobilerun_agents.agent.action_selector.loader import default_setup
-from mobilerun_agents.agent.run import Run
-from mobilerun_agents.agent.tools.base import Tool
-from mobilerun_agents.agent.tools.registry import build_registry
+from mobilerun_agents.agent.memory.blocks.repeat import RepeatBlock
+from mobilerun_agents.agent.memory.blocks.run_notes import RunNotesBlock
+from mobilerun_agents.agent.tools.helpers.images import ImageStore
 
-from .core.result import FailureSummary, ScreenVisit
+from .core.state import ActionRecord
 
-
-@dataclass(kw_only=True)
-class WorkflowRun(Run):
-    pending_tools: list[Tool] | None
-    setup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    model_notes: list[str] | None = field(default=None, init=False, repr=False)
-    thoughts: deque[str] = field(default_factory=lambda: deque(maxlen=3), init=False, repr=False)
-    blockers: deque[str] = field(default_factory=lambda: deque(maxlen=3), init=False, repr=False)
-    screens: dict[tuple[str, str], ScreenVisit] = field(
-        default_factory=dict, init=False, repr=False
-    )
-    last_screen: tuple[str, str] | None = field(default=None, init=False, repr=False)
-    report_failure: Callable[[FailureSummary], None] | None = field(default=None, repr=False)
+active_device: ContextVar[Device] = ContextVar("agent_device")
+active_memory_factory: ContextVar[Callable[[], Memory]] = ContextVar("agent_memory_factory")
+active_images: ContextVar[ImageStore | None] = ContextVar("agent_images", default=None)
+record_action: ContextVar[Callable[[ActionRecord], Awaitable[None]] | None] = ContextVar(
+    "record_action", default=None
+)
+record_offset: ContextVar[int] = ContextVar("record_offset", default=0)
+trace_image: ContextVar[Callable[[bytes], None] | None] = ContextVar("trace_image", default=None)
 
 
-active_run: ContextVar[WorkflowRun] = ContextVar("agent_run")
+@contextmanager
+def run_image_scope() -> Iterator[ImageStore | None]:
+    """Give a root workflow an image store unless its operator already owns one."""
+    if active_images.get() is not None:
+        yield None
+        return
+    images = ImageStore(uuid4().hex, keep=False)
+    token = active_images.set(images)
+    try:
+        yield images
+    finally:
+        active_images.reset(token)
 
 
-async def get_run() -> WorkflowRun:
-    run = active_run.get()
-    async with run.setup_lock:
-        if run.pending_tools is None:
-            return run
-        if run.action_selector is None:
-            setup = await default_setup()
-            run.action_selector = setup.selector or setup.executor
-            if run.action_selector is None:
-                raise ValueError("The default setup has no action selector.")
-        run.registry = build_registry(run, run.pending_tools, run.output)
-        run.pending_tools = None
-    return run
+def get_device() -> Device:
+    return active_device.get()
 
 
-# ResourceManager belongs to the workflow instance, not a run. Resolve on each
-# step; the invocation's context variable supplies the same object to its steps.
-RunResource = Annotated[WorkflowRun, Resource(get_run, cache=False)]
+def get_memory() -> Memory:
+    memory = active_memory_factory.get()()
+    memory.memory_blocks.extend([RunNotesBlock(), RepeatBlock()])
+    return memory
+
+
+DeviceResource = Annotated[Device, Resource(get_device)]
+MemoryResource = Annotated[Memory, Resource(get_memory)]

@@ -3,16 +3,24 @@ from pydantic import BaseModel, Field
 
 from mobilerun_agents.config.settings import DEFAULT_MAX_STEPS
 
+from .result import ScreenVisit
+from .snapshot import StepSnapshot
 
-class ActionRecord(BaseModel):
+
+class ActionOutcome(BaseModel):
     step: int
     name: str
     args: dict[str, JSONValue]
     ok: bool
     replayable: bool = True
     summary: str
-    screenshot: str | None
-    ui_state: str | None
+    thought: str | None = None
+    screen_changed: bool | None = None
+
+
+class ActionRecord(ActionOutcome):
+    before: StepSnapshot = Field(repr=False)
+    call_id: str = Field(default_factory=lambda: f"call_{uuid4().hex}", repr=False)
 
 
 class ActionRepeat(BaseModel):
@@ -32,3 +40,12 @@ class AgentState(BaseModel):
     repair_attempts: int = 0
     output_attempts: int = 0
     repeat: ActionRepeat | None = None
+    pending_thoughts: list[str] = Field(default_factory=list, repr=False)
+    no_progress: int = 0
+    screens: dict[str, ScreenVisit] = Field(default_factory=dict)
+    discoveries: dict[str, int] = Field(default_factory=dict)
+    cycle_visits: dict[str, int] = Field(default_factory=dict)
+    last_screen: str | None = None
+    answer: str = ""
+    reason: str = ""
+from uuid import uuid4

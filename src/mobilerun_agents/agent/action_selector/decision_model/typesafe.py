@@ -11,7 +11,7 @@ from typing import Any
 from mobilerun.core.state.ui_state import UIState
 from mobilerun.models.context import JSONValue
 from mobilerun.utils.images import image_dimensions
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field
 from typesafe_sdk import AsyncTypeSafeClient, Box, Choice, Image
 
 from mobilerun_agents.agent.action_selector.base import ActionCandidate
@@ -31,7 +31,7 @@ from mobilerun_agents.agent.logs.redaction import (
     run_sensitive_values,
 )
 from mobilerun_agents.agent.tools.base import RegistryTool
-from mobilerun_agents.config.prompts import render_selector_prompt
+from mobilerun_agents.config.prompts import render_prompt
 from mobilerun_agents.config.user_config import DecisionConfig
 
 from .base import Decision, DecisionInput
@@ -215,7 +215,7 @@ class TypeSafeDecisionModel:
         }
         abstain = not any(option.action.name == "delegate" for option in request.options)
         if abstain:
-            criteria["abstain"] = render_selector_prompt(
+            criteria["abstain"] = render_prompt(
                 self.config.criteria_prompt, kind="abstain"
             )
         if len(criteria) > self.config.max_choices:
@@ -225,7 +225,6 @@ class TypeSafeDecisionModel:
         state: dict[str, Any] = {
             "goal": request.goal,
             "memory": request.memory,
-            "history": TypeAdapter(list[Any]).dump_python(request.history, mode="json"),
         }
         if request.intent:
             state["intent"] = request.intent
@@ -249,11 +248,11 @@ class TypeSafeDecisionModel:
             request_kwargs["extra_headers"] = {"TypeSafe-Danger-Zone-Images": "true"}
             if locating:
                 questions["target"] = Box(
-                    instructions=render_selector_prompt(
+                    instructions=render_prompt(
                         self.config.locate_prompt, kind="instructions"
                     )
                 )
-        instructions = request.instructions or render_selector_prompt(
+        instructions = request.instructions or render_prompt(
             self.config.system_prompt, **request.get_decision_prompt_variables()
         )
         options = dict(self._client_kwargs)
@@ -377,7 +376,7 @@ class TypeSafeDecisionModel:
             return Decision(
                 option_index=index,
                 confidence=confidence,
-                message=render_selector_prompt(
+                message=render_prompt(
                     self.config.completion_prompt, success=option.action.parameters["success"]
                 ),
             )

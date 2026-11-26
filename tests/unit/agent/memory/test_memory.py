@@ -8,14 +8,15 @@ from llama_index.core.llms import ChatMessage
 from llama_index.core.memory import InsertMethod
 from llama_index.core.retrievers import BaseRetriever
 from llama_index.core.schema import NodeWithScore, TextNode
+from mobilerun.core.state.ui_state import UIState
 from mobilerun.models.context import ContextItem
 
 from mobilerun_agents.agent.memory.blocks.app_cards import AppCardBlock
 from mobilerun_agents.agent.memory.blocks.device_context import DeviceContextBlock
 from mobilerun_agents.agent.memory.blocks.retriever import RetrieverBlock
 from mobilerun_agents.agent.memory.blocks.run_notes import RunNotesBlock
-from mobilerun_agents.agent.memory.memory import build_memory
-from mobilerun_agents.agent.memory.snapshot import StepSnapshot
+from mobilerun_agents.agent.memory.memory import build_memory, build_run_memory
+from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 from mobilerun_agents.config.user_config import MemoryConfig
 
 
@@ -33,12 +34,23 @@ def snapshot():
     return StepSnapshot(
         goal="Find order",
         step=1,
-        package="mail",
-        activity="Inbox",
-        ui_elements=[],
+        ui=UIState([], "", "", {"packageName": "mail", "activityName": "Inbox"}, 0, 0),
         device_context=[ContextItem(source="battery", kind="status", data={"level": 63})],
-        last_actions=[],
     )
+
+
+def test_repeat_uses_the_call_id_when_two_actions_share_a_step(snapshot):
+    from mobilerun_agents.agent.memory.blocks.repeat import RepeatBlock
+    from mobilerun_agents.agent.memory.messages import action_messages
+    from mobilerun_agents.agent.workflows.core.state import ActionRecord
+
+    snapshot.ui.elements.append({"index": 3, "text": "first"})
+    other = snapshot.model_copy(update={"ui": UIState([{"index": 4}], "", "", {}, 0, 0)})
+    first = ActionRecord(step=1, name="tap", args={}, ok=True, summary="ok", before=snapshot)
+    second = ActionRecord(step=1, name="tap", args={}, ok=True, summary="ok", before=other)
+    snapshot._actions = (first, second)
+    messages = action_messages(first, "first_call") + action_messages(second, "second_call")
+    assert "Last action here: first_call" in asyncio.run(RepeatBlock().aget(messages, snapshot=snapshot))
 
 
 class Docs(BaseRetriever):
@@ -47,6 +59,15 @@ class Docs(BaseRetriever):
     def _retrieve(self, query_bundle):
         self.query = query_bundle.query_str
         return [NodeWithScore(node=TextNode(text=self.text))]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_app_cards_are_opt_in(snapshot, enabled):
+    snapshot.ui.phone_state["packageName"] = "com.google.android.gm"
+    config = MemoryConfig(blocks=["app_cards"] if enabled else [])
+    memory = build_run_memory(config, "android")
+    messages = asyncio.run(memory.aget(snapshot=snapshot))
+    assert any("<app_card>" in (message.content or "") for message in messages) == enabled
 
 
 @pytest.mark.parametrize("method", list(InsertMethod))
@@ -151,9 +172,9 @@ def test_app_cards_server_then_platform_specific_local(snapshot, tmp_path):
         ) as client:
             block = AppCardBlock(platform="ios", cards_dir=tmp_path, client=client)
             assert await block.aget(snapshot=snapshot) == "ios guide"
-            snapshot.package = "browser"
+            snapshot.ui.phone_state["packageName"] = "browser"
             assert await block.aget(snapshot=snapshot) == "server guide"
-            snapshot.package = None
+            snapshot.ui.phone_state.pop("packageName")
             assert await block.aget(snapshot=snapshot) == ""
 
     asyncio.run(check())

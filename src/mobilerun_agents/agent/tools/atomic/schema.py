@@ -10,7 +10,7 @@ from llama_index.core.tools import BaseTool
 from mobilerun.models.context import JSONValue
 
 from mobilerun_agents.agent.run import Run
-from mobilerun_agents.config.prompts import render_selector_prompt
+from mobilerun_agents.config.prompts import render_prompt
 
 from ..helpers import coordinate_pairs
 
@@ -70,7 +70,7 @@ def from_schema(run: Run, member: BaseTool) -> tuple[list[AtomicTool], str]:
         AtomicTool(
             name,
             dict(zip(domains, values, strict=True)),
-            render_selector_prompt(
+            render_prompt(
                 run.config.decision.candidate_prompt,
                 kind="schema",
                 name=name,

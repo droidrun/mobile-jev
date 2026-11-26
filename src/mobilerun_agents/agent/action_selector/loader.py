@@ -121,7 +121,7 @@ def _llm_profile(config: MobileConfig, name: str) -> LLMProfile:
 
 async def build_setup(name: str | None, vision: Vision | None = None) -> SetupSpec:
     config = ConfigLoader.load()
-    selected = name if name is not None else config.default_setup or next(iter(config.setups), None)
+    selected = name if name is not None else config.default_setup
     if selected is None:
         for profile in config.profiles.values():
             match profile:

@@ -31,8 +31,8 @@ from mobilerun_agents.agent.logs.redaction import run_sensitive_values
 from mobilerun_agents.agent.planner import Finish, Plan, PlanningInput, SubgoalResult
 from mobilerun_agents.agent.tools.base import complete as finish_tool
 from mobilerun_agents.agent.workflows.agent import AgentWorkflow
-from mobilerun_agents.agent.workflows.events import Invalid, Select, StepFinished, Subgoal
-from mobilerun_agents.agent.workflows.planning import PlannerScreenshot, PlanningWorkflow
+from mobilerun_agents.agent.workflows.events import Invalid, Observed, StepFinished, Subgoal
+from mobilerun_agents.agent.workflows.planning import PlanningWorkflow
 from mobilerun_agents.config.loader import ConfigLoader
 from mobilerun_agents.config.user_config import (
     AgentConfig,
@@ -96,6 +96,36 @@ class Executor(ActionSelector):
         return ActionSelection(actions=[next(self.calls)], memory_update="counted")
 
 
+@pytest.mark.anyio
+async def test_explicit_resource_manager_does_not_share_child_device_or_memory():
+    from workflows.resource import ResourceManager
+
+    children = []
+
+    class Inspect(ActionSelector):
+        async def select(self, run):
+            children.append((run.device, run.memory))
+            return ActionSelection(actions=[complete()])
+
+    planner = ScriptedPlanner(
+        Plan(("first",)),
+        Plan(("second",)),
+        Finish(True, "done"),
+        Plan(("third",)),
+        Finish(True, "done"),
+    )
+    flow = PlanningWorkflow(planner, Inspect(), resource_manager=ResourceManager())
+    first, second = await resources(), await resources()
+    assert (await flow.run(**first)).success
+    assert (await flow.run(**second)).success
+    assert [device for device, _ in children] == [
+        first["device"],
+        first["device"],
+        second["device"],
+    ]
+    assert len({id(memory) for _, memory in children}) == 3
+
+
 @tool(sensitive_parameters=frozenset({"value"}))
 async def authorize(run: Run, value: str) -> str:
     """Apply a fake authorization value."""
@@ -111,7 +141,7 @@ class Selections(ActionSelector):
 
 
 @pytest.mark.anyio
-async def test_queued_subgoal_is_raw_for_planner_but_masked_in_context():
+async def test_queued_subgoal_is_raw_in_planner_request_and_state():
     marker = "FAKE_QUEUE / REVIEW_9"
     queued = f"Later target {marker}"
     planner = ScriptedPlanner(Plan(("First",)), Plan(("Next", queued)), Finish(True, "done"))
@@ -123,12 +153,11 @@ async def test_queued_subgoal_is_raw_for_planner_but_masked_in_context():
     handler = PlanningWorkflow(planner, executor).run(**await resources(), tools=[authorize])
     assert (await handler).success
     assert planner.turns[-1].remaining_plan == (queued,)
-    assert (await handler.ctx.store.get_state()).remaining_plan == ["Later target ***"]
-    assert marker not in json.dumps(handler.ctx.to_dict())
+    assert (await handler.ctx.store.get_state()).remaining_plan == [queued]
 
 
 @pytest.mark.anyio
-async def test_active_subgoal_is_raw_for_executor_but_masked_in_both_contexts(monkeypatch):
+async def test_active_subgoal_is_raw_in_both_contexts_but_masked_on_stream(monkeypatch):
     marker = "FAKE_ACTIVE_GOAL_876234"
     goal = f"Use {marker}"
     entered = asyncio.Event()
@@ -162,12 +191,11 @@ async def test_active_subgoal_is_raw_for_executor_but_masked_in_both_contexts(mo
         resume.set()
     events = [event async for event in handler.stream_events()]
     assert (await handler).success
-    completed = [json.dumps(child.ctx.to_dict()) for child in (handler, *children)]
     assert observed == [(goal, goal)] and planner.turns[-1].results[-1].goal == goal
     assert [event.text for event in events if isinstance(event, Subgoal)] == ["First", "Use ***"]
     assert marker not in repr(events)
-    assert all(marker not in snapshot for snapshot in [*active, *completed])
-    assert (await children[1].ctx.store.get_state()).goal == "Use ***"
+    assert all(marker in snapshot for snapshot in active)
+    assert (await children[1].ctx.store.get_state()).goal == goal
 
 
 @pytest.mark.anyio
@@ -187,8 +215,8 @@ async def test_child_notes_are_raw_for_planner_but_masked_on_output():
     finally:
         private_values.reset(token)
     assert planner.turns[-1].notes == (note,)
-    assert (await handler.ctx.store.get_state()).notes == ["Keep ***"]
-    assert marker not in repr(events) and marker not in json.dumps(handler.ctx.to_dict())
+    assert (await handler.ctx.store.get_state()).notes == [note]
+    assert marker not in repr(events)
 
 
 @pytest.mark.anyio
@@ -335,7 +363,7 @@ async def test_failed_child_reports_loop_evidence_and_planner_changes_approach(
         "Change the Amazon delivery location",
     ]
     serialized = json.dumps(handler.ctx.to_dict())
-    assert all(part not in repr(events) and part not in serialized for part in secret_parts)
+    assert all(part not in repr(events) and part in serialized for part in secret_parts)
     assert "Amazon says this item cannot ship" in serialized
     if reason == "cycle":
         assert any(
@@ -384,7 +412,7 @@ async def test_planning_masks_prior_child_secrets_on_stream_and_disk(tmp_path, m
     )
     config = MobileConfig()
     config.analytics.enabled = config.tracing.enabled = False
-    config.checkpoints.folder = tmp_path / "runs"
+    monkeypatch.setenv("MOBILERUN_AGENT_RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setattr(
         "mobilerun_agents.agent.operators._consumers.get_macro_settings",
         lambda: SimpleNamespace(macro_directory=tmp_path / "macros"),
@@ -418,14 +446,11 @@ async def test_planning_masks_prior_child_secrets_on_stream_and_disk(tmp_path, m
     assert f"Goal: Verify {marker}" in last_prompt
     assert f"two {marker}" in last_prompt and f"verified {marker}" in last_prompt
     saved_subgoal = (await handler.ctx.store.get_state()).results[-1]
-    assert saved_subgoal.goal == "two ***" and saved_subgoal.message == "verified ***"
-    snapshots = [event.snapshot for event in events if isinstance(event, Select)]
-    assert snapshots[3].goal == "two ***" and snapshots[3].ui_elements[0]["text"] == "***"
-    screenshots = [event.screenshot for event in events if type(event) is Select]
-    assert screenshots[0] == b"screen" and all(image is None for image in screenshots[2:])
+    assert saved_subgoal.goal == f"two {marker}" and saved_subgoal.message == f"verified {marker}"
+    assert [event.step for event in events if isinstance(event, Observed)] == list(range(1, 7))
     assert all(marker not in repr(event) for event in events)
     assert all(
-        marker not in repr(event.pre_state) for event in events if isinstance(event, StepFinished)
+        not hasattr(event.action, "before") for event in events if isinstance(event, StepFinished)
     )
     assert all(marker not in path.read_text() for path in Path(folder).rglob("*.json"))
     macro_path = tmp_path / "macros/test-run/macro.json"
@@ -568,7 +593,7 @@ async def test_planner_receives_screen_summary_without_screenshot():
             return Finish(True, "done")
 
     handler = PlanningWorkflow(SeeingPlanner(), Executor()).run(**await resources())
-    turns = [event async for event in handler.stream_events() if isinstance(event, Select)]
+    turns = [event async for event in handler.stream_events() if isinstance(event, Observed)]
     assert (await handler).success
     assert not turns
 
@@ -642,10 +667,7 @@ async def test_planner_observes_screen_after_undescribed_completion(
     ]
     assert images == ([png] if vision and observe else [])
     assert params["device"].screenshot.await_count == len(images)
-    assert [event.image for event in events if isinstance(event, PlannerScreenshot)] == (
-        [] if protected else images
-    )
-    assert all(event.screenshot is None for event in events if isinstance(event, Select))
+    assert all("screenshot" not in event.model_dump() for event in events)
 
 
 @pytest.mark.anyio
@@ -667,7 +689,7 @@ async def test_planner_reviews_text_when_device_cannot_screenshot():
     assert not first.observe_screen
     assert all(turn.observe_screen and turn.ui == "screen" for turn in (review, repaired))
     assert all(turn.screenshot is None for turn in planner.turns)
-    assert not any(type(event) is PlannerScreenshot for event in events)
+    assert all("screenshot" not in event.model_dump() for event in events)
     screenshot.assert_awaited_once_with()
 
 
@@ -819,7 +841,7 @@ async def test_subgoal_limit_returns_failure_and_replans_with_continuous_events(
     assert (await handler).success
     assert [e.text for e in events if isinstance(e, Subgoal)] == ["first", "replacement"]
     assert [e.action.step for e in events if isinstance(e, StepFinished)] == [1, 2]
-    assert [e.snapshot.step for e in events if isinstance(e, Select)] == [1, 2]
+    assert [e.step for e in events if isinstance(e, Observed)] == [1, 2]
     prompt = planner._turns[1][0][0].content
     assert "Failed: first: step limit reached" in prompt and '["remaining"]' in prompt
 
