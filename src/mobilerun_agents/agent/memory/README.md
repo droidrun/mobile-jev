@@ -54,6 +54,8 @@ does nothing on put, and raises `TypeError` if read without `state=` or `redact=
 Android and iOS for apps with a bundled card. To disable them, omit `app_cards`
 from `memory.executor.blocks`. Delete the removed top-level `memory.blocks` key.
 `last_step` includes every call from the previous step and its screen transition.
+It masks call arguments and the executor's thought, but keeps result summaries
+unmasked so the executor can use a just-fetched value such as a verification code.
 The saved before-screenshot is optional (`memory.executor.last_step_screenshot`,
 default `true`); only vision-enabled LLM selectors send it. `history` shows the
 previous `memory.executor.history` steps (default `5`), excluding `last_step`,

@@ -45,7 +45,9 @@ def _render_failure(result: SubgoalResult, redact: Redactor) -> str:
         ("Recent action results", summary.actions),
     ):
         if items:
-            lines.extend([f"{title}:", *(f"- {clip(item, 240, redact)}" for item in items)])
+            lines.extend(
+                [f"{title}:", *(f"- {redact.text(clip(item, 240, redact))}" for item in items)]
+            )
     return "\n".join(lines)
 
 

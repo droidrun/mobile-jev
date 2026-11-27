@@ -919,9 +919,9 @@ async def test_failure_summary_never_clips_through_protected_values(make_workflo
     await workflow.run(goal="Advance")
 
     summary = _render_failure(planner.states[1].results[0], planner.redact)
-    suffix = "" if position in {"crossing", "encoded_crossing"} else marker[:remaining]
+    suffix = {"ends_at_cut": "***", "unprotected": marker[:remaining]}.get(position, "")
     assert f"- {thought_prefix}{suffix}\n" in summary
-    assert f" — {screen_prefix}{planner.redact.text(suffix)} ×1\n" in summary
+    assert f" — {screen_prefix}{suffix} ×1\n" in summary
 
 
 @pytest.mark.anyio
@@ -939,8 +939,8 @@ async def test_failure_summary_never_splits_protected_thoughts(make_workflow, se
     await workflow.run(goal="Advance")
 
     summary = _render_failure(planner.states[1].results[0], planner.redact)
-    assert "fixture-a" not in planner.redact.text(summary)
-    assert summary.count(f"- {thought}\n") == 2
+    assert "fixture-a" not in summary and "fixture-b" not in summary
+    assert summary.count("- Blocked by *** while signing in.\n") == 2
 
 
 @pytest.mark.anyio

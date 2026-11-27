@@ -49,13 +49,14 @@ class LastStepBlock(StateBlock[AgentState, list[ContentBlock]]):
             calls=[
                 (
                     record.call.tool_name,
-                    json.dumps(record.call.tool_kwargs),
+                    json.dumps(redact.value(record.call.tool_kwargs)),
                     record.ok,
+                    # Keep the latest result raw so the executor can use a just-fetched code.
                     record.summary,
                 )
                 for record in records
             ],
-            thought=first.thought,
+            thought=redact.text(first.thought) if first.thought else None,
             before=_screen(before, redact),
             after=_screen(state.current, redact),
             screen_changed=first.screen_changed,

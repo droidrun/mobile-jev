@@ -291,6 +291,29 @@ def test_executor_config_and_last_step_content(snapshot, screenshot_enabled, tmp
     asyncio.run(check())
 
 
+def test_latest_step_masks_arguments_and_thought_but_keeps_result(snapshot):
+    redact = Redactor()
+    redact.add("protected-account")
+    redact.add("fixture-code")
+    action = ActionRecord(
+        step=1,
+        call=ToolSelection(
+            tool_id="fetch",
+            tool_name="fetch_code",
+            tool_kwargs={"account": "protected-account"},
+        ),
+        ok=True,
+        summary="Verification code: fixture-code",
+        thought="Check protected-account",
+        before=snapshot,
+    )
+    (block,) = asyncio.run(LastStepBlock().render(AgentState(actions=[action]), redact))
+    assert block.text.splitlines()[1:3] == [
+        'fetch_code({"account": "***"}) · ok=true: Verification code: fixture-code',
+        "Thought: Check ***",
+    ]
+
+
 def test_shared_engine_keeps_sessions_separate_and_is_caller_owned():
     async def check():
         engine = memory_module._private_engine()
