@@ -6,8 +6,8 @@ from collections.abc import Callable
 from itertools import groupby
 from typing import Any, Literal, cast
 
-from llama_index.core.base.llms.types import ImageBlock
-from mobilerun.errors import DeviceOperationNotSupported
+from llama_index.core.tools import ToolSelection
+from mobilerun.core.runs import recording_scope
 from mobilerun.models.context import JSONValue
 from pydantic import BaseModel, PositiveInt, ValidationError
 from workflows import Context, Workflow, step
@@ -30,11 +30,14 @@ from mobilerun_agents.agent.events import (
     Subgoal,
 )
 from mobilerun_agents.agent.memory.memory import _RunMemory, prepare_child_memory
+from mobilerun_agents.agent.memory.registry import block_tools
 from mobilerun_agents.agent.planner import Finish, Plan, Planner
 from mobilerun_agents.agent.planner.base import remaining_child_steps, remaining_steps
+from mobilerun_agents.agent.tools.helpers.errors import tool_error_summary
 from mobilerun_agents.config.user_config import AgentConfig, MemoryConfig, MobileConfig
 
 from .agent import AgentWorkflow
+from .core.privacy import mask_value
 from .core.snapshot import StepSnapshot
 from .core.state import (
     ActionRecord,
@@ -43,8 +46,9 @@ from .core.state import (
     Outcome,
     PlanningState,
     SubgoalResult,
+    clear_latest_action_screenshots,
 )
-from .resources import DeviceResource, MemoryResource, ServicesResource, run_resources
+from .resources import DeviceResource, MemoryResource, Services, ServicesResource, run_resources
 
 _log = logging.getLogger(__name__)
 
@@ -93,11 +97,6 @@ def _offset(action: ActionRecord, offset: int) -> ActionRecord:
     return action.model_copy(update={"step": action.step + offset})
 
 
-def _unlink_screenshot(snapshot: StepSnapshot) -> None:
-    if snapshot.screenshot is not None and snapshot.screenshot.path is not None:
-        snapshot.screenshot.path.unlink(missing_ok=True)
-
-
 def _screen(snapshot: StepSnapshot) -> tuple[str | None, str | None]:
     phone = snapshot.ui.phone_state
     return phone.get("packageName"), phone.get("activityName")
@@ -107,12 +106,7 @@ def _record_subgoal_screen(
     result: SubgoalResult, before: StepSnapshot, after: StepSnapshot
 ) -> None:
     result.before_screen, result.after_screen = _screen(before), _screen(after)
-    if result.before_screen != result.after_screen:
-        result.screen_changed = True
-    elif (changed := before.compare(after)) is not None:
-        result.screen_changed = changed
-    elif before.ui.formatted_text or after.ui.formatted_text:
-        result.screen_changed = before.ui.formatted_text != after.ui.formatted_text
+    result.screen_changed = before.compare(after)
 
 
 def executor_kind(
@@ -189,16 +183,8 @@ class PlanningWorkflow(Workflow):
                 )
             case SubgoalDone():
                 pass
-        snapshot = StepSnapshot(
-            ui=await device.state.refresh(), device_context=list(await device.context())
-        )
-        try:
-            image = await device.screenshot()
-        except DeviceOperationNotSupported:
-            pass
-        else:
-            if image:
-                snapshot.screenshot = ImageBlock(path=services.images.save(image))
+        with recording_scope(enabled=False):
+            snapshot = await StepSnapshot.observe(device, screenshot=True)
         # Unlike action snapshots, only the current planner observation is retained.
         if state.current is not None:
             if state.results:
@@ -206,7 +192,7 @@ class PlanningWorkflow(Workflow):
                 result = state.results[-1].model_copy()
                 _record_subgoal_screen(result, state.current, snapshot)
                 state.results[-1] = result
-            _unlink_screenshot(state.current)
+            state.current.screenshot = None
         state.current = snapshot
         await ctx.store.set_state(state)
         phone = snapshot.ui.phone_state
@@ -226,21 +212,46 @@ class PlanningWorkflow(Workflow):
         ctx: Context[PlanningState],
         ev: PlanTurn,
         memory: MemoryResource,
+        services: ServicesResource,
     ) -> RunSubgoal | StopEvent:
         state = await ctx.store.get_state()
         repair = None
+        feedback = None
         output_attempts = 0
+        registry = services.registry.with_tools(block_tools(memory.memory_blocks))
+        tools = registry.tools(exclude=services.registry.by_name)
+        tool_names = {member.metadata.get_name() for member in tools}
         while remaining_steps(state) > 0:
             state.planner_turns += 1
             child_budget = min(self.config.planning.subgoal_steps, remaining_child_steps(state))
             complete_only = child_budget <= 0
             await ctx.store.set_state(state)
             try:
-                decision = await self.planner.bind(self.output_schema, repair).plan(ctx, memory)
+                with recording_scope(enabled=False):
+                    planner = self.planner.bind(self.output_schema, repair)
+                    decision = await planner.with_tools(tools, feedback).plan(ctx, memory)
             except InvalidResponse:
                 repair = "Invalid planner tool call"
                 continue
             match decision:
+                case ToolSelection() as call:
+                    if remaining_steps(state) <= 0 or call.tool_name not in tool_names:
+                        repair = "Call complete on the final turn; otherwise use an available tool."
+                        continue
+                    repair = registry.validate(call)
+                    if repair is not None:
+                        continue
+                    with recording_scope(enabled=False):
+                        try:
+                            feedback = str(
+                                mask_value(
+                                    str(await registry.execute(call, ctx)),
+                                    registry.device.known_codes_redactor(),
+                                )
+                            )
+                        except Exception as exc:
+                            feedback = tool_error_summary(exc)
+                    state = await ctx.store.get_state()
                 case Plan(subgoals=subgoals, findings=findings):
                     if complete_only:
                         repair = "Call complete when there is no budget for another subgoal."
@@ -317,10 +328,11 @@ class PlanningWorkflow(Workflow):
         start = len(state.actions)
         child = None
         try:
+            registry = services.registry.with_tools(block_tools(memory.memory_blocks))
             child = AgentWorkflow(
                 self.executor,
                 config=self.config,
-                resource_manager=await run_resources(device, memory, services),
+                resource_manager=await run_resources(device, memory, Services(registry)),
                 timeout=None,
             ).run(goal=ev.goal, max_steps=ev.max_steps)
             child_ctx = cast(Context[AgentState], child.ctx)
@@ -332,6 +344,8 @@ class PlanningWorkflow(Workflow):
                         event = event.model_copy(update={"step": number + offset})
                     case Acted(action=action):
                         child_state = await child_ctx.store.get_state()
+                        if len(state.actions) == start:
+                            clear_latest_action_screenshots(state.actions)
                         state.actions = [
                             *state.actions[:start],
                             *(
@@ -341,6 +355,7 @@ class PlanningWorkflow(Workflow):
                             ),
                         ]
                         await ctx.store.set_state(state)
+                        # Recorder indices are run-global; offset only the child workflow step.
                         event = event.model_copy(update={"action": _offset(action, offset)})
                 ctx.write_event_to_stream(event)
             await child

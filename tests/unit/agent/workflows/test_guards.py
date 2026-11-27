@@ -27,7 +27,7 @@ from mobilerun_agents.config.user_config import AgentConfig
 )
 def test_guards(screens, names, max_steps, reason):
     snapshots = [
-        StepSnapshot(ui=UIState([{"text": screen}], "", "", {}, 10, 10), device_context=[])
+        StepSnapshot(ui=UIState([{"resourceId": screen}], "", "", {}, 10, 10), device_context=[])
         for screen in screens
     ]
     state = AgentState(goal="Find the screen", max_steps=max_steps, current=snapshots[-1])
@@ -50,6 +50,35 @@ def test_guards(screens, names, max_steps, reason):
 
 
 @pytest.mark.anyio
+async def test_scrolling_new_text_on_same_structure_is_progress():
+    def snapshot(page):
+        return StepSnapshot(
+            ui=UIState(
+                [{"resourceId": "row", "text": page}], page, "", {"packageName": "shop"}, 100, 100
+            )
+        )
+
+    first = snapshot("Page 0")
+    state = AgentState(current=first)
+    for step in range(1, 6):
+        before, after = state.current, snapshot(f"Page {step}")
+        assert before.fingerprint == after.fingerprint == first.fingerprint
+        state.actions.append(
+            ActionRecord(
+                step=step,
+                before=before,
+                ok=True,
+                summary="scroll",
+                call=ToolSelection(tool_id=str(step), tool_name="swipe", tool_kwargs={}),
+                screen_changed=before.compare(after),
+            )
+        )
+        state.current = after
+    assert all(action.screen_changed is True for action in state.actions)
+    assert check(state, AgentConfig(no_progress_fail_after=5)) is None
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("variation", ["same", "index", "target", "argument", "tool"])
 async def test_zip_sheet_repeat_ignores_carousel_changes(variation):
     state = AgentState(max_steps=25)
@@ -60,7 +89,7 @@ async def test_zip_sheet_repeat_ignores_carousel_changes(variation):
         return StepSnapshot(
             ui=UIState(
                 [
-                    {"index": 0, "text": f"Carousel frame {n}"},
+                    {"index": 0, "resourceId": f"carousel-frame-{n}"},
                     {
                         "index": 26 + n if variation == "index" else 26,
                         "className": "android.widget.TextView",
@@ -147,7 +176,9 @@ def test_target_uses_before_snapshot_not_element_index():
 
 def _history(screens: str, calls_per_step: tuple[int, ...]) -> AgentState:
     snapshots = [
-        StepSnapshot(ui=UIState([{"text": screen}] if screen != "?" else [], "", "", {}, 10, 10))
+        StepSnapshot(
+            ui=UIState([{"resourceId": screen}] if screen != "?" else [], "", "", {}, 10, 10)
+        )
         for screen in screens
     ]
     return AgentState(

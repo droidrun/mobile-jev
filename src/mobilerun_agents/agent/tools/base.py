@@ -14,9 +14,11 @@ from mobilerun.core.extensions import Action
 from mobilerun.core.extensions.actions import Declaration
 from workflows import Context
 
-from mobilerun_agents.agent.workflows.core.state import AgentState
+from mobilerun_agents.agent.workflows.core.state import AgentState, PlanningState
 
 from .helpers.usage import IndexedToolMetadata
+
+RunContext = Context[AgentState] | Context[PlanningState]
 
 
 @dataclass(frozen=True)
@@ -26,9 +28,7 @@ class Tool:
 
     injected: dict[str, str]
 
-    async def invoke(
-        self, ctx: Context[AgentState], device: Device, arguments: dict[str, Any]
-    ) -> Any:
+    async def invoke(self, ctx: RunContext, device: Device, arguments: dict[str, Any]) -> Any:
         resources = {"context": ctx, "device": device}
         return await self.function(
             **arguments, **{name: resources[kind] for name, kind in self.injected.items()}
@@ -134,7 +134,7 @@ class RegistryTool(AsyncBaseTool):
     def __init__(
         self,
         metadata: ActionMetadata,
-        invoke: Callable[[Context[AgentState], dict[str, Any]], Awaitable[object]],
+        invoke: Callable[[RunContext, dict[str, Any]], Awaitable[object]],
         action: Action | None = None,
     ) -> None:
         self._metadata, self._invoke, self.action = metadata, invoke, action
@@ -149,5 +149,5 @@ class RegistryTool(AsyncBaseTool):
     async def acall(self, *args: Any, **kwargs: Any) -> ToolOutput:
         raise TypeError("Use ToolRegistry.execute with a workflow context")
 
-    async def execute(self, ctx: Context[AgentState], args: dict[str, Any]) -> object:
+    async def execute(self, ctx: RunContext, args: dict[str, Any]) -> object:
         return await self._invoke(ctx, args)

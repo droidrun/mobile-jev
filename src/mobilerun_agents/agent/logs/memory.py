@@ -2,6 +2,9 @@
 
 import logging
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 
 from llama_index.core.llms import ChatMessage, TextBlock
 from llama_index.core.memory import Memory
@@ -11,6 +14,17 @@ from mobilerun_agents.agent.events import Detail
 from mobilerun_agents.agent.workflows.core.state import AgentState, PlanningState
 
 _log = logging.getLogger("mobilerun_agents.agent.logs.console")
+_record_memory = ContextVar("record_agent_memory", default=False)
+
+
+@asynccontextmanager
+async def memory_evidence_scope(enabled: bool) -> AsyncIterator[None]:
+    """Emit memory events for an actual recording, even with a quiet console."""
+    token = _record_memory.set(enabled)
+    try:
+        yield
+    finally:
+        _record_memory.reset(token)
 
 
 class MemoryDetail(Detail):
@@ -30,7 +44,7 @@ def report_memory(
     messages: list[ChatMessage],
     selector: str = "jev",
 ) -> None:
-    if not _log.isEnabledFor(logging.DEBUG):
+    if not _record_memory.get() and not _log.isEnabledFor(logging.DEBUG):
         return
 
     blocks = dict.fromkeys((block.name for block in memory.memory_blocks), "")
@@ -47,13 +61,13 @@ def report_memory(
         # blocks in one text block, whether inserted under the system or user role.
         for block in message.blocks:
             match block:
-                case TextBlock(text=text) if text.startswith("<memory>\n") and text.endswith(
-                    "\n</memory>"
-                ):
+                case TextBlock(text=rendered) if rendered.startswith(
+                    "<memory>\n"
+                ) and rendered.endswith("\n</memory>"):
                     for name in blocks:
                         found = re.search(
                             rf"^<{re.escape(name)}>\n(.*?)\n</{re.escape(name)}>$",
-                            text,
+                            rendered,
                             re.M | re.S,
                         )
                         if found is not None:

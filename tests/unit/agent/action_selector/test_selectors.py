@@ -241,7 +241,7 @@ def test_typesafe_image_limits_and_coverage(image):
 @pytest.mark.anyio
 @pytest.mark.parametrize("kind", ["llm", "jev"])
 @pytest.mark.parametrize("level", ["DEBUG", "INFO"])
-async def test_selector_reports_only_debug_memory(kind, level, caplog, tmp_path):
+async def test_selector_reports_only_debug_memory(kind, level, caplog):
     class Chat(LLMSelector):
         async def _achat(self, messages, **kwargs):
             return None
@@ -280,7 +280,7 @@ async def test_selector_reports_only_debug_memory(kind, level, caplog, tmp_path)
 
     (detail,) = details
     assert "Find order\nfull block second line" in detail.text
-    console = ConsoleLog(tmp_path)
+    console = ConsoleLog(lambda text: text)
     console.event(Observed(step=31))
     console.event(detail)
     (compact,) = [message for message in caplog.messages if "memory: " in message]
@@ -289,5 +289,3 @@ async def test_selector_reports_only_debug_memory(kind, level, caplog, tmp_path)
     assert "goal: Find order" in compact
     assert "full block second line" not in compact
     assert "msgs" not in compact
-    saved = (tmp_path / "memory/0031.txt").read_text()
-    assert "Find order\nfull block second line" in saved

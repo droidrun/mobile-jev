@@ -24,16 +24,21 @@ class Answer(BaseModel):
     count: int
 
 
-def test_comparison_distinguishes_changes_from_incompatible_observations():
-    ui = UIState([], "", "", {}, 100, 100)
-    first = StepSnapshot(ui=ui, screenshot=ImageBlock(image=b"A"))
-    second = StepSnapshot(ui=ui, screenshot=ImageBlock(image=b"B"))
-    missing = StepSnapshot(ui=ui)
-    tree = StepSnapshot(ui=UIState([{"text": "Settings"}], "", "", {}, 100, 100))
+def test_comparison_uses_structural_identity_not_text_or_pixels():
+    def snapshot(resource_id, text, image):
+        return StepSnapshot(
+            ui=UIState([{"resourceId": resource_id, "text": text}], "", "", {}, 100, 100),
+            screenshot=ImageBlock(image=image),
+        )
+
+    first = snapshot("settings", "Settings", b"A")
+    second = snapshot("settings", "Einstellungen", b"B")
+    tree = snapshot("inbox", "Settings", b"A")
+    missing = StepSnapshot(ui=UIState([], "", "", {}, 100, 100))
     assert first.compare(first) is False
-    assert first.compare(second) is True
+    assert first.compare(second) is False
     assert first.compare(missing) is None
-    assert first.compare(tree) is None
+    assert first.compare(tree) is True
 
 
 def test_click_uses_context_observation_not_newer_live_tree():

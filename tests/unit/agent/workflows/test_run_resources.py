@@ -48,9 +48,9 @@ def test_prebuilt_resources_are_injected_per_workflow_and_child():
         device = Mock(spec=Device)
         first = build_executor_memory(MobileConfig(), "android")
         child = build_executor_memory(MobileConfig(), "android")
-        registry, images = Mock(), Mock()
-        parent_services = Services(registry=registry, images=images)
-        child_services = Services(registry=registry, images=images)
+        registry = Mock()
+        parent_services = Services(registry=registry)
+        child_services = Services(registry=registry)
         parent_flow = Probe(resource_manager=await run_resources(device, first, parent_services))
         child_flow = Probe(resource_manager=await run_resources(device, child, child_services))
         assert await asyncio.gather(parent_flow.run(), child_flow.run()) == [

@@ -14,6 +14,7 @@ from pydantic import (
     NonNegativeFloat,
     PositiveFloat,
     PositiveInt,
+    PrivateAttr,
     ValidationError,
     ValidationInfo,
     field_validator,
@@ -222,13 +223,13 @@ class ToolsConfig(Section):
     }
 
 
-class CheckpointsConfig(Section):
+class RecordingConfig(Section):
     enabled: bool = True
 
 
 _MEMORY_BLOCKS = {
     "executor": ("setup", "goal", "last_step", "history", "app_cards"),
-    "planner": ("setup", "goal", "findings", "last_subgoal", "subgoal_history"),
+    "planner": ("setup", "goal", "last_subgoal", "subgoal_history"),
 }
 
 
@@ -258,6 +259,7 @@ class MemoryConfig(Section):
 
 
 class MobileConfig(Section):
+    _recording_override: tuple[bool, bool] | None = PrivateAttr(default=None)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     profiles: dict[str, Profile] = Field(default_factory=dict)
     setups: dict[str, SetupConfig] = Field(default_factory=dict)
@@ -266,7 +268,7 @@ class MobileConfig(Section):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     analytics: TelemetryConfig = Field(default_factory=TelemetryConfig)
     tracing: TracingConfig = Field(default_factory=TracingConfig)
-    checkpoints: CheckpointsConfig = Field(default_factory=CheckpointsConfig)
+    recording: RecordingConfig = Field(default_factory=RecordingConfig)
 
     @model_validator(mode="after")
     def _references(self) -> Self:
@@ -288,6 +290,10 @@ class MobileConfig(Section):
     @classmethod
     def validate_file_data(cls, data: object) -> Self:
         if type(data) is dict:
+            if "checkpoints" in data:
+                raise OldConfigKeys(
+                    "Replace checkpoints.enabled with recording.enabled in agents.yaml."
+                )
             memory = data.get("memory")
             if type(memory) is dict:
                 if "blocks" in memory:

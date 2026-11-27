@@ -2,13 +2,13 @@
 
 **Purpose:** Decide the next subgoals or finish the overall run.
 
-**What belongs here / what doesn't:** Planners receive `Context[PlanningState]` and run-scoped LlamaIndex `Memory` and return a decision. They do not execute actions or write workflow state. `LlamaIndexPlanner` requires a `set_plan` or `complete` tool call. It sends system instructions, memory, then a step message with the full current UI and device context. Vision-capable models also get the current screenshot if available.
+**What belongs here / what doesn't:** Planners receive `Context[PlanningState]` and run-scoped LlamaIndex `Memory` and return a decision. They do not execute actions or write workflow state. `LlamaIndexPlanner` requires a `set_plan`, `complete`, or configured memory-tool call. It sends system instructions, memory, then a step message with the full current UI and device context. Vision-capable models also get the current screenshot if available.
 
-`memory.planner.blocks` selects and orders setup, goal, findings, the last subgoal, and older subgoal history. The latest subgoal includes the before and after app/activity, failure evidence, and any raw Jev abstention data. Older entries are capped by `memory.planner.options.subgoal_history.subgoals` (default 5) and dropped oldest first under token pressure. The planner stores no chat history. When restoring a checkpoint, rebuild memory using the restored state's executor kind; `read_memory(memory, ctx)` renders from persisted state.
+`memory.planner.blocks` defaults to setup, goal, the last subgoal, and older subgoal history. The latest subgoal includes the before and after app/activity, failure evidence, and any raw Jev abstention data. Older entries are capped by `memory.planner.options.subgoal_history.subgoals` (default 5) and dropped oldest first under token pressure. The planner stores no chat history; `read_memory(memory, ctx)` renders from live workflow state.
 
 Planner turns and executor actions each use one step from the same budget. If only one step remains when the planner is called, it must call `complete` and report any blocker instead of setting another plan.
 
-`set_plan` can include findings from the current screen, such as a shop's price. The workflow keeps them alongside child notes for later planner turns. It does not pass them to the executor.
+`set_plan` can include findings from the current screen, such as a shop's price. The workflow keeps them alongside child notes for later planner turns and shows them in `goal` by default. Add `notes` to `memory.planner.blocks` to show them separately and enable `note(text)`. A planner memory-tool call consumes one turn and is unavailable on the final turn. Planner notes are not passed to the executor.
 
 **Contents:**
 

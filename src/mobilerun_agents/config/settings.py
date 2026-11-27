@@ -1,8 +1,5 @@
 """Agent-owned settings, read fresh at call time using exact environment field names."""
 
-from pathlib import Path
-
-from mobilerun.config.settings import get_settings
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -28,27 +25,8 @@ class _Environment(BaseSettings):
 
 
 class AgentSettings(_Environment):
-    MOBILERUN_AGENT_RUNS_DIR: str = ""
-    """Parent directory for agent run checkpoints and diagnostics."""
-
-    MOBILERUN_AGENT_IMAGES_DIR: str = ""
-    """Parent directory for agent run screenshots."""
-
-    @property
-    def runs_dir(self) -> Path:
-        return self._directory(self.MOBILERUN_AGENT_RUNS_DIR, "runs")
-
-    @property
-    def images_dir(self) -> Path:
-        return self._directory(self.MOBILERUN_AGENT_IMAGES_DIR, "images")
-
-    @staticmethod
-    def _directory(value: str, default: str) -> Path:
-        return (
-            Path(value).expanduser()
-            if value
-            else get_settings().MOBILERUN_USER_CONFIG_DIR / default
-        ).absolute()
+    MOBILERUN_AGENT_RECORDING_ENABLED: bool | None = None
+    """Override the agents.yaml recording preference when set."""
 
     MOBILERUN_FINALIZE_TELEMETRY_SECONDS: float = 10.0
     """Finalize telemetry seconds."""

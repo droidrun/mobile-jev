@@ -7,6 +7,7 @@ from math import isfinite
 from typing import Any
 
 from mobilerun.core.state.ui_state import UIState
+from mobilerun.models.recording import Fingerprint
 
 from .state import ActionRecord
 
@@ -180,12 +181,12 @@ def unchanged_steps(actions: Sequence[ActionRecord]) -> int:
     return len({record.step for record in unchanged})
 
 
-def cycle_visits(actions: Sequence[ActionRecord], current: tuple[str, str] | None) -> int:
+def cycle_visits(actions: Sequence[ActionRecord], current: Fingerprint | None) -> int:
     """Count visits to the current screen since the last unknown or newly seen screen."""
     if current is None:
         return 0
     history = [record.before.fingerprint for record in actions] + [current]
-    previous_screens: set[tuple[str, str]] = set()
+    previous_screens: set[Fingerprint] = set()
     visits = 0
     for screen, _ in groupby(history):
         if screen is None:

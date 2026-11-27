@@ -25,7 +25,7 @@ result = await AgentOperator().execute(device, "Read the battery level")
 result = await PlanningOperator().execute(device, "Find and report the app version")
 
 # Replay a macro, handing off to an agent if the screen diverges
-result = await MacroAgentOperator("macro.json").execute(device, "Finish the task")
+result = await MacroAgentOperator("macros/my-task/v1.jsonl").execute(device, "Finish the task")
 ```
 
 ### External operators
@@ -54,19 +54,20 @@ To add context without replacing the operator, [write a memory block](src/mobile
 
 ## Saved data and diagnostics
 
-The agent uses four workflow steps: observe → select → act → finish. Planning uses three: observe → plan → execute a child agent, with one planner memory per run and a fresh executor memory for each child. Blocks render from workflow state, not chat history. The device, LlamaIndex memory, tool registry and image store are live resources, not checkpoint data.
+The agent uses four workflow steps: observe → select → act → finish. Planning uses three: observe → plan → execute a child agent, with one planner memory per run and a fresh executor memory for each child. Blocks render from workflow state, not chat history. Screenshots used in prompts stay in memory; the agent never writes them to disk.
 
 Each planner turn and executor action costs one step. Override the total with `PlanningOperator.execute(max_steps=...)`. The run stops when the budget runs out. If the planner takes the last step, it must call `complete` and report what blocked it if the goal is unfinished.
 
-Run data is organized by run ID. Empty directory overrides use the defaults.
+The device decides what is recorded. The agent reuses an existing recorder or wraps a plain device in `RecordingDevice(capture="actions")`. Set `record=False`, use `--no-record`, set `recording.enabled: false`, or set `MOBILERUN_AGENT_RECORDING_ENABLED=false` to opt out of agent recording (explicit operator settings take precedence).
 
-| Data | Environment override | Default | Layout |
-|---|---|---|---|
-| Native workflow checkpoint | `MOBILERUN_AGENT_RUNS_DIR` | `<MOBILERUN_USER_CONFIG_DIR>/runs` | `<runs>/<run_id>/context.json` |
-| Screenshots | `MOBILERUN_AGENT_IMAGES_DIR` | `<MOBILERUN_USER_CONFIG_DIR>/images` | `<images>/<run_id>/NNNN.png` |
+| Recording | What core saves |
+|---|---|
+| Explicit `RecordingDevice(capture="full")` (recorder default) | Action, arguments, outcome and timing, plus before/after fingerprints, redacted UI and context JSON, and **unredacted** screenshots when available. |
+| Agent auto-wraps a plain device with `capture="actions"` | Action, arguments (secrets and known OTPs masked), outcome and timing. No extra observations for recording. |
+| `StealthDevice` anywhere in the chain or recording opt-out (e.g. `--no-record`) | Nothing during the agent run, even with an existing recorder. |
 
-With checkpoints enabled, the operator saves the native LlamaIndex context after each step and at completion. It exports a macro from the saved action history into the base Mobilerun macro directory. Step snapshots point to image files; checkpoints don't embed screenshot bytes. When checkpoints are disabled, the image directory is deleted at the end. Treat checkpoints, screenshots and macros as private device data.
+Core writes `run.json`, `steps.jsonl` and, for full recording, `screens/` under `<MOBILERUN_RUNS_DIR>/<run_id>/`. The agent adds only `agent.json` with reasoning linked to step IDs. Macros are built from `steps.jsonl` into `<MOBILERUN_MACRO_DIRECTORY>/<name>/vN.jsonl`. Actions-only macros replay without screen guards, but repair needs a recorded after fingerprint. Treat run records, screenshots and macros as private device data.
 
-Use `mobilerun --debug agent run …` for selector choices, model-call diagnostics, run details and tracebacks. The agent uses standard logging; Mobilerun's `secret_scope` masks sensitive values in log records during sensitive calls. Run data, including checkpoints, screenshots, macros and results, is stored unmasked.
+Use `mobilerun --debug agent run …` for selector choices, model-call diagnostics, run details and tracebacks. The agent uses standard logging; Mobilerun's `secret_scope` masks sensitive values in log records during sensitive calls. Persisted agent evidence is sanitized; run data and macros remain private device data.
 
 See [demo instructions](tests/demo/README.md), [contributing](CONTRIBUTING.md), and [MIT license](LICENSE).

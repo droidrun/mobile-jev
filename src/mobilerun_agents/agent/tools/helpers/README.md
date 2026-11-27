@@ -4,8 +4,8 @@
 
 **What belongs here / what doesn't:** Helpers may use run state and core contracts, but must not depend on the registry or atomic expansion.
 
-**Contents:** `__init__.py` — shared exports; `elements.py` — element targeting and labels; `coordinates.py` — coordinate fields, dimensions, and bounds; `errors.py` — tool failure summaries; `usage.py` — schema-derived coordinate and UI-index tool names; `images.py` — `ImageStore`, which writes each screenshot once under `MOBILERUN_AGENT_IMAGES_DIR` and removes the run's images when checkpoints are disabled.
+**Contents:** `__init__.py` — shared exports; `elements.py` — element targeting and labels; `coordinates.py` — coordinate fields, dimensions, and bounds; `errors.py` — tool failure summaries; `usage.py` — schema-derived coordinate and UI-index tool names.
 
-**Examples:** `check_point(x, y, ui, provider)` checks device coordinates against the pinned observation. `ImageStore.save(data)` writes the screenshot bytes and returns its path.
+**Examples:** `check_point(x, y, ui, provider)` checks device coordinates against the pinned observation.
 
 **Depends on / used by:** Tools and selectors use these helpers.

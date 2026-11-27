@@ -16,13 +16,13 @@ def test_clean_config_round_trip(tmp_path):
     path = tmp_path / "agent.yaml"
     path.write_text(
         "agent: {max_steps: 7, planning_max_steps: 19, planning: {subgoal_steps: 4}}\n"
-        "checkpoints: {enabled: true}\nmemory: {token_limit: 9000}\n"
+        "recording: {enabled: false}\nmemory: {token_limit: 9000}\n"
     )
     config = ConfigLoader.load(str(path))
     assert config.agent.max_steps == 7 and config.memory.token_limit == 9000
     assert config.agent.planning_max_steps == 19
     assert config.agent.planning.subgoal_steps == 4
-    assert config.checkpoints.enabled
+    assert config.recording.enabled is False
     assert config.profiles == {} and config.setups == {} and config.default_setup is None
     assert MobileConfig.model_validate(config.model_dump(mode="json")) == config
 
@@ -42,7 +42,6 @@ def test_memory_block_defaults_and_custom_order():
     assert default.planner.blocks == [
         "setup",
         "goal",
-        "findings",
         "last_subgoal",
         "subgoal_history",
     ]
@@ -95,23 +94,48 @@ def test_post_action_settle_defaults_and_bounds():
         MobileConfig.model_validate({"agent": {"settle_delay": -1}})
 
 
-@pytest.mark.parametrize("value", [None, "", "override"])
-def test_agent_output_directories_resolve_at_run_time(monkeypatch, tmp_path, value):
-    from mobilerun_agents.config.settings import get_agent_settings
+def test_recording_defaults_to_enabled(monkeypatch, tmp_path):
+    monkeypatch.delenv("MOBILERUN_AGENT_RECORDING_ENABLED", raising=False)
+    path = tmp_path / "agents.yaml"
+    path.write_text("{}\n")
+    assert ConfigLoader.load(str(path)).recording.enabled is True
 
-    monkeypatch.setenv("MOBILERUN_USER_CONFIG_DIR", str(tmp_path / "base"))
-    for env, name in [
-        ("MOBILERUN_AGENT_RUNS_DIR", "runs"),
-        ("MOBILERUN_AGENT_IMAGES_DIR", "images"),
-    ]:
-        if value is None:
-            monkeypatch.delenv(env, raising=False)
-        else:
-            monkeypatch.setenv(env, str(tmp_path / name) if value else "")
-        assert (
-            getattr(get_agent_settings(), f"{name}_dir")
-            == (tmp_path if value else tmp_path / "base") / name
-        )
+
+@pytest.mark.parametrize(
+    ("yaml_value", "env_value", "expected"),
+    [
+        ("true", "false", False),
+        ("false", "true", True),
+    ],
+)
+def test_recording_environment_overrides_yaml(
+    monkeypatch, tmp_path, yaml_value, env_value, expected
+):
+    path = tmp_path / "agents.yaml"
+    path.write_text(f"recording: {{enabled: {yaml_value}}}\n")
+    monkeypatch.setenv("MOBILERUN_AGENT_RECORDING_ENABLED", env_value)
+    assert ConfigLoader.load(str(path)).recording.enabled is expected
+
+
+def test_recording_environment_applies_without_yaml(monkeypatch):
+    assert not ConfigLoader.get_user_config_path().exists()
+    monkeypatch.setenv("MOBILERUN_AGENT_RECORDING_ENABLED", "false")
+    assert ConfigLoader.load().recording.enabled is False
+
+
+def test_recording_environment_does_not_change_persisted_preference(monkeypatch):
+    monkeypatch.setenv("MOBILERUN_AGENT_RECORDING_ENABLED", "false")
+    ConfigLoader.update(lambda config: setattr(config.agent, "max_steps", 7))
+    ConfigLoader.update(lambda config: setattr(config.agent, "max_steps", 8))
+    monkeypatch.delenv("MOBILERUN_AGENT_RECORDING_ENABLED")
+    assert ConfigLoader.load().recording.enabled is True
+
+
+def test_removed_checkpoints_setting_names_its_replacement(tmp_path):
+    path = tmp_path / "agents.yaml"
+    path.write_text("checkpoints: {enabled: false}\n")
+    with pytest.raises(OldConfigKeys, match=r"checkpoints.*recording\.enabled"):
+        ConfigLoader.load(str(path))
 
 
 def test_scoped_config_is_nested_and_task_local():

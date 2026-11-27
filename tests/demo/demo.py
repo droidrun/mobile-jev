@@ -49,9 +49,9 @@ from mobilerun_agents.config.settings import get_agent_settings
 # --- edit me ---------------------------------------------------------
 DEVICE = "4c1f61fd-5e3a-4d02-9457-478f05875ab9"  # serial, remote URL, or cloud ID
 CLOUD = True
-RUN = ["all"]  # choose a name in DEMOS or ["all"]
+RUN = ["planner_delegation"]  # choose a name in DEMOS or ["all"]
 RESET = True  # stop the foreground app and press Home before each example
-DEBUG = False  # True gives the CLI's per-step --debug detail
+DEBUG = True  # True gives the CLI's per-step --debug detail
 MAX_STEPS = 60
 TIMEOUT = 300  # seconds per operator run; None = no deadline
 MODELS = {
@@ -65,9 +65,9 @@ PLANNER = ("openai", "gpt-6-luna")
 EXECUTOR = ("openai", "gpt-6-luna")
 VISION_MODEL = ("openai", "gpt-6-luna")
 JEV_VISION: Vision = "off"
-JEV_MIN_CONFIDENCE = 0.7
+JEV_MIN_CONFIDENCE = 0.0
 
-GOAL = "Check the cheapest prices of Amazon and eBay prices for the game split fiction."
+GOAL = "Check the cheapest prices of Amazon and eBay prices for the game gta 6."
 EASY_GOAL = "Open Settings and tell me the battery level."
 VISION_GOAL = "Open Settings and describe two things visible on the screen."
 JEV_GOAL = "Open Settings and report the first visible menu item without entering text."
@@ -368,11 +368,7 @@ async def compare(phone: Device, runs: Iterable[tuple[str, Run]]) -> int:
         try:
             await reset_phone(phone)
             result = await run(phone)
-            success, steps, answer = (
-                result.success,
-                result.steps or 0,
-                result.answer or "-",
-            )
+            success, steps, answer = result.success, result.steps or 0, result.answer or "-"
         except CredentialMissing:
             answer = "skipped (no key)"
         except Exception as error:

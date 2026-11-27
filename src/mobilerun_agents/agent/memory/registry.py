@@ -1,26 +1,27 @@
 """Discover memory block factories without a mutable registration API."""
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import cache
 from importlib import metadata
 from types import MappingProxyType
-from typing import Any, Literal, cast
+from typing import Any, Literal, Protocol, cast, runtime_checkable
 
 from llama_index.core.base.llms.types import TextBlock
 from llama_index.core.memory import BaseMemoryBlock, StaticMemoryBlock
 from pydantic import PositiveInt
 
+from mobilerun_agents.agent.tools.base import Tool
 from mobilerun_agents.agent.workflows.core.state import PlanningState
 from mobilerun_agents.config.paths import resolve_prompt_path
 from mobilerun_agents.config.prompts import render_prompt
-from mobilerun_agents.config.user_config import MobileConfig, Section
+from mobilerun_agents.config.user_config import AgentMemoryConfig, MobileConfig, Section
 
 from .blocks.app_cards import AppCardBlock
-from .blocks.findings import FindingsBlock
 from .blocks.goal import GoalBlock
 from .blocks.history import HistoryBlock
 from .blocks.last_step import LastStepBlock
+from .blocks.notes import NotesBlock
 from .blocks.subgoals import LastSubgoalBlock, SubgoalHistoryBlock
 
 _Agent = Literal["executor", "planner"]
@@ -40,6 +41,21 @@ class BlockContext:
 
 BlockFactory = Callable[[BlockContext], BaseMemoryBlock[Any]]
 NO_MEMORY_BLOCKS: Mapping[str, BlockFactory] = MappingProxyType({})
+
+
+@runtime_checkable
+class _ToolProvider(Protocol):
+    def tools(self) -> Sequence[Tool]: ...
+
+
+def block_tools(blocks: Iterable[BaseMemoryBlock[Any]]) -> list[Tool]:
+    """Collect tools from configured blocks, preserving their order."""
+    tools: list[Tool] = []
+    for block in blocks:
+        match block:
+            case _ToolProvider():
+                tools.extend(block.tools())
+    return tools
 
 
 class _HistoryOptions(Section):
@@ -79,7 +95,7 @@ def _setup(context: BlockContext) -> StaticMemoryBlock:
 
 def _goal(context: BlockContext) -> GoalBlock:
     Section.model_validate(context.options)
-    return GoalBlock(include_notes=context.agent == "executor")
+    return GoalBlock(include_notes="notes" not in _role_config(context).blocks)
 
 
 def _last_step(context: BlockContext) -> LastStepBlock:
@@ -109,10 +125,9 @@ def _app_cards(context: BlockContext) -> AppCardBlock | _UnavailableBlock:
     )
 
 
-def _findings(context: BlockContext) -> FindingsBlock:
-    _require_agent("findings", context, "planner")
+def _notes(context: BlockContext) -> NotesBlock:
     Section.model_validate(context.options)
-    return FindingsBlock()
+    return NotesBlock()
 
 
 def _last_subgoal(context: BlockContext) -> LastSubgoalBlock:
@@ -134,7 +149,7 @@ BUILTIN: Mapping[str, BlockFactory] = MappingProxyType(
         "last_step": _last_step,
         "history": _history,
         "app_cards": _app_cards,
-        "findings": _findings,
+        "notes": _notes,
         "last_subgoal": _last_subgoal,
         "subgoal_history": _subgoal_history,
     }
@@ -216,16 +231,20 @@ def build(
             )
 
 
+def _role_config(context: BlockContext) -> AgentMemoryConfig:
+    return (
+        context.config.memory.executor
+        if context.agent == "executor"
+        else context.config.memory.planner
+    )
+
+
 def configured_blocks(
     context: BlockContext, extra: Mapping[str, BlockFactory]
 ) -> list[BaseMemoryBlock[Any]]:
     """Build configured blocks in order, omitting unavailable platform-specific blocks."""
     available = factories(extra)
-    section = (
-        context.config.memory.executor
-        if context.agent == "executor"
-        else context.config.memory.planner
-    )
+    section = _role_config(context)
     blocks: list[BaseMemoryBlock[Any]] = []
     for name in section.blocks:
         options = MappingProxyType(section.options.get(name, {}))

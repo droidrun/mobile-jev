@@ -39,7 +39,7 @@ def test_exact_documented_environment_field(monkeypatch, model, name):
     elif isinstance(default, Enum):
         raw = default.value
         expected = default
-    elif isinstance(default, bool):
+    elif bool in types or isinstance(default, bool):
         raw, expected = "false", False
     elif isinstance(default, int):
         raw, expected = "4321", 4321

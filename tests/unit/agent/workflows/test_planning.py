@@ -6,6 +6,7 @@ import pytest
 from llama_index.core.base.llms.types import ImageBlock
 from llama_index.core.memory import Memory
 from llama_index.core.tools import ToolSelection
+from mobilerun.core.devices.recording import RecordingDevice
 from mobilerun.core.state.base import StateProvider
 from mobilerun.core.state.ui_state import UIState
 from mobilerun.errors import DeviceOperationNotSupported
@@ -16,7 +17,6 @@ from workflows.context.serializers import JsonSerializer
 from workflows.errors import WorkflowCancelledByUser
 
 from mobilerun_agents.agent.action_selector.base import ActionSelector, Selection
-from mobilerun_agents.agent.checkpoints.store import save_context
 from mobilerun_agents.agent.events import Acted, Finished, Observed, Subgoal
 from mobilerun_agents.agent.logs.console import ConsoleLog
 from mobilerun_agents.agent.logs.memory import MemoryDetail
@@ -24,7 +24,6 @@ from mobilerun_agents.agent.memory.blocks.subgoals import _render_failure
 from mobilerun_agents.agent.memory.memory import _RunMemory, build_planner_memory
 from mobilerun_agents.agent.planner import Finish, Plan, Planner
 from mobilerun_agents.agent.tools.base import tool
-from mobilerun_agents.agent.tools.helpers.images import ImageStore
 from mobilerun_agents.agent.tools.registry import build_registry
 from mobilerun_agents.agent.workflows.core.state import PlanningState
 from mobilerun_agents.agent.workflows.planning import PlanningWorkflow, executor_kind
@@ -94,8 +93,7 @@ def phone():
 
 
 @pytest.fixture
-async def make_workflow(phone, tmp_path, monkeypatch):
-    monkeypatch.setenv("MOBILERUN_AGENT_IMAGES_DIR", str(tmp_path))
+async def make_workflow(phone):
     memories = []
 
     @tool
@@ -103,16 +101,17 @@ async def make_workflow(phone, tmp_path, monkeypatch):
         """Record a fake tick without contacting the device."""
         return "tick"
 
-    async def make(planner, executor, **options):
-        registry = build_registry(phone, [tick], ToolsConfig())
-        services = Services(registry, ImageStore("run", keep=True))
+    async def make(planner, executor, *, device=None, **options):
+        device = device or phone
+        registry = build_registry(device, [tick], ToolsConfig())
+        services = Services(registry)
         memory = build_planner_memory(
             MobileConfig(memory=options.get("memory_config") or MemoryConfig()),
             PlanningState(executor=executor_kind(executor)),
             phone.platform,
         )
         memories.append(memory)
-        manager = await run_resources(phone, memory, services)
+        manager = await run_resources(device, memory, services)
         return PlanningWorkflow(planner, executor, resource_manager=manager, **options)
 
     yield make
@@ -157,8 +156,8 @@ async def test_direct_planning_workflow_rejects_invalid_child_memory_before_obse
         ("custom", "Executor: a custom selector."),
     ],
 )
-async def test_planner_prompt_describes_executor_and_checkpoint_restores_it(
-    make_workflow, tmp_path, kind, setup
+async def test_planner_prompt_describes_executor_and_context_restores_it(
+    make_workflow, kind, setup
 ):
     from mobilerun_agents.agent.action_selector import (
         DecisionSelector,
@@ -187,7 +186,7 @@ async def test_planner_prompt_describes_executor_and_checkpoint_restores_it(
         setup
     ]
 
-    saved = await save_context(tmp_path / "context.json", handler.ctx)
+    saved = handler.ctx.to_dict()
     restored = await Context.from_dict(flow, saved).store.get_state()
     assert restored.executor == kind
 
@@ -280,7 +279,9 @@ async def test_delegation_retry_and_intent_are_local_to_each_planning_child(make
 
 
 @pytest.mark.anyio
-async def test_planner_reconsiders_each_subgoal_and_saves_one_ordered_action_history(make_workflow):
+async def test_planner_reconsiders_each_subgoal_and_saves_one_ordered_action_history(
+    make_workflow, phone
+):
     planner = FakePlanner(
         Plan(("Look up price", "Unused remainder")),
         Plan(("Dismiss sign-in",)),
@@ -323,8 +324,31 @@ async def test_planner_reconsiders_each_subgoal_and_saves_one_ordered_action_his
         (1, "Could not load prices"),
         (2, "Now visible"),
     ]
-    paths = [record.before.screenshot.path for record in actions]
-    assert paths[0] != paths[1] and paths[0].parent == paths[1].parent
+    assert all(record.before.screenshot is None for record in actions)
+    live = (await handler.ctx.store.get_state()).actions
+    assert live[0].before.screenshot is None
+    with live[-1].before.screenshot.resolve_image() as image:
+        assert image.read() == phone.screenshot.return_value
+
+
+@pytest.mark.anyio
+async def test_planner_offsets_child_action_numbers_but_not_device_links(
+    make_workflow, phone, tmp_path
+):
+    recorder = RecordingDevice(phone, runs_dir=tmp_path / "runs", capture="actions")
+    await recorder.wait(0)  # Caller-owned recorder already has step 1.
+    wait = ToolSelection(tool_id="wait", tool_name="wait", tool_kwargs={})
+    planner = FakePlanner(Plan(("first",)), Plan(("second",)), Finish(True, "done", None))
+    selector = FakeSelector(wait, complete(), wait, complete())
+    flow = await make_workflow(planner, selector, device=recorder)
+    handler = flow.run(goal="Run two subgoals")
+    links = [
+        (event.action.step, event.step_ids)
+        async for event in handler.stream_events()
+        if isinstance(event, Acted)
+    ]
+    assert (await handler).success
+    assert links == [(1, [2]), (2, []), (3, [3]), (4, [])]
 
 
 @pytest.mark.anyio
@@ -350,7 +374,7 @@ async def test_console_keeps_memory_for_second_child_when_first_makes_no_action(
     planner = FakePlanner(Plan(("first child",)), Plan(("second child",)), Finish(True, "done"))
     flow = await make_workflow(planner, EmptyFirstSelector())
     handler = flow.run(goal="root")
-    console = ConsoleLog()
+    console = ConsoleLog(lambda text: text)
     caplog.set_level("DEBUG", logger="mobilerun_agents.agent.logs.console")
     async for event in handler.stream_events():
         console.event(event)
@@ -361,7 +385,7 @@ async def test_console_keeps_memory_for_second_child_when_first_makes_no_action(
 @pytest.mark.anyio
 @pytest.mark.parametrize("screenshot_supported", [True, False])
 async def test_planner_observes_fresh_ui_images_and_context_for_free(
-    make_workflow, phone, screenshot_supported
+    make_workflow, phone, screenshot_supported, tmp_path
 ):
     provider = phone._state_provider_override
     packages = ["initial", "child1", "after1", "child2", "after2"]
@@ -393,15 +417,22 @@ async def test_planner_observes_fresh_ui_images_and_context_for_free(
     snapshots = [state.current for state in planner.states]
     assert [item.ui.formatted_text for item in snapshots] == packages[::2]
     assert [item.device_context for item in snapshots] == [[item] for item in contexts[::2]]
-    assert [item.screenshot is not None for item in snapshots] == [screenshot_supported] * 3
+    assert [item.screenshot is not None for item in snapshots] == [
+        False,
+        False,
+        screenshot_supported,
+    ]
     if screenshot_supported:
-        assert snapshots[-1].screenshot.path.read_bytes() == phone.screenshot.return_value
-        assert all(not item.screenshot.path.exists() for item in snapshots[:-1])
+        screenshot = snapshots[-1].screenshot
+        assert screenshot.path is None
+        with screenshot.resolve_image() as image:
+            assert image.read() == phone.screenshot.return_value
+    assert not any(path.is_file() for path in tmp_path.rglob("*"))
 
 
 @pytest.mark.anyio
 async def test_vision_planner_reads_full_ui_after_child_completes_without_message(
-    make_workflow, phone, monkeypatch
+    make_workflow, phone, monkeypatch, tmp_path
 ):
     from mobilerun_agents.agent.action_selector.llm.models import Capabilities
     from mobilerun_agents.agent.planner import LlamaIndexPlanner
@@ -425,10 +456,12 @@ async def test_vision_planner_reads_full_ui_after_child_completes_without_messag
     handler = flow.run(goal="Find the price", max_steps=4)
     assert (await handler).message == "The price is £42.00"
     (first, _), (second, _) = llm._requests
-    initial_image = next(block for block in first[-1].blocks if isinstance(block, ImageBlock))
-    assert initial_image.path is not None and not initial_image.path.exists()
-    current_image = next(block for block in second[-1].blocks if isinstance(block, ImageBlock))
-    assert current_image.path is not None and current_image.path.is_file()
+    for messages in (first, second):
+        block = next(block for block in messages[-1].blocks if isinstance(block, ImageBlock))
+        assert block.path is None
+        with block.resolve_image() as image:
+            assert image.read() == phone.screenshot.return_value
+    assert not any(path.is_file() for path in tmp_path.rglob("*"))
     assert phone.screenshot.await_count == 2
     assert full_ui in second[-1].content
     assert (
@@ -488,9 +521,9 @@ async def test_planner_keeps_findings_when_switching_between_price_screens(make_
     assert [message.role.value for message in fourth] == ["system", "user", "user"]
     assert "Verify executor results" in fourth[0].content
     assert second[-1].content.endswith(f"UI summary (observed data):\n{amazon}")
-    assert f'Findings and notes: ["{amazon}", "{child_note}"]' in third[1].content
+    assert f"{amazon}\n{child_note}" in third[1].content
     assert third[-1].content.endswith(f"UI summary (observed data):\n{ebay}")
-    assert f'Findings and notes: ["{amazon}", "{child_note}", "{ebay}"]' in fourth[1].content
+    assert f"{amazon}\n{child_note}\n{ebay}" in fourth[1].content
     assert fourth[1].content.count(amazon) == 1
     assert "Screen: ebay/unknown → home/unknown (changed)" in fourth[1].content
     assert fourth[-1].content.endswith("UI summary (observed data):\nHome")
@@ -596,10 +629,10 @@ async def test_planning_console_reports_subgoal_turn_and_final_budgets(phone, ca
     config = MobileConfig()
     config.analytics.enabled = False
     config.tracing.enabled = False
-    config.checkpoints.enabled = False
     operator = PlanningOperator(
         FakePlanner(Plan(("Search eBay",)), Plan(("Try again",)), Finish(False, "Price hidden")),
         FakeSelector(complete(), complete()),
+        record=False,
     )
     with ConfigLoader.override(config):
         result = await operator.execute(phone, "Find the price", max_steps=60)
@@ -675,7 +708,7 @@ async def test_typed_planner_output_repairs_without_rerunning_executor(make_work
 
 
 @pytest.mark.anyio
-async def test_parent_cancellation_stops_child_and_keeps_checkpoint_image(make_workflow):
+async def test_parent_cancellation_stops_child_without_writing_image(make_workflow, tmp_path):
     started = asyncio.Event()
     ended = asyncio.Event()
 
@@ -691,13 +724,12 @@ async def test_parent_cancellation_stops_child_and_keeps_checkpoint_image(make_w
     flow = await make_workflow(planner, Waiting())
     handler = flow.run(goal="Cancel")
     await asyncio.wait_for(started.wait(), timeout=5)
-    path = planner.states[0].current.screenshot.path
-    assert path.is_file()
+    assert planner.states[0].current.screenshot.path is None
     await handler.cancel_run()
     with pytest.raises(WorkflowCancelledByUser):
         await handler
     await asyncio.wait_for(ended.wait(), timeout=5)
-    assert path.is_file()
+    assert not any(path.is_file() for path in tmp_path.rglob("*"))
 
 
 @pytest.mark.anyio
@@ -734,7 +766,8 @@ async def test_planner_refreshes_after_each_kind_of_terminal_batch(make_workflow
     assert state.current.ui.formatted_text == "After"
     assert state.actions[0].before.ui.formatted_text == "Before"
     assert provider.get_state.await_count == (4 if batch == "sequential" else 3)
-    assert state.current.screenshot.path.read_bytes() == b"After"
+    with state.current.screenshot.resolve_image() as image:
+        assert image.read() == b"After"
     assert phone.screenshot.await_count == 2
 
 

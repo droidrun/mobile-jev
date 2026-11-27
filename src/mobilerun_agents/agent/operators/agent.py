@@ -23,10 +23,12 @@ class AgentOperator(Operator):
         selector: ActionSelector | None = None,
         tools: Sequence[Tool] = (),
         memory_blocks: Mapping[str, BlockFactory] = NO_MEMORY_BLOCKS,
+        record: bool | None = None,
     ) -> None:
         self._selector = selector
         self._tools = tuple(tools)
         self._memory_blocks = dict(memory_blocks)
+        self._record = record
 
     async def execute(
         self,
@@ -53,7 +55,8 @@ class AgentOperator(Operator):
             output,
             config.agent.max_steps if max_steps is None else max_steps,
             config.agent.workflow_timeout if timeout is None else timeout,
-            memory_factory=lambda _: build_executor_memory(
+            memory_factory=lambda: build_executor_memory(
                 config, device.platform, extra=self._memory_blocks
             ),
+            record=self._record,
         )

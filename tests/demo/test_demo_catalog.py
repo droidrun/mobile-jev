@@ -248,9 +248,9 @@ def test_catalog_runs_with_fakes(demo, monkeypatch, tmp_path, capsys, name):
     config = MobileConfig()
     config.analytics.enabled = config.tracing.enabled = config.agent.streaming = False
     verification = name in {"phone_number", "mailbox"}
-    config.checkpoints.enabled = not verification
+    config.recording.enabled = not verification
     monkeypatch.setitem(demo, "DEBUG", verification)
-    monkeypatch.setenv("MOBILERUN_AGENT_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setenv("MOBILERUN_RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setenv("MOBILERUN_MACRO_DIRECTORY", str(tmp_path / "macros"))
     monkeypatch.setattr(
         llama_index, "adapter_capabilities", lambda _: Capabilities(tool_call_format="responses")
@@ -342,8 +342,12 @@ def test_catalog_runs_with_fakes(demo, monkeypatch, tmp_path, capsys, name):
     if name in {"compare_models", "compare_setups"}:
         assert out.count("\tTrue\t") == (2 if name == "compare_models" else 4)
     if name == "custom_tool":
-        checkpoint = next((tmp_path / "runs").glob("*/context.json"))
-        assert "Note saved." in json.dumps(json.loads(checkpoint.read_text()))
+        run_dir = next((tmp_path / "runs").glob("*"))
+        assert json.loads((run_dir / "run.json").read_text())["status"] == "succeeded"
+        assert {"kind": "tool", "text": "note", "step_ids": []} in json.loads(
+            (run_dir / "agent.json").read_text()
+        )
+        assert (run_dir / "steps.jsonl").is_file()
 
 
 def test_reset_stops_foreground_before_home(demo):

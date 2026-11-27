@@ -1,3 +1,4 @@
+import json
 import logging
 from collections.abc import Mapping
 from datetime import datetime, tzinfo
@@ -6,6 +7,7 @@ from uuid import UUID
 
 import pytest
 from llama_index.core.tools import ToolSelection
+from mobilerun.core.credentials import DictCredentials
 from mobilerun.core.devices import Device
 from mobilerun.core.devices.recording import RecordingDevice
 from mobilerun.core.extensions import Extension, action
@@ -46,22 +48,20 @@ async def test_resources_are_injected_without_exposing_them_as_arguments():
     @tool(sensitive_parameters=frozenset({"label"}))
     async def mark(label: str, workflow: Context[AgentState], phone: Device) -> str:
         """Label this device."""
-        return f"{phone.platform}: {(await workflow.store.get_state()).goal}: {label}"
+        assert label == "sample name"
+        return f"{phone.platform}: {(await workflow.store.get_state()).goal}"
 
     turn = Turn(goal="bench")
     registry = build_registry(turn.device, [mark], ToolsConfig())
     schema = registry.by_name["mark"].metadata.get_parameters_dict()["properties"]
     assert set(schema) == {"label"}
-    assert (
-        await registry.execute(call("mark", label="sample name"), turn.ctx)
-        == "android: bench: sample name"
-    )
+    assert await registry.execute(call("mark", label="sample name"), turn.ctx) == "android: bench"
     with pytest.raises(ExtensionActionError):
         await registry.execute(call("mark", label="sample", phone="pretender"), turn.ctx)
 
 
 @pytest.mark.anyio
-async def test_sensitive_tool_scopes_log_masking_to_invocation(caplog):
+async def test_sensitive_tool_registers_log_masking_for_device_session(caplog):
     logger = logging.getLogger(__name__)
 
     @tool(sensitive_parameters=frozenset({"label"}))
@@ -71,28 +71,66 @@ async def test_sensitive_tool_scopes_log_masking_to_invocation(caplog):
         return label
 
     turn = Turn()
-    registry = build_registry(turn.device, [mark], ToolsConfig())
+    parent = build_registry(turn.device, [], ToolsConfig())
+    registry = parent.with_tools([mark])
+    assert "mark" not in parent.by_name and not parent.sensitive_seen
     value = "fixture-sensitive-label"
-    assert await registry.execute(call("mark", label=value), turn.ctx) == value
+    assert await registry.execute(call("mark", label=value), turn.ctx) == "***"
+    assert parent.sensitive_seen
     logger.warning("Outside: %s", value)
-    assert caplog.messages == ["Inside: ***", f"Outside: {value}"]
+    assert caplog.messages == ["Inside: ***", "Outside: ***"]
 
 
 @pytest.mark.anyio
-async def test_native_action_preserves_outer_recording_and_hides_backend_exception_text():
+async def test_native_action_preserves_outer_recording_and_hides_backend_exception_text(tmp_path):
     class Phone(MemoryDevice):
         async def open_url(self, url: str) -> None:
             raise RuntimeError("fixture refused the URL")
 
     phone = Phone(supported_operations=frozenset({"input_text", "open_url"}))
-    outer = RecordingDevice(phone)
+    outer = RecordingDevice(phone, runs_dir=tmp_path, capture="actions")
     turn = Turn(device=outer)
     result = await turn.registry.execute(call("input_text", text="ordinary text"), turn.ctx)
     assert result.success and phone.inputs == ["ordinary text"]
-    assert [a["text"] for a in outer.recorded_actions] == ["ordinary text"]
+    [step] = (outer.run_dir / "steps.jsonl").read_text().splitlines()
+    assert json.loads(step)["args"]["text"] == "ordinary text"
     result = await turn.registry.execute(call("open_url", url="https://example.invalid"), turn.ctx)
     assert not result.success
     assert result.summary == "RuntimeError"
+
+
+@pytest.mark.anyio
+async def test_vault_types_through_recorder_without_logging_expanded_value(tmp_path, caplog):
+    class Phone(MemoryDevice):
+        async def _input_text_raw(self, text, clear=False, stealth=False, wpm=0):
+            logging.getLogger(__name__).warning("Backend input: %s", text)
+            return await super()._input_text_raw(text, clear, stealth, wpm)
+
+    class Provider(StateProvider):
+        async def get_state(self):
+            return UIState([], "", "", {"focusedElement": {"index": 1}, "isEditable": True}, 10, 10)
+
+    marker = "fixture-credential-value"
+    phone = Phone()
+    phone._set_state_provider(Provider(phone))
+    recorder = RecordingDevice(phone, runs_dir=tmp_path, capture="actions")
+    await DictCredentials({"work": marker}).bind(recorder)
+    turn = Turn(device=recorder)
+
+    result = await turn.registry.execute(
+        call("vault__type_field", package=None, name="work", field="password"), turn.ctx
+    )
+
+    assert result.success and phone.inputs == [marker]
+    assert "Backend input: ***" in caplog.messages
+    [steps] = tmp_path.glob("*/steps.jsonl")
+    row = json.loads(steps.read_text())
+    assert row["action"] == "extension_call"
+    assert row["args"] == {
+        "name": "vault.type_field",
+        "arguments": {"package": None, "name": "work", "field": "password"},
+    }
+    assert marker not in result.summary and marker not in steps.read_text()
 
 
 def test_registry_validates_tool_selection_against_dispatch_schema():

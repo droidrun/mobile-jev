@@ -12,8 +12,8 @@
 
 **Examples:** `configure_cli_logging(debug=True)` shows additional details on stderr; the final answer is on stdout. Set `MOBILERUN_LOG_LEVEL=debug` to include transport diagnostics.
 
-Debug shows a short memory summary per selection. With checkpoints enabled it also saves the full unmasked detail under `memory/NNNN.txt` in the run folder. Retries and handoffs on the same step share that step's file.
+Debug shows a short memory summary per selection, even without recording. The console does not write memory files; recorded memory details live in `agent.json`.
 
-If an agent or subgoal completes without a message, the consumer renders a display-only default from the configured completion prompt. The workflow state and checkpoint still contain `null`.
+If an agent or subgoal completes without a message, the consumer renders a display-only default from the configured completion prompt. The workflow state still contains `null`.
 
-**Depends on / used by:** The operator routes events to the console. The base's `secret_scope` masks sensitive values in log records during sensitive calls; run data is stored unmasked.
+**Depends on / used by:** The operator routes events to `ConsoleLog(redact)` and supplies the redactor used for console messages.

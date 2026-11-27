@@ -1,6 +1,6 @@
 import json
 
-from llama_index.core.base.llms.types import ContentBlock, ImageBlock, TextBlock
+from llama_index.core.base.llms.types import ContentBlock, TextBlock
 
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.state import AgentState
@@ -40,7 +40,7 @@ class LastStepBlock(StateBlock[AgentState, list[ContentBlock]]):
         records = [record for record in state.actions if record.step == step]
         first = records[0]
         before = first.before
-        path = before.screenshot.path if self.screenshot and before.screenshot is not None else None
+        screenshot = before.screenshot if self.screenshot else None
         text = render_prompt(
             "assets/prompts/memory/last_step.jinja2",
             step=step,
@@ -57,9 +57,9 @@ class LastStepBlock(StateBlock[AgentState, list[ContentBlock]]):
             before=_screen(before),
             after=_screen(state.current),
             screen_changed=first.screen_changed,
-            has_screenshot=path is not None,
+            has_screenshot=screenshot is not None,
         )
         result: list[ContentBlock] = [TextBlock(text=text)]
-        if path is not None:
-            result.append(ImageBlock(path=path))
+        if screenshot is not None:
+            result.append(screenshot)
         return result

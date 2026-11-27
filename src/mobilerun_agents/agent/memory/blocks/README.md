@@ -8,8 +8,8 @@
 
 - `__init__.py` — `StateBlock`, the base for blocks that render workflow state.
 - `app_cards.py` — local app-specific guidance for the current platform.
-- `findings.py` — planner findings and notes.
-- `goal.py` — the run goal, plus notes for the executor only.
+- `notes.py` — opt-in notes for either role, with a `note` tool to save facts between turns.
+- `goal.py` — the run goal and any saved notes, unless a separate `notes` block renders them.
 - `history.py` — older executor steps and progress warnings.
 - `last_step.py` — the previous executor step, including its screen transition and optional before-screenshot.
 - `subgoals.py` — the latest planner subgoal result and older subgoal history.

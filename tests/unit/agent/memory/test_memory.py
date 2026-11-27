@@ -11,6 +11,7 @@ from llama_index.core.memory import InsertMethod, Memory, StaticMemoryBlock
 from llama_index.core.tools import ToolSelection
 from mobilerun.core.state.ui_state import UIState
 from mobilerun.models.context import ContextItem
+from mobilerun.utils.redaction import secret_scope
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from mobilerun_agents.agent.memory import memory as memory_module
@@ -19,9 +20,12 @@ from mobilerun_agents.agent.memory.blocks.goal import GoalBlock
 from mobilerun_agents.agent.memory.blocks.history import HistoryBlock
 from mobilerun_agents.agent.memory.blocks.last_step import LastStepBlock
 from mobilerun_agents.agent.memory.memory import build_executor_memory, build_planner_memory
+from mobilerun_agents.agent.tools import tool
+from mobilerun_agents.agent.tools.registry import build_registry
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.state import ActionRecord, AgentState, PlanningState
 from mobilerun_agents.config.user_config import MobileConfig
+from tests.unit.agent.action_selector.fixtures import Store, Turn
 
 
 @pytest.fixture(autouse=True)
@@ -210,9 +214,7 @@ def test_executor_config_and_last_step_content(snapshot, screenshot_enabled, tmp
         )
         memory = build_executor_memory(config, "android")
         snapshot.ui.phone_state.update(focusedElement={"text": "Search"}, keyboardVisible=True)
-        path = tmp_path / "before.png"
-        path.write_bytes(b"fake screenshot")
-        snapshot.screenshot = ImageBlock(path=path)
+        snapshot.screenshot = ImageBlock(image=b"fake screenshot")
         after = StepSnapshot(
             ui=UIState(
                 [],
@@ -281,6 +283,7 @@ def test_executor_config_and_last_step_content(snapshot, screenshot_enabled, tmp
                 assert part in text
             assert "Old result" not in text and "<history>" not in text
             assert (snapshot.screenshot in message.blocks) is screenshot_enabled
+            assert not list(tmp_path.rglob("*.png"))
             print(text)
         finally:
             await memory.aclose()
@@ -313,7 +316,9 @@ def test_shared_engine_keeps_sessions_separate_and_is_caller_owned():
 
 def test_repeat_uses_the_matching_snapshot_when_two_actions_share_a_step(snapshot):
     snapshot.ui.elements.append({"index": 3, "text": "first"})
-    other = snapshot.model_copy(update={"ui": UIState([{"index": 4}], "", "", {}, 0, 0)})
+    other = StepSnapshot(
+        ui=UIState([{"index": 4}], "", "", {"packageName": "mail", "activityName": "Sent"}, 0, 0)
+    )
     calls = [
         ToolSelection(tool_id=str(i), tool_name=name, tool_kwargs={"index": i})
         for i, name in [(3, "tap"), (4, "long_press")]
@@ -565,6 +570,87 @@ async def test_entry_point_block_renders_state_in_configured_order(installed_blo
     load.assert_called_once_with()
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize("role", ["executor", "planner"])
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_only_configured_notes_block_adds_a_tool(role, enabled):
+    from mobilerun_agents.agent.memory.registry import block_tools
+
+    config = (
+        MobileConfig(memory={role: {"blocks": ["goal", "notes"]}}) if enabled else MobileConfig()
+    )
+    state = AgentState() if role == "executor" else PlanningState(notes=["Planner finding"])
+    memory = (
+        build_executor_memory(config, "android")
+        if role == "executor"
+        else build_planner_memory(config, state, "android")
+    )
+    turn = Turn()
+    ctx = SimpleNamespace(store=Store(AsyncMock(return_value=state)))
+    try:
+        registry = build_registry(turn.device, block_tools(memory.memory_blocks), config.tools)
+        assert ("note" in registry.by_name) is enabled
+        if enabled:
+
+            async def note(text):
+                return await registry.execute(
+                    ToolSelection(
+                        tool_id="note-call", tool_name="note", tool_kwargs={"text": text}
+                    ),
+                    ctx,
+                )
+
+            assert await note("  Compare the same edition  ") == "Note saved."
+            assert await note("Compare the same edition") == "Note already saved."
+            assert await note("   ") == "No note saved: text is empty."
+            with secret_scope("fixture-secret"):
+                assert await note("private value: fixture-secret") == "Note saved."
+            saved = await ctx.store.get_state()
+            expected = ["Compare the same edition", "***"]
+            if role == "planner":
+                expected.insert(0, "Planner finding")
+            assert saved.notes == expected
+            (message,) = await memory.aget(state=saved)
+            assert "<notes>" in message.content
+            assert message.content.count("Compare the same edition") == 1
+            assert "fixture-secret" not in message.content
+        else:
+            (message,) = await memory.aget(state=state)
+            assert "<notes>" not in message.content
+        if role == "planner":
+            assert message.content.count("Planner finding") == 1
+    finally:
+        await memory.aclose()
+
+
+def test_configured_entry_point_block_contributes_tools(installed_blocks):
+    from mobilerun_agents.agent.memory.registry import BlockContext, block_tools, configured_blocks
+
+    @tool
+    async def check_price() -> str:
+        """Read a price from the shop."""
+        return "$42"
+
+    class PriceWatch(StaticMemoryBlock):
+        name: str = "price_watch"
+
+        def tools(self):
+            return [check_price]
+
+    entries, _ = installed_blocks
+    entries.append(
+        SimpleNamespace(
+            name="price_watch",
+            value="shop.blocks:price_watch",
+            load=lambda: lambda _: PriceWatch(static_content="Watch prices"),
+        )
+    )
+    config = MobileConfig(memory={"executor": {"blocks": ["goal", "price_watch"]}})
+    blocks = configured_blocks(BlockContext("executor", "android", {}, config), {})
+    registry = build_registry(Turn().device, block_tools(blocks), config.tools)
+    assert registry.by_name["check_price"].metadata.description == "Read a price from the shop."
+
+
 @pytest.mark.parametrize(
     ("name", "entry_name", "problem", "message"),
     [
@@ -582,7 +668,7 @@ async def test_entry_point_block_renders_state_in_configured_order(installed_blo
             r"Cannot load.*'price_watch'.*shop\.blocks:price_watch",
         ),
         ("price_watch", "price_watch", "none", r"'price_watch'.*shop\.blocks:price_watch.*'goal'"),
-        ("findings", None, "none", r"'findings'.*planner.*executor"),
+        ("findings", None, "none", r"Unknown memory block 'findings'"),
     ],
 )
 def test_registry_rejects_invalid_blocks_at_build(

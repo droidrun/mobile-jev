@@ -5,7 +5,8 @@ from typing import Any
 import yaml
 from mobilerun.config.loader import ConfigFile
 
-from .user_config import MobileConfig
+from .settings import get_agent_settings
+from .user_config import MobileConfig, RecordingConfig
 
 
 class _ConfigYAML(yaml.SafeLoader):
@@ -25,11 +26,30 @@ class ConfigLoader(ConfigFile[MobileConfig]):
     config_type = MobileConfig
 
     @classmethod
+    def load(cls, config_path: str | None = None) -> MobileConfig:
+        if config_path is None and (resolved := cls._override.get()) is not None:
+            return resolved
+        config = super().load(config_path)
+        enabled = get_agent_settings().MOBILERUN_AGENT_RECORDING_ENABLED
+        if enabled is not None and enabled != config.recording.enabled:
+            effective = config.model_copy(update={"recording": RecordingConfig(enabled=enabled)})
+            effective._recording_override = (config.recording.enabled, enabled)
+            return effective
+        return config
+
+    @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MobileConfig:
         return cls.config_type.validate_file_data(data)
 
     @classmethod
     def to_dict(cls, config: MobileConfig) -> dict[str, Any]:
+        if (
+            config._recording_override is not None
+            and config.recording.enabled == config._recording_override[1]
+        ):
+            config = config.model_copy(
+                update={"recording": RecordingConfig(enabled=config._recording_override[0])}
+            )
         data = config.model_dump(mode="json", exclude_defaults=True)
         cls.config_type.model_validate(data)
         return data

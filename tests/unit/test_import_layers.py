@@ -20,7 +20,6 @@ LAYERS = {
             "agent.planner",
             "agent.tools",
             "agent.memory",
-            "agent.checkpoints",
             "agent.analytics",
             "agent.logs",
         ),

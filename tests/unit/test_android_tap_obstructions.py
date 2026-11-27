@@ -1,9 +1,11 @@
 """Regression coverage through raw Portal data, formatting, and real actions."""
 
 import asyncio
+import json
 from unittest.mock import AsyncMock
 
 import pytest
+from mobilerun.core.devices.recording import RecordingDevice
 from mobilerun.core.state.android import AndroidStateProvider
 from mobilerun.core.state.filters import ConciseFilter
 from mobilerun.core.state.formatters import IndexedFormatter
@@ -25,7 +27,7 @@ def node(text, bounds=(0, 0, 1000, 400), children=(), **properties):
     }
 
 
-def context(children, screen=(1000, 2000), **provider_kwargs):
+def context(children, screen=(1000, 2000), *, runs_dir=None, **provider_kwargs):
     width, height = screen
     raw = {
         "a11y_tree": node("root", children=children, isClickable=False),
@@ -42,7 +44,12 @@ def context(children, screen=(1000, 2000), **provider_kwargs):
     driver.tap_mock = AsyncMock()
     provider = AndroidStateProvider(driver, ConciseFilter(), IndexedFormatter(), **provider_kwargs)
     ui = asyncio.run(provider.get_state())
-    return device_turn(driver, ui, provider)
+    device = (
+        RecordingDevice(driver, runs_dir=runs_dir, capture="actions")
+        if runs_dir is not None
+        else driver
+    )
+    return device_turn(device, ui, provider)
 
 
 def element(ctx, text):
@@ -150,27 +157,15 @@ def test_normalized_indexed_actions_tap_device_pixels(stealth):
         assert (x, y) == (990, 2210)
 
 
-def test_normalized_macro_records_device_pixels():
-    from llama_index.core.tools import ToolSelection
-
-    from mobilerun_agents.agent.checkpoints.macro_export import macro_data
-    from mobilerun_agents.agent.workflows.core.state import ActionRecord
-
+def test_normalized_tap_records_device_pixels(tmp_path):
     ctx = context(
         [node("send", (930, 2150, 1050, 2270))],
         screen=(1080, 2400),
+        runs_dir=tmp_path,
         use_normalized=True,
     )
-    call = ToolSelection(
-        tool_id="tap", tool_name="tap_element", tool_kwargs={"index": element(ctx, "send")["index"]}
-    )
-    result = asyncio.run(ctx.registry.execute(call, ctx.ctx))
-    record = ActionRecord(
-        step=1,
-        call=ctx.registry.resolve(call),
-        ok=result.success,
-        summary=result.summary,
-        before=ctx.state.current,
-    )
-    [action] = macro_data("Send", [record])["actions"]
-    assert (action["action_type"], action["x"], action["y"]) == ("tap", 990, 2210)
+    assert asyncio.run(click(ctx, element(ctx, "send")["index"])).success
+    [steps] = tmp_path.glob("*/steps.jsonl")
+    [row] = map(json.loads, steps.read_text().splitlines())
+    assert row["action"] == "tap"
+    assert row["args"] == {"x": 990, "y": 2210}

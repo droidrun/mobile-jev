@@ -6,7 +6,6 @@ import pytest
 from jinja2 import StrictUndefined, UndefinedError
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
-import mobilerun_agents
 from mobilerun_agents.agent.action_selector import DecisionSelector
 from mobilerun_agents.agent.action_selector.decision_model.base import (
     ActionCandidate,
@@ -62,9 +61,8 @@ TEMPLATES = {
 
 
 @pytest.mark.parametrize("name,variables", TEMPLATES.items())
-def test_templates_ship_in_installed_wheel_and_render_strict(name, variables):
-    path = Path(mobilerun_agents.__file__).parent / "assets/prompts" / name
-    assert "site-packages" in str(path), "Check the installed wheel, not the checkout"
+def test_templates_ship_in_installed_wheel_and_render_strict(name, variables, agent_wheel_site):
+    path = agent_wheel_site / "mobilerun_agents/assets/prompts" / name
     text = path.read_text()
     template = ImmutableSandboxedEnvironment(undefined=StrictUndefined).from_string(text)
     assert template.render(**variables).strip()
@@ -242,9 +240,8 @@ def test_no_model_facing_prose_in_selector_code():
     assert not violations, "\n".join(violations)
 
 
-def test_fast_agent_prompt_reports_partial_results_and_visible_blockers():
-    path = Path(mobilerun_agents.__file__).parent / "assets/prompts/fast_agent/system.jinja2"
-    assert "site-packages" in str(path), "Check the installed wheel, not the checkout"
+def test_fast_agent_prompt_reports_partial_results_and_visible_blockers(agent_wheel_site):
+    path = agent_wheel_site / "mobilerun_agents/assets/prompts/fast_agent/system.jinja2"
     prompt = path.read_text()
     assert "including partial values. Don't keep searching the same places." in prompt
     assert (

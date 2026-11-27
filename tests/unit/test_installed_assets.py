@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 EMPTY = ROOT / ".build" / "empty-cwd"
 
 
-def test_installed_assets_resolve_and_render_outside_checkout():
+def test_installed_assets_resolve_and_render_outside_checkout(agent_wheel_site):
     import hashlib
 
     source = ROOT / "src/mobilerun_agents"
@@ -30,12 +30,13 @@ def test_installed_assets_resolve_and_render_outside_checkout():
         checkouts.append(report["base_source"])
     EMPTY.mkdir(parents=True, exist_ok=True)
     script = """
-import hashlib, json, sys, sysconfig
+import hashlib, json, sys
 from pathlib import Path
 from importlib.resources import files
+purelib = Path(sys.argv[3]).resolve()
+sys.path.insert(0, str(purelib))
 from mobilerun_agents.config.paths import resolve_prompt_path
 import mobilerun_agents
-purelib = Path(sysconfig.get_paths()['purelib']).resolve()
 package = Path(mobilerun_agents.__file__).resolve()
 assert package.is_relative_to(purelib), (package, purelib)
 checkouts = [Path(path).resolve() for path in json.loads(sys.argv[2])]
@@ -58,6 +59,7 @@ assert "Read the battery" in render_prompt("assets/prompts/llm/selection_request
             script,
             json.dumps(assets),
             json.dumps(checkouts),
+            str(agent_wheel_site),
         ],
         cwd=EMPTY,
         capture_output=True,

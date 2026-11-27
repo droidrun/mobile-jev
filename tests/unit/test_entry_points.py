@@ -20,7 +20,7 @@ def test_declared_entry_points_are_importable():
             )
 
 
-def test_agent_macro_entry_point_accepts_resolved_target(monkeypatch):
+def test_agent_macro_entry_point_accepts_resolved_target(monkeypatch, tmp_path):
     import importlib
 
     from mobilerun_agents.config.user_config import MobileConfig
@@ -36,7 +36,7 @@ def test_agent_macro_entry_point_accepts_resolved_target(monkeypatch):
     monkeypatch.setattr(replay_module, "run_replay", lambda *a, **kw: calls.append((a, kw)))
     target = object()
     options = dict(
-        path="macro.json",
+        path=str(tmp_path / "inbox" / "v3.jsonl"),
         target=target,
         delay=0.1,
         start_from=1,

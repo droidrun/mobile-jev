@@ -1,35 +1,29 @@
 """Reuse base replay's device selection, credentials, limits and dry-run mode."""
 
-from os import PathLike, fsdecode
 from typing import Unpack
 
 import click
-from mobilerun.macro.cli.replay import ReplayOptions, replay_options, run_replay
+from mobilerun.macro.cli.replay import (
+    ReplayOptions,
+    _preflight_before_target,
+    replay_options,
+    run_replay,
+)
 
 from mobilerun_agents.cli.agent.configuration import load_config
 from mobilerun_agents.config.user_config import LLMProfile
 from mobilerun_agents.macro_agent import MacroAgentOperator
-from mobilerun_agents.macro_agent.paths import resolve_macro_target
-
-
-class _ReplayTarget(click.Path):
-    def convert(
-        self, value: str | PathLike[str], param: click.Parameter | None, ctx: click.Context | None
-    ) -> str:
-        return fsdecode(super().convert(str(resolve_macro_target(value)), param, ctx))
 
 
 @click.command()
 @click.option("--provider", help="LLM provider for recovery.")
 @click.option("--model", help="LLM model for recovery.")
+@click.option("--yes", "-y", is_flag=True, help="Confirm possible SMS charges without prompting.")
+@_preflight_before_target
 @replay_options
 def replay(provider: str | None, model: str | None, **options: Unpack[ReplayOptions]) -> None:
-    """Replay a run ID, macro folder, or macro.json; hand off on UI divergence."""
+    """Replay a macro by name, folder, or version. Repair needs a recorded after fingerprint."""
     replay_handoff(provider, model, **options)
-
-
-# Keep base's replay flags and device selection; resolve IDs before checking path existence.
-next(param for param in replay.params if param.name == "path").type = _ReplayTarget(exists=True)
 
 
 def replay_handoff(

@@ -1,5 +1,4 @@
-{{ goal }}
+The macro stopped at step {{ step }}. Your only goal is to reach this target screen from the current UI:
+{{ target }}
 
-Agent macro diverged before step {{ step }}. Continue from the current UI to finish the goal; do not blindly replay stale coordinates.
-Remaining recorded steps: {{ actions }}
-Current state: {{ state }}
+Stop as soon as the screen matches. Do not attempt later steps or send messages, make purchases, or repeat other side effects.

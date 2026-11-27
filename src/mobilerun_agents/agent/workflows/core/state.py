@@ -36,6 +36,16 @@ class ActionRecord(BaseModel):
     screen_changed: bool | None = None
 
 
+def clear_latest_action_screenshots(actions: list[ActionRecord]) -> None:
+    """Release the preceding batch's images before replacing it with a new batch."""
+    if actions:
+        step = actions[-1].step
+        for record in reversed(actions):
+            if record.step != step:
+                break
+            record.before.screenshot = None
+
+
 class AgentState(BaseModel):
     goal: str = ""
     notes: list[str] = Field(default_factory=list)

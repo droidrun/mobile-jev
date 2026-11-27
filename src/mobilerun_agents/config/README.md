@@ -8,7 +8,7 @@
 
 - `__init__.py` — Package marker.
 - `README.md` — Module overview.
-- `user_config.py` — Typed agent, model profile, tool, memory, analytics, tracing and checkpoint settings.
+- `user_config.py` — Typed agent, model profile, tool, memory, analytics, tracing and recording settings.
 - `loader.py` — Read `agents.yaml` in the Mobilerun config directory, or an explicit path. Saves store only non-default choices. `ConfigLoader.update(edit)` holds a file lock from load through atomic replacement and leaves the base device config alone.
 - `settings.py` — Runtime defaults, environment-backed settings and masked Langfuse keys.
 - `paths.py` — Packaged asset and caller-relative path resolution.
@@ -69,6 +69,15 @@ These values are the defaults. Move `memory.executor.last_step_screenshot`,
 paths above; the old keys are no longer accepted. For other removed keys,
 recreate profiles and setups with the new commands. There is no automatic migration.
 
-`MOBILERUN_AGENT_RUNS_DIR` and `MOBILERUN_AGENT_IMAGES_DIR` override the parent directories for run records and screenshots. Empty values use the defaults `<MOBILERUN_USER_CONFIG_DIR>/runs` and `<MOBILERUN_USER_CONFIG_DIR>/images`; each run is stored under `<run_id>/`. Screenshots use `NNNN.png` filenames. `ExecutionResult.trajectory_path` locates run data. Macros use `MOBILERUN_MACRO_DIRECTORY`. When checkpoints are disabled, run data is not retained and the run's image directory is deleted at the end.
+### Recording
+
+```yaml
+recording:
+  enabled: true
+```
+
+Agent recording is on by default. `MOBILERUN_AGENT_RECORDING_ENABLED` overrides the YAML value; the operator's `record=` argument (or `agent run --no-record`) takes precedence over both. Stealth vetoes recording regardless of settings.
+
+Recorded runs are saved under `<MOBILERUN_RUNS_DIR>/<run_id>/`, defaulting to `<MOBILERUN_USER_CONFIG_DIR>/runs`. `ExecutionResult.trajectory_path` locates the recording. The agent auto-wraps plain devices for actions-only capture and adds only `agent.json`; its prompt screenshots stay in memory. An explicit full recorder also saves screen evidence, including unredacted screenshots. Macros use `MOBILERUN_MACRO_DIRECTORY`.
 
 **Depends on / used by:** Depends on shared base configuration and Pydantic. Relative prompt paths resolve only inside the add-on package; set a prompt field to an absolute path to override a bundled prompt. Providers, services, workflows and entry points consume these models.

@@ -89,6 +89,11 @@ to `AgentOperator` or `PlanningOperator`, and enable it using the same config.
 The mapping applies only to that operator's runs, including planning children.
 Names cannot shadow built-ins or installed entry points.
 
+To contribute model-callable tools, give the block a `tools()` method that
+returns a sequence of `Tool` declarations (for example, functions decorated
+with `@tool`). Only configured blocks contribute tools. Use the injected
+workflow `Context` to read or edit live state.
+
 ## Native behavior pinned by tests
 
 - Priority 0 is never truncated, even when it exceeds the budget on its own.
@@ -116,3 +121,11 @@ previous `memory.executor.options.history.steps` steps (default `5`), excluding 
 plus any repeat and cycle warnings. Each older action includes its arguments
 and a short result. Under token pressure app cards (priority 1) are dropped
 before executor history (priority 2); history loses its oldest lines first.
+
+## Notes
+
+Add `notes` to either role's `blocks` list to render saved facts separately and
+give that role a `note(text)` tool. The tool trims whitespace, masks active
+secrets, and skips blank and duplicate notes. Neither role enables the block
+by default. The `goal` block still shows saved notes when no separate `notes`
+block is configured; this includes the planner's `set_plan` findings.

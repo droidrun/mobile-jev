@@ -55,6 +55,30 @@ def test_failed_operator_result_exits_one(monkeypatch, run):
     assert isinstance(result.exception, SystemExit)
 
 
+@pytest.mark.parametrize("planner", [None, object()])
+@pytest.mark.parametrize(("flags", "record"), [([], None), (["--no-record"], False)])
+def test_recording_override_is_forwarded_to_the_selected_operator(
+    monkeypatch, run, planner, flags, record
+):
+    module = import_module("mobilerun_agents.cli.agent.run")
+    spec = Mock(planner=planner)
+    monkeypatch.setattr(module, "build_setup", AsyncMock(return_value=spec))
+    agent, planning = Mock(), Mock()
+    monkeypatch.setattr(module, "AgentOperator", agent)
+    monkeypatch.setattr(module, "PlanningOperator", planning)
+    monkeypatch.setattr(module, "_execute", AsyncMock())
+
+    result = CliRunner().invoke(run, ["goal", "serial", *flags])
+
+    assert result.exit_code == 0, result.output
+    if planner is None:
+        agent.assert_called_once_with(selector=spec.selector, record=record)
+        planning.assert_not_called()
+    else:
+        planning.assert_called_once_with(planner=planner, executor=spec.executor, record=record)
+        agent.assert_not_called()
+
+
 @pytest.mark.parametrize("args", [[], ["phone-id", "--cloud"], ["phone-id", "--setup", "missing"]])
 def test_setup_error_precedes_device_discovery_consent_and_open(monkeypatch, args, run):
     forbidden = Mock(side_effect=AssertionError("device accessed before model resolution"))

@@ -14,13 +14,13 @@ from llama_index.core.tools import BaseTool, ToolSelection
 from mobilerun.core.devices.base import Device
 from mobilerun.core.devices.components.wrapper import DeviceWrapper
 from mobilerun.core.extensions import Action
-from mobilerun.core.extensions.actions import Declaration
+from mobilerun.core.extensions.actions import Declaration, iter_sensitive_values
+from mobilerun.core.runs import recording_scope
 from mobilerun.core.state.ui_state import UIState
-from mobilerun.utils.redaction import secret_scope
+from mobilerun.utils.redaction import mask_step_args, secret_scope
 from pydantic import BaseModel, ConfigDict, ValidationError, create_model
-from workflows import Context
 
-from mobilerun_agents.agent.workflows.core.state import AgentState
+from mobilerun_agents.agent.workflows.core.privacy import mask_value
 from mobilerun_agents.agent.workflows.core.targets import (
     ActionTarget,
     action_target,
@@ -30,7 +30,17 @@ from mobilerun_agents.config.prompts import render_prompt
 from mobilerun_agents.config.user_config import DecisionConfig, ToolsConfig
 
 from .atomic import AtomicTool, expand_atomic_tools
-from .base import ActionMetadata, ActionResult, RegistryTool, Source, Tool, complete, tool
+from .base import (
+    ActionMetadata,
+    ActionResult,
+    Completion,
+    RegistryTool,
+    RunContext,
+    Source,
+    Tool,
+    complete,
+    tool,
+)
 from .helpers import check_point, coordinate_pairs
 from .helpers.coordinates import CoordinateError
 from .helpers.errors import tool_error_summary
@@ -64,6 +74,7 @@ DEVICE_TOOL_DENYLIST = frozenset(
 # The cloud driver forwards the base float unchanged to this integer wire field.
 # Keep the device's model-facing schema; normalize only at the cloud boundary.
 _CLOUD_INTEGER_MINIMUMS = {"swipe": {"duration_ms": 10}}
+_VERIFICATION_READS = {"mailbox": {"wait_for_code"}, "phone_number": {"wait_for_code", "messages"}}
 _ACTION_VERBS = {
     "tap": "tapped",
     "tap_element": "tapped",
@@ -138,12 +149,17 @@ def _cloud_arguments(name: str, validated: dict[str, Any]) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class _VerificationResult:
+    summary: str = field(repr=False)
+
+
 async def _invoke_device(
     device: Device,
     ui: UIState | None,
     action: Action,
     arguments: dict[str, Any],
-) -> ActionResult:
+) -> ActionResult | _VerificationResult:
     name = model_name(action)
     try:
         validated = action.validate(arguments)
@@ -160,17 +176,14 @@ async def _invoke_device(
                 except CoordinateError as error:
                     return ActionResult(False, f"ValueError: {error}")
 
-        sensitive = action.sensitive_parameters
-        # Base primitive recorders do not honor the extension sensitivity flag.
-        # Bypass caller-owned recording facades for sensitive native arguments.
-        target = device._unwrap() if sensitive and action.owner == "device" else device
-        view = DeviceWrapper(target, state_provider=provider)
+        view = DeviceWrapper(device, state_provider=provider)
         view.state._current = ui
         resolved = action_target(action.name, validated, ui)
-        cached = _cached_ui(view, target, target._unwrap()) if resolved else ()
+        cached = _cached_ui(view, device, device._unwrap()) if resolved else ()
         if action.owner == "device":
-            with secret_scope(*(str(validated[key]) for key in sensitive)):
-                result = action.validate_result(await getattr(view, name)(**validated))
+            if action.sensitive_parameters:
+                device._extension_state.sensitive_ui = True
+            result = action.validate_result(await getattr(view, name)(**validated))
         else:
             result = await view.actions.call(action.name, validated, audience="operator")
         if resolved is not None and result is not False:
@@ -179,9 +192,27 @@ async def _invoke_device(
             summary = f"{name} {arguments}" if arguments else name
         if result is not None:
             summary += f" → {result!r}"
+        if _verification_read(device, action) and result is not False:
+            return _VerificationResult(summary)
         return ActionResult(result is not False, summary)
     except Exception as error:
         return ActionResult(False, tool_error_summary(error))
+
+
+def _verification_read(device: Device, action: Action) -> bool:
+    extension = device.extensions.get(action.owner)
+    return extension is not None and action.name.rsplit(".", 1)[-1] in _VERIFICATION_READS.get(
+        extension.role or "", set()
+    )
+
+
+def _vault_action(device: Device, action: Action, method: str) -> bool:
+    extension = device.extensions.get(action.owner)
+    return (
+        extension is not None
+        and extension.default_name == "vault"
+        and action.name.endswith(f".{method}")
+    )
 
 
 def _cached_ui(*devices: Device) -> tuple[tuple[Device, UIState | None], ...]:
@@ -273,7 +304,7 @@ def _route(
     output: type[BaseModel] | None,
     device: Device,
 ) -> RegistryTool:
-    async def invoke(ctx: Context[AgentState], args: dict[str, Any]) -> object:
+    async def invoke(ctx: RunContext, args: dict[str, Any]) -> object:
         if declaration is None:
             state = await ctx.store.get_state()
             return await _invoke_device(
@@ -286,8 +317,9 @@ def _route(
             ui = state.current.ui if state.current else None
         targeted = action_target(action.name, validated, ui)
         cached = _cached_ui(device, device._unwrap()) if targeted else ()
-        with secret_scope(*(str(validated[key]) for key in action.sensitive_parameters)):
-            result = action.validate_result(await declaration.invoke(ctx, device, validated))
+        if action.sensitive_parameters:
+            device._extension_state.sensitive_ui = True
+        result = action.validate_result(await declaration.invoke(ctx, device, validated))
         if targeted is not None:
             summary = _target_summary(model_name(action), targeted, cached)
             match result:
@@ -339,6 +371,14 @@ def _route(
     )
 
 
+@dataclass
+class _RunPrivacy:
+    feedback: list[str] = field(default_factory=list)
+    sensitive_seen: bool = False
+    # The public known-code redactor does not include registered literal secrets.
+    evidence_secrets: set[str] = field(default_factory=set, repr=False)
+
+
 @dataclass(frozen=True)
 class ToolRegistry:
     """Device and custom actions with model-facing selector projections."""
@@ -348,6 +388,7 @@ class ToolRegistry:
     decision_config: DecisionConfig = field(default_factory=DecisionConfig)
     _members: tuple[BaseTool, ...] = ()
     by_name: Mapping[str, BaseTool] = field(init=False, repr=False)
+    _privacy: _RunPrivacy = field(default_factory=_RunPrivacy, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         names: dict[str, BaseTool] = {}
@@ -358,13 +399,41 @@ class ToolRegistry:
             names[name] = member
         object.__setattr__(self, "by_name", MappingProxyType(names))
 
+    def with_tools(self, tools: Sequence[Tool]) -> "ToolRegistry":
+        """Expose additional tools for one agent without resetting run privacy."""
+        if not tools:
+            return self
+        disabled = set(self.config.exclude or ())
+        seen = set(self.by_name)
+        members = list(self._members)
+        for member in tools:
+            action = member.compile()
+            name = model_name(action)
+            if name in seen:
+                raise ValueError(f"Duplicate tool name: {name}")
+            seen.add(name)
+            if name not in disabled and action.name not in disabled:
+                members.append(_route(action, action, member, None, self.device))
+        return replace(self, _members=tuple(members))
+
     @property
     def has_sensitive(self) -> bool:
-        for t in self._members:
-            match t:
-                case RegistryTool(action=action) if action and action.sensitive_parameters:
-                    return True
-        return False
+        return any(self.is_sensitive_choice(name) for name in self.by_name)
+
+    def is_sensitive_choice(self, name: str) -> bool:
+        match self.by_name.get(name):
+            case RegistryTool(action=action) if action is not None:
+                return (
+                    bool(action.sensitive_parameters)
+                    or _verification_read(self.device, action)
+                    or _vault_action(self.device, action, "type_field")
+                )
+            case _:
+                return False
+
+    @property
+    def sensitive_seen(self) -> bool:
+        return self._privacy.sensitive_seen
 
     def tools(
         self, exclude: Collection[str] = (), include: Sequence[BaseTool] = ()
@@ -424,10 +493,92 @@ class ToolRegistry:
             case _:
                 return call
 
-    async def execute(self, call: ToolSelection, ctx: Context[AgentState]) -> object:
+    def _sensitive_parameters(self, call: ToolSelection) -> frozenset[str]:
+        match self.by_name.get(call.tool_name):
+            case RegistryTool(action=action) if action is not None:
+                return action.sensitive_parameters
+            case _:
+                return frozenset()
+
+    def _call_secrets(self, call: ToolSelection) -> tuple[str, ...]:
+        return tuple(
+            value
+            for key in self._sensitive_parameters(call)
+            for value in iter_sensitive_values(call.tool_kwargs.get(key))
+        )
+
+    def redact_selection(
+        self, calls: list[ToolSelection], thought: str | None
+    ) -> tuple[list[ToolSelection], str | None]:
+        """Prepare event and memory copies without modifying the calls to be dispatched."""
+        secrets = tuple(value for call in calls for value in self._call_secrets(call))
+        redact_code = self.device.known_codes_redactor()
+        with secret_scope(*self._privacy.evidence_secrets, *secrets):
+            safe_calls = []
+            for call in calls:
+                sensitive = self._sensitive_parameters(call)
+                args = mask_step_args(
+                    {
+                        key: "***" if key in sensitive else value
+                        for key, value in call.tool_kwargs.items()
+                    },
+                    contains_code=lambda text: redact_code(text) != text,
+                )
+                safe_calls.append(call.model_copy(update={"tool_kwargs": args}))
+            return safe_calls, (
+                str(mask_value(thought, redact_code)) if thought is not None else None
+            )
+
+    def take_verification_feedback(self) -> list[str]:
+        """Supply fresh verification results to the next selector, not workflow state."""
+        feedback = self._privacy.feedback[:]
+        self._privacy.feedback.clear()
+        return feedback
+
+    async def execute(self, call: ToolSelection, ctx: RunContext) -> object:
         member = self.by_name.get(call.tool_name)
         match member:
-            case RegistryTool():
-                return await member.execute(ctx, call.tool_kwargs)
+            case RegistryTool(action=action):
+                redact_code = self.device.known_codes_redactor()
+                secrets = self._call_secrets(call)
+                if secrets:
+                    self.device.register_sensitive_values(secrets)
+                    self._privacy.evidence_secrets.update(secrets)
+                with secret_scope(*self._privacy.evidence_secrets):
+                    uses_declared_secret = mask_value(call.tool_kwargs) != call.tool_kwargs
+                uses_code = any(
+                    redact_code(value) != value for value in iter_sensitive_values(call.tool_kwargs)
+                )
+                if uses_code or self.is_sensitive_choice(call.tool_name):
+                    self._privacy.sensitive_seen = True
+                keeping = action is None or not (
+                    _verification_read(self.device, action)
+                    or _vault_action(self.device, action, "list")
+                )
+                with recording_scope(enabled=keeping):
+                    if uses_code and call.tool_name != "complete":
+                        self.device._extension_state.sensitive_ui = True
+                    result = await member.execute(ctx, call.tool_kwargs)
+                    if type(result) is _VerificationResult:
+                        self._privacy.feedback.append(result.summary)
+                        return ActionResult(
+                            True, "Verification details supplied to the next selector."
+                        )
+                with secret_scope(*self._privacy.evidence_secrets):
+                    match result:
+                        case Completion():
+                            return result  # The workflow keeps public results separate from memory.
+                        case ActionResult(summary=summary):
+                            return replace(result, summary=str(mask_value(summary, redact_code)))
+                        case str():
+                            return mask_value(result, redact_code)
+                        case _:
+                            if (
+                                uses_code
+                                or uses_declared_secret
+                                or self._sensitive_parameters(call)
+                            ):
+                                return ActionResult(result is not False, call.tool_name)
+                            return result
             case _:
                 raise ValueError(f"Unknown tool: {call.tool_name}")

@@ -1,6 +1,5 @@
-import os
-
 import click
+import pytest
 from llama_index.core.tools import ToolSelection
 from mobilerun.core.state.ui_state import UIState
 
@@ -11,10 +10,14 @@ from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.state import ActionRecord, Outcome
 
 
+def redact(text):
+    return text.replace("fixture secret", "***").replace("fixture+secret", "***")
+
+
 def test_console_logs_event_values_with_single_line_messages(caplog):
     caplog.set_level("DEBUG", logger="mobilerun_agents.agent.logs.console")
-    console = ConsoleLog()
-    console.event(Subgoal(text="enter\n fixture secret"))
+    console = ConsoleLog(redact)
+    console.event(Subgoal(text="enter\nfixture secret"))
     console.event(Repaired(step=1, attempt=1, reason="fixture secret"))
     console.event(
         Acted(
@@ -30,19 +33,17 @@ def test_console_logs_event_values_with_single_line_messages(caplog):
         )
     )
     console.finish(True, "done with fixture secret", 1)
-    assert "→ subgoal: enter fixture secret" in caplog.messages
+    assert "→ subgoal: enter ***" in caplog.messages
     assert "Retrying invalid selection" in caplog.messages
     assert "1 · input_text ✓" in caplog.messages
-    assert (
-        "  arguments: {'text': 'fixture+secret'} · result: typed fixture secret" in caplog.messages
-    )
-    assert "✓ done with fixture secret (1 step)" in caplog.messages
+    assert "  arguments: {'text': '***'} · result: typed ***" in caplog.messages
+    assert "✓ done with *** (1 step)" in caplog.messages
 
 
 def test_cli_routes_debug_to_stderr_and_result_to_stdout(capsys):
     with click.Context(click.Command("agent")):
         configure_cli_logging(True)
-        console = ConsoleLog()
+        console = ConsoleLog(redact)
         console.event(Detail(section="image", text="no image"))
         console.finish(True, "done", 1)
     output = capsys.readouterr()
@@ -53,14 +54,14 @@ def test_cli_routes_debug_to_stderr_and_result_to_stdout(capsys):
 def test_agent_console_keeps_step_count_and_path(caplog, tmp_path):
     caplog.set_level("INFO", logger="mobilerun_agents.agent.logs.console")
     finished = Finished(outcome=Outcome(success=True, reason="completed"), steps=1)
-    ConsoleLog().finish(True, "done", finished, tmp_path)
+    ConsoleLog(redact).finish(True, "done", finished, tmp_path)
 
     assert caplog.messages == [f"✓ done (1 step · {tmp_path})"]
 
 
 def test_console_distinguishes_planner_and_executor_screens(caplog):
     caplog.set_level("DEBUG", logger="mobilerun_agents.agent.logs.console")
-    console = ConsoleLog()
+    console = ConsoleLog(redact)
     console.event(Observed(step=0, package="shop", planner=True))
     console.event(Observed(step=1, package="shop"))
 
@@ -69,7 +70,7 @@ def test_console_distinguishes_planner_and_executor_screens(caplog):
 
 def test_console_subgoal_shows_shared_step_progress(caplog):
     caplog.set_level("INFO", logger="mobilerun_agents.agent.logs.console")
-    ConsoleLog().event(Subgoal(text="Open settings", step=12, budget=60))
+    ConsoleLog(redact).event(Subgoal(text="Open settings", step=12, budget=60))
 
     assert caplog.messages == ["→ subgoal (step 12/60): Open settings"]
 
@@ -79,15 +80,18 @@ def test_console_finish_shows_shared_step_breakdown(caplog, tmp_path):
     finished = Finished(
         outcome=Outcome(success=True, reason="completed"), steps=16, planner_turns=10, budget=60
     )
-    ConsoleLog().finish(True, "done", finished, tmp_path)
+    ConsoleLog(redact).finish(True, "done", finished, tmp_path)
 
     assert caplog.messages == [f"✓ done (16/60 steps · 10 planner, 6 actions · {tmp_path})"]
 
 
-def test_memories_share_a_step_file_without_wrapping_console_output(capsys, tmp_path):
+def test_debug_memory_is_console_only(capsys, tmp_path, monkeypatch):
+    console_dir = tmp_path / "console"
+    console_dir.mkdir()
+    monkeypatch.chdir(console_dir)
     with click.Context(click.Command("agent")):
         configure_cli_logging(True)
-        console = ConsoleLog(tmp_path)
+        console = ConsoleLog(redact)
         console.event(Observed(step=3))
         for text in ("x" * 140, "second memory read"):
             console.event(
@@ -101,17 +105,15 @@ def test_memories_share_a_step_file_without_wrapping_console_output(capsys, tmp_
             )
         console.finish(True, "done", 3)
     lines = capsys.readouterr().err.splitlines()
-    assert sum("Memory details:" in line for line in lines) == 1
     previews = [line for line in lines if "notes:" in line]
     assert previews == [f"    notes: {'x' * 119}…"]
     assert any("memory (jev): 1 msg" in line for line in lines)
-    assert (tmp_path / "memory/0003.txt").read_text() == "x" * 140 + "\n"
-    assert (tmp_path / "memory/0003-jev.txt").read_text() == "second memory read\n"
+    assert not list(console_dir.iterdir())
 
 
-def test_console_compacts_later_memory_details_and_keeps_separate_files(caplog, tmp_path):
+def test_console_compacts_later_memory_details(caplog):
     caplog.set_level("DEBUG", logger="mobilerun_agents.agent.logs.console")
-    console = ConsoleLog(tmp_path)
+    console = ConsoleLog(redact)
     console.event(Observed(step=2))
     console.event(
         MemoryDetail(
@@ -136,18 +138,23 @@ def test_console_compacts_later_memory_details_and_keeps_separate_files(caplog, 
     assert sum("memory: 6 msgs" in message for message in caplog.messages) == 1
     assert "memory (delegate): 6 msgs · 166/30k tokens" in caplog.text
     assert "different" not in caplog.text
-    assert (tmp_path / "memory/0002.txt").read_text() == "first\n"
-    assert (tmp_path / "memory/0002-delegate.txt").read_text() == "different\n"
 
 
-def test_memory_files_use_private_mode_independent_of_umask(tmp_path, caplog):
-    caplog.set_level("DEBUG", logger="mobilerun_agents.agent.logs.console")
-    console = ConsoleLog(tmp_path)
-    previous = os.umask(0)
-    try:
-        console.event(
-            MemoryDetail(section="memory", text="full", blocks={}, last_steps=[], counts="counts")
+@pytest.mark.parametrize("level", ["INFO", "DEBUG"])
+def test_console_sanitizes_debug_memory(caplog, level):
+    caplog.set_level(level, logger="mobilerun_agents.agent.logs.console")
+    console = ConsoleLog(redact)
+    console.event(
+        MemoryDetail(
+            section="memory",
+            text="fixture secret",
+            blocks={"notes": "fixture secret"},
+            last_steps=[],
+            counts="1 msg",
         )
-    finally:
-        os.umask(previous)
-    assert (tmp_path / "memory/0001.txt").stat().st_mode & 0o777 == 0o600
+    )
+    console.finish(True, "done", 1)
+
+    assert "✓ done (1 step)" in caplog.messages
+    assert "fixture secret" not in caplog.text
+    assert ("notes: ***" in caplog.text) is (level == "DEBUG")

@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from llama_index.core.memory import Memory
+from llama_index.core.tools import BaseTool, ToolSelection
 from mobilerun.models.context import JSONValue
 from workflows import Context
 
@@ -32,6 +33,10 @@ class Finish:
 
 
 class Planner(ABC):
+    def with_tools(self, tools: tuple[BaseTool, ...], feedback: str | None) -> "Planner":
+        """Bind optional memory tools and the previous tool result for one turn."""
+        return self
+
     def bind(
         self,
         output_schema: dict[str, JSONValue] | None,
@@ -41,5 +46,7 @@ class Planner(ABC):
         return self
 
     @abstractmethod
-    async def plan(self, ctx: Context[PlanningState], memory: Memory) -> Plan | Finish:
-        """Return subgoals and optional findings or a final result without modifying state."""
+    async def plan(
+        self, ctx: Context[PlanningState], memory: Memory
+    ) -> Plan | Finish | ToolSelection:
+        """Return a plan, finish, or memory tool call without modifying state."""

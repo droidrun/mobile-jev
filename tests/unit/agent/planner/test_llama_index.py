@@ -12,7 +12,7 @@ from workflows import Context, Workflow, step
 from workflows.events import StartEvent, StopEvent
 
 from mobilerun_agents.agent.action_selector.llm.models import Capabilities
-from mobilerun_agents.agent.memory.blocks.findings import FindingsBlock
+from mobilerun_agents.agent.memory.blocks.notes import NotesBlock
 from mobilerun_agents.agent.memory.blocks.subgoals import LastSubgoalBlock, SubgoalHistoryBlock
 from mobilerun_agents.agent.memory.memory import build_planner_memory
 from mobilerun_agents.agent.planner import Finish, LlamaIndexPlanner, Plan
@@ -210,7 +210,7 @@ async def test_llm_gets_path_backed_screenshot_if_it_supports_vision(
 
 
 @pytest.mark.anyio
-async def test_planner_config_removes_findings_and_orders_remaining_blocks():
+async def test_planner_config_orders_blocks_and_keeps_findings_in_goal():
     state = PlanningState(goal="Check the battery", notes=["Measured 60% earlier"], executor="llm")
     ctx = Context[PlanningState](PlanningProbe())
     await ctx.store.set_state(state)
@@ -231,9 +231,7 @@ async def test_planner_config_removes_findings_and_orders_remaining_blocks():
     assert memory_message.content.index("Goal: Check the battery") < memory_message.content.index(
         "Executor: an LLM"
     )
-    assert all(
-        "Measured 60% earlier" not in message.content for message in (system, memory_message, step)
-    )
+    assert "Measured 60% earlier" in memory_message.content
 
 
 @pytest.mark.anyio
@@ -279,7 +277,6 @@ async def test_planner_request_renders_default_memory_order(insert_method):
         "memory",
         "setup",
         "goal",
-        "findings",
         "last_subgoal",
         "subgoal_history",
     ]
@@ -308,7 +305,7 @@ async def test_planner_blocks_render_latest_result_and_bounded_history():
             ),
         ],
     )
-    assert await FindingsBlock().render(state) == 'Findings and notes: ["Battery is charged"]'
+    assert await NotesBlock().render(state) == 'Notes: ["Battery is charged"]'
     assert (await LastSubgoalBlock().render(state)).splitlines() == [
         "Latest executor subgoal result: Succeeded: Latest: Done",
         "Screen: shop/List → shop/Item (changed)",

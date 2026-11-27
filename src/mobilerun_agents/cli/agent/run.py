@@ -32,6 +32,7 @@ def _device_target(target: DeviceTarget) -> DeviceTarget:
 @click.option("--config", "agent_config", type=click.Path(exists=True, dir_okay=False))
 @click.option("--setup", help="Use this named setup instead of the default.")
 @click.option("--steps", type=click.IntRange(min=1))
+@click.option("--no-record", is_flag=True, help="Do not save a recording for this run.")
 @click.option(
     "--vision",
     type=click.Choice(VISION_MODES),
@@ -43,6 +44,7 @@ def run(
     agent_config: str | None,
     setup: str | None,
     steps: int | None,
+    no_record: bool,
     vision: Vision | None,
     **device_options: Any,
 ) -> None:
@@ -53,10 +55,11 @@ def run(
         with ConfigLoader.override(config), asyncio.Runner() as loop:
             try:
                 spec = loop.run(build_setup(setup, vision))
+                record = False if no_record else None
                 operator = (
-                    PlanningOperator(planner=spec.planner, executor=spec.executor)
+                    PlanningOperator(planner=spec.planner, executor=spec.executor, record=record)
                     if spec.planner is not None
-                    else AgentOperator(selector=spec.selector)
+                    else AgentOperator(selector=spec.selector, record=record)
                 )
             except (CredentialMissing, UnknownModel, ValueError) as exc:
                 raise click.ClickException(str(exc)) from None

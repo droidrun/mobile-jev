@@ -1,8 +1,10 @@
-"""Raw workflow events. Redaction belongs to stream consumers."""
+"""Live workflow events, including safe tool selections and device-step links."""
 
 from llama_index.core.tools import ToolSelection
+from pydantic import Field, field_validator
 from workflows.events import Event
 
+from .workflows.core.privacy import mask_value
 from .workflows.core.state import ActionRecord, Outcome, SubgoalResult
 
 
@@ -23,6 +25,7 @@ class Selected(Event):
 
 class Acted(Event):
     action: ActionRecord
+    step_ids: list[int] = Field(default_factory=list)
 
 
 class Repaired(Event):
@@ -41,6 +44,11 @@ class Subgoal(Event):
 class Detail(Event):
     section: str
     text: str
+
+    @field_validator("text")
+    @classmethod
+    def _redact_text(cls, text: str) -> str:
+        return str(mask_value(text))
 
 
 class Finished(Event):

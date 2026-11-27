@@ -21,11 +21,11 @@ These examples can change the phone's screen and send screen contents to model p
 | `mailbox` | Bind an existing cloud mailbox (`MAILBOX_ID`) and wait for a verification email. Send the fixture during the wait; the base API searches for new mail by default. |
 | `structured` | Validate battery level and charging status with a Pydantic model. |
 | `custom_tool` | Register `note`, whose workflow context is injected by type. |
-| `macro` | Replay the automatic macro export for the latest checkpoint using base `MacroPlayer`. |
-| `inspect_run` | Read the newest `context.json` and print action targets and whether each action succeeded or changed the screen. |
+| `macro` | Replay a versioned JSONL macro built from recorded steps using base `MacroPlayer`. |
+| `inspect_run` | Inspect the latest run's `run.json` and `steps.jsonl` for action targets and outcomes. |
 | `compare_models` | Run `COMPARE_GOAL` once per provider in `COMPARE`. |
 | `compare_setups` | Run `COMPARE_GOAL` with LLM, Jev, delegation, and planner + delegation. |
 
 The vault example requires the backend to report an editable focused field after Chrome's address bar is tapped. If the phone reports the keyboard instead, base can reject the action. Use fake credentials and **synthetic SMS/email only**. The SMS and mailbox demos report only whether a code was found and the step count, even with `DEBUG` enabled. Extension setup does not buy resources. See [`demo_extension.py`](demo_extension.py) for standalone extension wiring.
 
-The demo follows your checkpoint settings. To generate data for `macro` and `inspect_run`, enable checkpoints in your config and run an agent example first. Checkpoints use `MOBILERUN_AGENT_RUNS_DIR` (default: `runs` under the Mobilerun user config directory). Macro exports use `MOBILERUN_MACRO_DIRECTORY`, keyed by the same run ID. Replay requires the recording's starting screen; set `RESET = False` and prepare that screen yourself if Home is not the right starting point. Macros don't recreate temporary extension bindings; use a prior plain device-action run for replay.
+Agents record by default unless stealth or recording opt-out is active (`record=False`, `--no-record`, `recording.enabled: false`, or `MOBILERUN_AGENT_RECORDING_ENABLED=false`). Core writes `runs/<id>/run.json` and `steps.jsonl`; the agent adds only `agent.json`. A device recorder with full capture writes the before/after PNGs. Core run storage defaults to `runs` under the Mobilerun user config directory, configurable with `MOBILERUN_RUNS_DIR`. Versioned macros are stored under the Mobilerun `macros` directory. Replay requires the recording's starting screen; set `RESET = False` and prepare that screen yourself if Home is not the right starting point. Macros don't recreate temporary extension bindings; use a prior plain device-action run for replay.

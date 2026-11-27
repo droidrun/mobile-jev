@@ -9,29 +9,33 @@ from typing import Protocol, TypeVar
 from uuid import uuid4
 
 from mobilerun.core.devices import Device
-from mobilerun.macro.settings import get_macro_settings
+from mobilerun.core.runs import recording_scope
+from mobilerun.macro import MacroError, build_macro
+from mobilerun.models.recording import RunStatus, RunStep
 from mobilerun.models.results import ExecutionResult
 from pydantic import BaseModel, ValidationError
-from workflows import Context, Workflow
+from workflows import Workflow
 from workflows.errors import WorkflowTimeoutError
 from workflows.events import Event
 from workflows.resource import ResourceManager
 
 from mobilerun_agents.agent.analytics.consumer import RunAnalytics
 from mobilerun_agents.agent.analytics.tracing import trace_run
-from mobilerun_agents.agent.checkpoints.macro_export import macro_data
-from mobilerun_agents.agent.checkpoints.store import save_context, save_macro
-from mobilerun_agents.agent.events import Acted, Finished, Observed, Subgoal
+from mobilerun_agents.agent.events import Acted, Finished, Observed, Selected, Subgoal
 from mobilerun_agents.agent.logs import ConsoleLog
+from mobilerun_agents.agent.logs.memory import MemoryDetail, memory_evidence_scope
 from mobilerun_agents.agent.memory.memory import _RunMemory
+from mobilerun_agents.agent.memory.registry import block_tools
 from mobilerun_agents.agent.tools import Tool
-from mobilerun_agents.agent.tools.helpers.images import ImageStore
 from mobilerun_agents.agent.tools.registry import ToolRegistry, build_registry
+from mobilerun_agents.agent.workflows.core.privacy import mask_value
 from mobilerun_agents.agent.workflows.core.state import AgentState, Outcome, PlanningState
 from mobilerun_agents.agent.workflows.resources import Services, run_resources
 from mobilerun_agents.config.prompts import render_prompt
-from mobilerun_agents.config.settings import get_agent_settings
 from mobilerun_agents.config.user_config import MobileConfig
+
+from .evidence import AgentEntry, AgentEntryKind, AgentEvidence
+from .recording import resolve_recording
 
 T = TypeVar("T", bound=BaseModel)
 _log = logging.getLogger(__name__)
@@ -50,45 +54,84 @@ async def execute_workflow(
     output: type[T] | None,
     max_steps: int,
     timeout: float | None,
-    memory_factory: Callable[[ToolRegistry], _RunMemory],
-    typed_completion: bool = True,
+    memory_factory: Callable[[], _RunMemory],
+    planning: bool = False,
+    record: bool | None = None,
 ) -> ExecutionResult[T]:
-    run_id = uuid4().hex
-    images = ImageStore(run_id, keep=config.checkpoints.enabled)
-    try:
-        registry = build_registry(
-            device, tools, config.tools, output if typed_completion else None, config.agent.decision
-        )
-        memory = memory_factory(registry)
+    device, recorder, owned = resolve_recording(device, record, config)
+    status: RunStatus = "failed"
+    with recording_scope(enabled=recorder is not None, by="agent"):
         try:
-            manager = await run_resources(device, memory, Services(registry, images))
-            workflow = factory(timeout=timeout, resource_manager=manager)
-            return await _consume(config, workflow, images, run_id, device, goal, output, max_steps)
-        finally:
+            folder = recorder.start_run() if recorder is not None else None
+            memory = memory_factory()
             try:
-                await memory.aclose()
-            except Exception:
-                _log.warning("Unable to close run memory")
-    finally:
-        images.close()
+                registry = build_registry(
+                    device,
+                    tools if planning else [*tools, *block_tools(memory.memory_blocks)],
+                    config.tools,
+                    None if planning else output,
+                    config.agent.decision,
+                )
+                manager = await run_resources(device, memory, Services(registry))
+                workflow = factory(timeout=timeout, resource_manager=manager)
+                result = await _consume(
+                    config, workflow, folder, device, goal, output, max_steps, registry
+                )
+            finally:
+                try:
+                    await memory.aclose()
+                except Exception:
+                    _log.warning("Unable to close run memory")
+            if result.success:
+                status = "succeeded"
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            status = "cancelled"
+            raise
+        finally:
+            if owned and recorder is not None:
+                recorder.finish(status)
+        if owned and status == "succeeded" and folder is not None:
+            _export(folder)
+        return result
+
+
+def _export(folder: Path) -> None:
+    path = folder / "steps.jsonl"
+    try:
+        with path.open(encoding="utf-8") as file:
+            has_success = any(RunStep.model_validate_json(line).ok for line in file)
+        if has_success:
+            build_macro(path, folder.name)
+    except (OSError, ValidationError, MacroError):
+        # A completed agent can have no replayable steps (e.g. all masked).
+        _log.debug("No macro published from the recorded agent run")
 
 
 async def _consume(
     config: MobileConfig,
     workflow: Workflow,
-    images: ImageStore,
-    run_id: str,
+    folder: Path | None,
     device: Device,
     goal: str,
     output: type[T] | None,
     max_steps: int,
+    registry: ToolRegistry,
 ) -> ExecutionResult[T]:
-    folder = get_agent_settings().runs_dir / run_id if config.checkpoints.enabled else None
-    checkpoint = folder / "context.json" if folder is not None else None
-    console = ConsoleLog(folder)
+    run_id = folder.name if folder is not None else uuid4().hex
+    evidence = AgentEvidence(folder) if folder is not None else None
+    sensitive = False
+    redact_code = device.known_codes_redactor()
+
+    def redact(text: str) -> str:
+        if text and (sensitive or registry.sensitive_seen or device._extension_state.sensitive_ui):
+            return "[omitted]"
+        return redact_code(str(mask_value(text)))
+
+    console = ConsoleLog(redact)
     analytics = RunAnalytics(config.analytics, run_id)
     finished: Finished | None = None
     pending: list[Event] = []
+    batch: list[Acted] = []
     steps = 0
     action_steps = 0
     shared_steps = 0
@@ -98,32 +141,61 @@ async def _consume(
             message = render_prompt(config.agent.decision.completion_prompt, success=success)
         return message or reason
 
-    def flush() -> None:
+    def append(kind: AgentEntryKind, text: str, step_ids: list[int]) -> None:
+        if evidence is not None:
+            evidence.append(AgentEntry(kind=kind, text=redact_code(text), step_ids=step_ids))
+
+    def flush(step_ids: list[int]) -> None:
         for detail in pending:
             console.event(detail)
             match detail:
                 case Observed(step=step, package=package, activity=activity):
                     analytics.on_observe(package, activity, step)
+                case Selected(thought=thought) if thought:
+                    append("thought", redact(thought), step_ids)
+                case Subgoal(text=text):
+                    append("plan", redact(text), step_ids)
+                case MemoryDetail(text=text):
+                    append("memory", redact(text), step_ids)
         pending.clear()
 
-    async with trace_run(config.tracing, run_id) as trace:
+    def flush_actions() -> None:
+        if not batch:
+            return
+        flush(list(dict.fromkeys(i for event in batch for i in event.step_ids)))
+        for acted in batch:
+            console.event(acted)
+            append("tool", str(mask_value(acted.action.call.tool_name)), acted.step_ids)
+        batch.clear()
+
+    async with (
+        memory_evidence_scope(evidence is not None),
+        trace_run(config.tracing, run_id) as trace,
+    ):
         handler = workflow.run(goal=goal, max_steps=max_steps)
-        try:
+
+        async def consume_events() -> None:
+            nonlocal action_steps, finished, sensitive, shared_steps, steps
             async for event in handler.stream_events():
                 match event:
                     case Acted(action=action):
-                        flush()
-                        console.event(event)
+                        batch.append(event)
                         if action_steps < action.step:
                             action_steps = steps = action.step
-                            if checkpoint is not None:
-                                await save_context(checkpoint, handler.ctx)
+                        continue
+                flush_actions()
+                match event:
+                    case Selected(calls=calls):
+                        sensitive |= any(
+                            registry.is_sensitive_choice(call.tool_name) for call in calls
+                        )
+                        pending.append(event)
                     case Finished():
                         finished = event
                     case Subgoal(result=subgoal, step=step) if subgoal is not None:
                         if step is not None:
                             shared_steps = max(shared_steps, step)
-                        flush()
+                        flush([])
                         console.subgoal_finished(
                             subgoal.success,
                             display_message(subgoal.message, subgoal.success, subgoal.reason),
@@ -133,26 +205,17 @@ async def _consume(
                         pending.append(event)
                     case _:
                         pending.append(event)
+            flush_actions()
+
+        events = asyncio.create_task(consume_events())
+        try:
+            await asyncio.shield(events)
             outcome = Outcome.model_validate(await handler)
             if finished is None:
                 raise RuntimeError("Workflow ended without a Finished event")
             steps = finished.steps
             shared_steps = max(shared_steps, finished.steps)
-            if checkpoint is not None:
-                saved = await save_context(checkpoint, handler.ctx)
-                state = await Context.from_dict(workflow, saved).store.get_state()
-                match state:
-                    case AgentState() | PlanningState():
-                        macro_path = (
-                            Path(get_macro_settings().macro_directory).expanduser()
-                            / run_id
-                            / "macro.json"
-                        )
-                        await save_macro(macro_path, macro_data(state.goal, state.actions))
-            if config.tracing.enabled and config.tracing.langfuse_screenshots:
-                for path in sorted(images.folder.glob("*.png")):
-                    trace.screenshot(await asyncio.to_thread(path.read_bytes))
-            flush()
+            flush([])
             answer = display_message(outcome.message, outcome.success, outcome.reason)
             public_output = None
             if output is not None and outcome.success:
@@ -177,6 +240,12 @@ async def _consume(
         except BaseException as error:
             if not handler.is_done():
                 await handler.cancel_run()
+            if not events.done():
+                await asyncio.wait({events}, timeout=1)
+                if not events.done():
+                    events.cancel()
+            await asyncio.gather(events, return_exceptions=True)
+            flush_actions()
             cancelled = type(error) in (asyncio.CancelledError, KeyboardInterrupt)
             trace.finish(False, steps)
             console_steps = shared_steps or steps

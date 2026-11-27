@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from io import BytesIO
 from pathlib import Path
@@ -8,6 +9,9 @@ import pytest
 from llama_index.core.base.llms.types import ChatMessage, ChatResponse, ImageBlock
 from llama_index.core.memory import Memory
 from llama_index.core.tools import ToolSelection
+from mobilerun.core.devices import Device
+from mobilerun.core.devices.recording import RecordingDevice
+from mobilerun.core.devices.stealth import StealthDevice
 from mobilerun.core.extensions import Extension, action
 from mobilerun.core.state.ui_state import UIState
 from mobilerun.errors import DeviceError, NoFocusedInput
@@ -40,23 +44,36 @@ def complete(**kwargs):
 
 class Phone(MemoryDevice):
     def __init__(self, screens, has_tree=False):
-        super().__init__()
+        super().__init__(supported_operations=frozenset({"tap"}))
         self.screens = iter(screens)
         self.captures = 0
         self.has_tree = has_tree
         self._set_state_provider(
             SimpleNamespace(
-                get_state=self.refresh, capabilities=set(), requires_coordinate_tools=False
+                get_state=self.refresh,
+                capabilities=set(),
+                requires_coordinate_tools=False,
+                requires_active_contract_for_coords=False,
             )
         )
 
     async def refresh(self):
-        return UIState([{"index": 1}] if self.has_tree else [], "screen", "", {}, 10, 10)
+        return UIState(
+            [{"index": 1, "resourceId": "screen"}] if self.has_tree else [],
+            "screen",
+            "",
+            {},
+            10,
+            10,
+        )
 
     async def context(self):
         return []
 
-    async def screenshot(self):
+    async def tap(self, x: int, y: int) -> None:
+        pass
+
+    async def screenshot(self, hide_overlay=True):
         self.captures += 1
         return next(self.screens)
 
@@ -92,19 +109,22 @@ async def run(
     max_steps=None,
     selector=None,
     has_tree=False,
+    record=False,
+    stealth=False,
+    extensions=(),
     **settings,
 ):
     from mobilerun_agents.agent.memory.memory import build_executor_memory
     from mobilerun_agents.agent.tools.base import tool
-    from mobilerun_agents.agent.tools.helpers.images import ImageStore
     from mobilerun_agents.agent.tools.registry import build_registry
     from mobilerun_agents.agent.workflows.agent import AgentWorkflow
     from mobilerun_agents.agent.workflows.resources import Services, run_resources
     from mobilerun_agents.config.user_config import MobileConfig, ToolsConfig
 
-    monkeypatch.setenv("MOBILERUN_AGENT_IMAGES_DIR", str(tmp_path))
     device = Phone(screens, has_tree)
     await Bench().bind(device)
+    for extension in extensions:
+        await extension.bind(device)
     if selector is None:
         selector = Selector(choices, on_select)
 
@@ -115,16 +135,27 @@ async def run(
         return text
 
     @tool(sensitive_parameters=frozenset({"text"}))
-    async def write_sensitive(text: str) -> str:
+    async def write_sensitive(text: str, phone: Device) -> str:
         """Write a sensitive value."""
+        await phone.input_text(text)
         return text
 
+    @tool
+    async def tap_twice(phone: Device) -> None:
+        """Tap two different points."""
+        await phone.tap(3, 4)
+        await asyncio.create_task(phone.tap(5, 6))
+
     memory = build_executor_memory(MobileConfig(), device.platform)
-    images = ImageStore("test", keep=True)
-    registry = build_registry(device, [write, write_sensitive], ToolsConfig())
-    services = Services(registry=registry, images=images)
+    dispatch = (
+        RecordingDevice(device, runs_dir=tmp_path / "runs", capture="actions") if record else device
+    )
+    if stealth:
+        dispatch = StealthDevice(dispatch)
+    registry = build_registry(dispatch, [write, write_sensitive, tap_twice], ToolsConfig())
+    services = Services(registry=registry)
     workflow = AgentWorkflow(
-        selector, resource_manager=await run_resources(device, memory, services), **settings
+        selector, resource_manager=await run_resources(dispatch, memory, services), **settings
     )
     handler = workflow.run(goal="Test", max_steps=max_steps)
     try:
@@ -194,7 +225,6 @@ def test_jev_abstention_stops_without_repair_or_fallback(tmp_path, monkeypatch, 
         )
         assert not result.success and result.reason == "abstained"
         assert not state.actions and state.repairs == 0
-        assert state.current.screenshot is None
         assert not any(isinstance(event, Repaired) for event in events)
         assert len(decision.requests) == 1 and not delegate.calls
         assert state.repair is None
@@ -265,7 +295,7 @@ def test_jev_abstention_outcome_keeps_raw_decision_and_choices(
     assert "input_text" not in details.choices
 
 
-def test_abstention_keeps_prior_saved_images_without_saving_current(tmp_path, monkeypatch):
+def test_abstention_keeps_only_latest_action_image_in_memory(tmp_path, monkeypatch):
     from mobilerun_agents.agent.action_selector.base import Selection
 
     class AbstainAfterActions(Selector):
@@ -276,7 +306,7 @@ def test_abstention_keeps_prior_saved_images_without_saving_current(tmp_path, mo
             return Selection(abstained=True)
 
     selector = AbstainAfterActions(
-        [call("write_sensitive", text="fixture-sensitive-input"), call("write", text="next")],
+        [call("write", text="first"), call("write", text="next")],
         lambda _: None,
     )
     result, state, *_ = asyncio.run(
@@ -285,33 +315,50 @@ def test_abstention_keeps_prior_saved_images_without_saving_current(tmp_path, mo
 
     assert result.reason == "abstained"
     assert result.message == "Unfinished: the selector took no action."
-    assert sorted(path.read_bytes() for path in tmp_path.rglob("*.png")) == [b"A", b"B"]
-    assert [record.before.screenshot.path.read_bytes() for record in state.actions] == [b"A", b"B"]
-    assert state.current.screenshot is None
+    assert not any(path.is_file() for path in tmp_path.rglob("*"))
+    assert state.actions[0].before.screenshot is None
+    with state.actions[1].before.screenshot.resolve_image() as image:
+        assert image.read() == b"B"
+    with state.current.screenshot.resolve_image() as image:
+        assert image.read() == b"C"
 
 
-def test_happy_path_keeps_pinned_before_and_renders_call_and_result(tmp_path, monkeypatch):
+@pytest.mark.parametrize("record,stealth", [(False, False), (True, True)])
+def test_happy_path_renders_last_step_with_in_memory_before_image(
+    tmp_path, monkeypatch, record, stealth
+):
     from mobilerun_agents.agent.events import Acted, Finished, Observed, Selected
 
     result, state, events, phone, selector = asyncio.run(
-        run(tmp_path, monkeypatch, [call("write", text="hello"), complete()], [b"A", b"B"])
+        run(
+            tmp_path,
+            monkeypatch,
+            [call("tap", x=1, y=2), complete()],
+            [b"A", b"B"],
+            record=record,
+            stealth=stealth,
+        )
     )
     assert result.success and result.message == "done"
     assert [
         type(event) for event in events if type(event) in {Observed, Selected, Acted, Finished}
     ] == [Observed, Selected, Acted, Observed, Selected, Acted, Finished]
     action = state.actions[0]
-    assert action.before.screenshot.path.read_bytes() == b"A"
-    assert action.call.tool_kwargs == {"text": "hello"}
-    assert action.screen_changed is True
+    assert action.before.screenshot is None
+    assert action.call.tool_kwargs == {"x": 1, "y": 2}
+    assert action.screen_changed is None
     assert phone.captures == 2
     (message,) = selector.history[-1]
     assert message.role == "user"
-    assert 'write({"text": "hello"}) · ok=true: hello' in message.content
-    assert action.before.screenshot in message.blocks
+    assert 'tap({"x": 1, "y": 2}) · ok=true' in message.content
+    (previous_image,) = [block for block in message.blocks if isinstance(block, ImageBlock)]
+    assert previous_image.path is None
+    with previous_image.resolve_image() as image:
+        assert image.read() == b"A"
+    assert not any(path.is_file() for path in tmp_path.rglob("*"))
 
 
-def test_persisting_image_does_not_modify_selected_snapshot(tmp_path, monkeypatch):
+def test_action_retains_selected_screenshot_in_memory(tmp_path, monkeypatch):
     selected = []
     _, state, *_ = asyncio.run(
         run(
@@ -324,7 +371,7 @@ def test_persisting_image_does_not_modify_selected_snapshot(tmp_path, monkeypatc
     )
     assert selected[0].screenshot.path is None
     assert selected[0].screenshot.image is not None
-    assert state.actions[0].before.screenshot.path.read_bytes() == b"A"
+    assert state.actions[0].before.screenshot == selected[0].screenshot
 
 
 def test_record_and_memory_use_the_base_action_name(tmp_path, monkeypatch):
@@ -398,14 +445,14 @@ def test_rejected_sensitive_selection_preserves_images_during_repair(
             choices,
             [b"A", b"B"],
             config=cfg,
-            on_select=lambda _: present.append(bool(list(tmp_path.rglob("*.png")))),
+            on_select=lambda s: present.append(s.current.screenshot is not None),
         )
     )
     assert result.reason == ("repair_attempts" if exhausted else "complete")
-    assert present == [False, True, True]
-    expected = [b"A"] if exhausted else [b"A", b"B"]
-    assert sorted(path.read_bytes() for path in tmp_path.rglob("*.png")) == expected
-    assert [record.before.screenshot.path.read_bytes() for record in state.actions] == expected
+    assert present == [True, True, True]
+    assert not list(tmp_path.rglob("*.png"))
+    with state.actions[-1].before.screenshot.resolve_image() as image:
+        assert image.read() == (b"A" if exhausted else b"B")
 
 
 def test_selector_parse_error_becomes_a_repair(tmp_path, monkeypatch):
@@ -420,20 +467,110 @@ def test_selector_parse_error_becomes_a_repair(tmp_path, monkeypatch):
     assert selector.repairs == [None, "Malformed model reply"]
 
 
-def test_sensitive_action_keeps_screenshots_and_raw_arguments(tmp_path, monkeypatch):
-    value = "fixture-sensitive-input"
-    choices = [call("write", text=value), call("write_sensitive", text=value), complete()]
-    result, state, _, phone, _ = asyncio.run(
-        run(tmp_path, monkeypatch, choices, [b"A", b"B", b"C"])
+@pytest.mark.parametrize("record", [False, True])
+def test_acted_links_each_tool_to_its_committed_primitives(tmp_path, monkeypatch, record):
+    from mobilerun_agents.agent.events import Acted
+    from mobilerun_agents.config.user_config import AgentConfig
+
+    choices = [call("tap", x=1, y=2), call("tap_twice"), complete()]
+    result, _, events, *_ = asyncio.run(
+        run(
+            tmp_path,
+            monkeypatch,
+            choices,
+            [],
+            has_tree=True,
+            record=record,
+            config=AgentConfig(settle_delay=0),
+        )
     )
-    assert result.success and phone.captures == 3
-    assert sorted(path.read_bytes() for path in tmp_path.rglob("*.png")) == [b"A", b"B", b"C"]
-    assert [record.before.screenshot.path.read_bytes() for record in state.actions] == [
-        b"A",
-        b"B",
-        b"C",
+    assert result.success
+    assert [event.step_ids for event in events if isinstance(event, Acted)] == (
+        [[1], [2, 3], []] if record else [[], [], []]
+    )
+
+
+@pytest.mark.parametrize("record", [False, True])
+def test_sensitive_action_does_not_expose_its_value(tmp_path, monkeypatch, record):
+    from mobilerun_agents.agent.events import Acted, Selected
+
+    value = "fixture-sensitive-input"
+    choices = [call("write_sensitive", text=value), complete()]
+    result, state, events, phone, selector = asyncio.run(
+        run(tmp_path, monkeypatch, choices, [b"before", b"live after"], record=record)
+    )
+    assert result.success and phone.inputs == [value]
+    event = next(event for event in events if isinstance(event, Acted))
+    assert event.step_ids == ([1] if record else [])
+    assert event.action.call.tool_kwargs == {"text": "***"}
+    assert value not in event.action.model_dump_json()
+    assert all(
+        value not in event.model_dump_json() for event in events if isinstance(event, Selected)
+    )
+    assert value not in state.model_dump_json()
+    assert value not in "\n".join(message.model_dump_json() for message in selector.history[-1])
+    (before,) = [
+        block
+        for message in selector.history[-1]
+        for block in message.blocks
+        if isinstance(block, ImageBlock)
     ]
-    assert state.actions[1].call.tool_kwargs == {"text": value}
+    with before.resolve_image() as image:
+        assert image.read() == b"before"
+    if record:
+        [steps] = (tmp_path / "runs").glob("*/steps.jsonl")
+        assert json.loads(steps.read_text())["args"]["text"] == "***"
+        assert value not in steps.read_text()
+        assert {path.name for path in steps.parent.iterdir()} == {"run.json", "steps.jsonl"}
+    assert phone.captures == 2
+    assert not list(tmp_path.rglob("*.png"))
+    with state.actions[-1].before.screenshot.resolve_image() as image:
+        assert image.read() == b"live after"
+
+
+def test_verification_code_is_not_in_acted_or_workflow_state(tmp_path, monkeypatch, caplog):
+    from mobilerun.core.mailbox import Mailbox
+
+    from mobilerun_agents.agent.events import Acted
+
+    code = "314159"
+
+    class Mail(Mailbox):
+        address = None
+
+        @action
+        async def wait_for_code(self) -> str:
+            """Read the test code."""
+            return code
+
+    async def refresh(phone):
+        text = phone.inputs[-1] if phone.inputs else ""
+        return UIState([], text, text, {"focusedElement": {"text": text}}, 10, 10)
+
+    monkeypatch.setattr(Phone, "refresh", refresh)
+    monkeypatch.setattr(Phone, "supported_operations", {"input_text"})
+    choices = [
+        call("email__wait_for_code"),
+        call("input_text", text=code),
+        call("complete", success=True, message=code),
+    ]
+    result, state, events, phone, _ = asyncio.run(
+        run(
+            tmp_path,
+            monkeypatch,
+            choices,
+            [b"initial", b"before typing", b"live after typing"],
+            record=True,
+            extensions=(Mail(),),
+        )
+    )
+
+    assert result.success and phone.inputs == [code]
+    actions = [event for event in events if isinstance(event, Acted)]
+    assert [event.step_ids for event in actions] == [[], [1], []]
+    assert all(code not in event.action.model_dump_json() for event in actions)
+    assert code not in state.model_dump_json()
+    assert code not in caplog.text
 
 
 def test_output_schema_is_validated_before_completing(tmp_path, monkeypatch):
@@ -466,15 +603,6 @@ def test_completion_without_a_message_records_empty_feedback(tmp_path, monkeypat
     )
     assert result.success and result.message is None
     assert state.actions[0].summary == ""
-
-
-def test_unchanged_screenshot_is_compared_from_next_observation(tmp_path, monkeypatch):
-    _, state, _, phone, _ = asyncio.run(
-        run(tmp_path, monkeypatch, [call("write", text="hello"), complete()], [b"A", b"A"])
-    )
-    assert state.actions[0].screen_changed is False
-    assert state.actions[1].screen_changed is None
-    assert phone.captures == 2
 
 
 def png(color):
@@ -553,30 +681,36 @@ def test_tree_screenshot_is_only_fetched_by_vision_selector(
     assert result.success
     assert phone.captures == captures
     assert selector.captures_at_entry == ([0, 1] if captures else [0, 0])
-    for record, messages, image in zip(state.actions, selector.requests, images, strict=True):
+    for messages in selector.requests:
         assert any(isinstance(block, ImageBlock) for block in messages[-1].blocks) == bool(captures)
-        if captures:
-            assert record.before.screenshot.path.read_bytes() == image
-        else:
-            assert record.before.screenshot is None
+    assert state.actions[0].before.screenshot is None
+    if captures:
+        with state.actions[-1].before.screenshot.resolve_image() as image:
+            assert image.read() == images[-1]
+    else:
+        assert state.actions[-1].before.screenshot is None
 
 
 @pytest.mark.parametrize(
-    "second,changed,line",
+    "resource_id,changed,line",
     [
-        (b"B", True, "Previous action changed the screen"),
-        (b"A", False, "Previous action did not change the screen"),
+        ("next", True, "Previous action changed the screen"),
+        ("first", False, "Previous action did not change the screen"),
     ],
 )
-def test_screenshot_only_change_is_live_model_context_not_stored_history(
-    tmp_path, monkeypatch, second, changed, line
+def test_structural_screen_change_is_live_model_context(
+    tmp_path, monkeypatch, resource_id, changed, line
 ):
+    ids = iter(["first", resource_id])
+
+    async def refresh(self):
+        return UIState([{"resourceId": next(ids)}], "", "", {}, 10, 10)
+
+    monkeypatch.setattr(Phone, "refresh", refresh)
     selector = chat_selector("off")
-    result, state, _, phone, _ = asyncio.run(
-        run(tmp_path, monkeypatch, [], [b"A", second], selector=selector)
-    )
+    result, state, _, phone, _ = asyncio.run(run(tmp_path, monkeypatch, [], [], selector=selector))
     assert result.success and state.actions[0].screen_changed is changed
-    assert phone.captures == 2 and selector.captures_at_entry == [1, 2]
+    assert phone.captures == 0 and selector.captures_at_entry == [0, 0]
     assert not selector.requests[0][-1].content.startswith("Previous action")
     assert selector.requests[1][-1].content.splitlines()[0] == line
     assert "<last_step>" in selector.requests[1][-2].content
@@ -622,10 +756,9 @@ def test_untracked_tool_exception_text_is_not_in_public_artifacts(tmp_path, monk
         raise RuntimeError(f"https://example.invalid/?api_key={marker}")
 
     cfg = MobileConfig()
-    cfg.checkpoints.enabled = True
     cfg.analytics.enabled = cfg.tracing.enabled = False
-    monkeypatch.setenv("MOBILERUN_AGENT_RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setenv("MOBILERUN_AGENT_IMAGES_DIR", str(tmp_path / "images"))
+    monkeypatch.setenv("MOBILERUN_RUNS_DIR", str(tmp_path / "runs"))
+    monkeypatch.setenv("MOBILERUN_RUN_SCREEN_MODE", "none")
     monkeypatch.setenv("MOBILERUN_MACRO_DIRECTORY", str(tmp_path / "macros"))
     caplog.set_level(logging.DEBUG, logger="mobilerun_agents.agent.logs.console")
     selector = Selector([call("lookup"), complete()], lambda state: None)
@@ -633,9 +766,9 @@ def test_untracked_tool_exception_text_is_not_in_public_artifacts(tmp_path, monk
         result = asyncio.run(AgentOperator(selector, [lookup]).execute(Phone([b"A", b"B"]), "fake"))
 
     assert result.success
-    checkpoint = (Path(result.trajectory_path) / "context.json").read_text()
-    assert "RuntimeError" in caplog.text and "RuntimeError" in checkpoint
-    assert marker not in caplog.text and marker not in checkpoint
+    [evidence] = (tmp_path / "runs").glob("*/agent.json")
+    assert "RuntimeError" in caplog.text and "lookup" in evidence.read_text()
+    assert marker not in caplog.text and marker not in evidence.read_text()
 
 
 def test_rejected_output_is_not_echoed_in_public_answer(tmp_path, monkeypatch):
@@ -645,18 +778,19 @@ def test_rejected_output_is_not_echoed_in_public_answer(tmp_path, monkeypatch):
 
     cfg = MobileConfig()
     cfg.agent.max_output_validation_attempts = 1
-    cfg.checkpoints.enabled = cfg.analytics.enabled = cfg.tracing.enabled = False
-    monkeypatch.setenv("MOBILERUN_AGENT_IMAGES_DIR", str(tmp_path / "images"))
+    cfg.analytics.enabled = cfg.tracing.enabled = False
     selector = Selector(
         [complete(output={"count": "FAKE_INVALID_OUTPUT_SECRET"})], lambda state: None
     )
     with ConfigLoader.override(cfg):
-        result = asyncio.run(AgentOperator(selector).execute(Phone([b"A"]), "fake", output=Output))
+        result = asyncio.run(
+            AgentOperator(selector, record=False).execute(Phone([b"A"]), "fake", output=Output)
+        )
 
     assert not result.success and result.answer == "count: Input should be a valid integer"
 
 
-def test_rejected_output_mapping_key_is_kept_in_run_data_but_not_feedback(tmp_path, monkeypatch):
+def test_rejected_output_mapping_key_is_kept_in_live_memory_but_not_feedback():
     from mobilerun_agents import AgentOperator
     from mobilerun_agents.config.loader import ConfigLoader
     from mobilerun_agents.config.user_config import MobileConfig
@@ -669,23 +803,21 @@ def test_rejected_output_mapping_key_is_kept_in_run_data_but_not_feedback(tmp_pa
 
     marker = "FAKE_MAPPING_KEY_SECRET"
     cfg = MobileConfig()
-    cfg.checkpoints.enabled = True
     cfg.agent.max_output_validation_attempts = 2
     cfg.analytics.enabled = cfg.tracing.enabled = False
-    monkeypatch.setenv("MOBILERUN_AGENT_RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setenv("MOBILERUN_AGENT_IMAGES_DIR", str(tmp_path / "images"))
     rejected = complete(output={"results": [{"counts": {marker: "bad"}}]})
     selector = Selector([rejected, rejected], lambda _: None)
     with ConfigLoader.override(cfg):
         result = asyncio.run(
-            AgentOperator(selector).execute(Phone([b"A", b"B"]), "fake", output=TypedOutput)
+            AgentOperator(selector, record=False).execute(
+                Phone([b"A", b"B"]), "fake", output=TypedOutput
+            )
         )
 
     assert not result.success
     assert result.answer == "results.0.counts.*: Input should be a valid integer"
     history = [message.model_dump_json() for message in selector.history[-1]]
     assert marker in "\n".join(history)
-    assert marker in (Path(result.trajectory_path) / "context.json").read_text()
 
 
 def test_rejected_custom_validator_exception_text_is_not_echoed(tmp_path, monkeypatch):
@@ -736,7 +868,9 @@ def test_decision_selector_captures_tree_and_reports_change_as_live_context(tmp_
     )
     assert result.success and phone.captures == 2
     assert [request.screenshot for request in model.requests] == images
-    assert [record.before.screenshot.path.read_bytes() for record in state.actions] == images
+    assert state.actions[0].before.screenshot is None
+    with state.actions[-1].before.screenshot.resolve_image() as image:
+        assert image.read() == images[-1]
     assert model.requests[0].previous_action is None
     assert model.requests[1].previous_action == "Previous action did not change the screen"
     assert "Screen changed: false" in model.requests[1].memory
@@ -746,7 +880,6 @@ def test_decision_selector_captures_tree_and_reports_change_as_live_context(tmp_
 async def test_reused_workflow_passes_the_current_registry():
     from mobilerun_agents.agent.action_selector.base import ActionSelector, Selection
     from mobilerun_agents.agent.tools.base import tool
-    from mobilerun_agents.agent.tools.helpers.images import ImageStore
     from mobilerun_agents.agent.tools.registry import build_registry
     from mobilerun_agents.agent.workflows.agent import AgentWorkflow
     from mobilerun_agents.agent.workflows.resources import Services, run_resources
@@ -768,15 +901,12 @@ async def test_reused_workflow_passes_the_current_registry():
         return "second"
 
     phone = Phone([b"A"] * 4)
-    images = ImageStore("reuse", keep=False)
     first_registry = build_registry(phone, [first], ToolsConfig())
     second_registry = build_registry(phone, [second], ToolsConfig())
-    manager = await run_resources(phone, Memory.from_defaults(), Services(first_registry, images))
+    manager = await run_resources(phone, Memory.from_defaults(), Services(first_registry))
     workflow = AgentWorkflow(Choose(), resource_manager=manager)
     await workflow.run(goal="first", max_steps=1)
-    second_resources = await run_resources(
-        phone, Memory.from_defaults(), Services(second_registry, images)
-    )
+    second_resources = await run_resources(phone, Memory.from_defaults(), Services(second_registry))
     for name, resource in second_resources.get_all().items():
         await manager.set(name, resource)
     handler = workflow.run(goal="second", max_steps=1)
@@ -804,8 +934,9 @@ def test_image_is_not_persisted_during_dispatch_and_terminal_guard_does_not_save
     assert files_during_write == [[]]
     assert result.reason == "max_steps"
     assert result.message is None
-    assert state.actions[0].screen_changed is True
-    assert state.current.screenshot is None
+    assert state.actions[0].screen_changed is None
+    with state.current.screenshot.resolve_image() as image:
+        assert image.read() == b"B"
     assert phone.captures == 2
-    assert [path.read_bytes() for path in tmp_path.rglob("*.png")] == [b"A"]
+    assert not list(tmp_path.rglob("*.png"))
     assert [event.step for event in events if isinstance(event, Observed)] == [1]

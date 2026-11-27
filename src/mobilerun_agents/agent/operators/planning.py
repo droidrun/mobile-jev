@@ -26,11 +26,13 @@ class PlanningOperator(Operator):
         executor: ActionSelector | None = None,
         tools: Sequence[Tool] = (),
         memory_blocks: Mapping[str, BlockFactory] = NO_MEMORY_BLOCKS,
+        record: bool | None = None,
     ) -> None:
         self._planner = planner
         self._executor = executor
         self._tools = tuple(tools)
         self._memory_blocks = dict(memory_blocks)
+        self._record = record
 
     async def execute(
         self,
@@ -69,8 +71,9 @@ class PlanningOperator(Operator):
             output,
             config.agent.planning_max_steps if max_steps is None else max_steps,
             config.agent.workflow_timeout if timeout is None else timeout,
-            memory_factory=lambda _: build_planner_memory(
+            memory_factory=lambda: build_planner_memory(
                 config, state, device.platform, extra=self._memory_blocks
             ),
-            typed_completion=False,
+            planning=True,
+            record=self._record,
         )

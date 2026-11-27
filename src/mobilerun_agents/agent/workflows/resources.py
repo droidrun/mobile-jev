@@ -5,7 +5,7 @@ run_resources(device, memory, services)` to the workflow constructor, which
 forwards it to `Workflow`. ResourceManager.set binds the cached descriptors by
 name before steps run; no factory needs access to context or ambient state.
 Construct a new workflow and manager for every run and planning child. A child
-gets its own memory; the phone and image store can be passed on explicitly.
+gets its own memory; the phone and run services can be passed on explicitly.
 """
 
 from dataclasses import dataclass
@@ -16,14 +16,12 @@ from mobilerun.core.devices import Device
 from workflows.resource import Resource, ResourceManager
 
 if TYPE_CHECKING:
-    from mobilerun_agents.agent.tools.helpers.images import ImageStore
     from mobilerun_agents.agent.tools.registry import ToolRegistry
 
 
 @dataclass(frozen=True)
 class Services:
     registry: "ToolRegistry"
-    images: "ImageStore"
 
 
 def _device() -> Device:
