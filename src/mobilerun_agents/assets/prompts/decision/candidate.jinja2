@@ -1,0 +1,13 @@
+{% if kind == 'tap' %}
+tap on screen
+{% elif kind == 'located' %}
+tap ({{ x }}, {{ y }})
+{% elif kind == 'schema' %}
+{{ name }}{% if arguments %} {{ arguments | join(' ') }}{% endif %}
+{% elif kind == 'app' %}
+start_app {{ label }}
+{% elif kind == 'scroll' %}
+scroll {{ direction }} (show content further {{ direction }}; finger moves {{ {'up': 'down', 'down': 'up', 'left': 'right', 'right': 'left'}[direction] }})
+{% elif kind == 'element' %}
+tap_element [{{ index }}] "{{ label or ('unnamed ' ~ unnamed_class) }}"{% if element_kind %} ({{ element_kind | replace('_', ' ') }}){% endif %}{% if contents | default('') or extra | default('') or notes %} ({% if contents | default('') %}contains "{{ contents }}"{% if extra | default('') or notes %}, {% endif %}{% endif %}{% if extra | default('') %}{{ extra }}{% if notes %}, {% endif %}{% endif %}{% for note in notes %}{{ {'top': 'top of screen', 'bottom': 'bottom of screen', 'state_true': ('on' if element_kind == 'switch' else 'checked'), 'state_false': ('off' if element_kind == 'switch' else 'unchecked'), 'selected': 'selected', 'focused': 'focused', 'password': 'password'}[note] }}{% if not loop.last %}, {% endif %}{% endfor %}){% endif %}
+{% endif %}

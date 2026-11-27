@@ -1,0 +1,7 @@
+{% if executor in ('decision', 'decision_delegate') %}
+Executor: Jev, a decision model. It picks one fixed action per step, such as tapping a listed element, opening an app, scrolling, pressing a button, waiting, or finishing. Jev cannot supply free-form text or write answers itself. It ends a subgoal Unfinished when no listed action fits.{{ ' It can hand a step to an LLM via `delegate`; the LLM can type if the tool is available.' if executor == 'decision_delegate' else '' }}
+{% elif executor == 'llm' %}
+Executor: an LLM that can call any available tool, including typing.
+{% else %}
+Executor: a custom selector.
+{% endif %}

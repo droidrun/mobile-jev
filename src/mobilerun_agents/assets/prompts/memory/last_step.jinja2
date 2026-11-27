@@ -1,0 +1,14 @@
+Step {{ step }}
+{% for name, arguments, ok, summary in calls %}
+{{ name }}({{ arguments }}) · ok={{ ok | tojson }}: {{ summary }}
+{% endfor %}
+{% if thought %}
+Thought: {{ thought }}
+{% endif %}
+App: {{ before.package or 'unknown' }} / {{ before.activity or 'unknown' }} → {{ after.package or 'unknown' }} / {{ after.activity or 'unknown' }}
+Focused element: {{ before.focus or 'none reported' }} → {{ after.focus or 'none reported' }}
+Keyboard visible: {{ 'unknown' if before.keyboard is none else before.keyboard | tojson }} → {{ 'unknown' if after.keyboard is none else after.keyboard | tojson }}
+Screen changed: {{ 'unknown' if screen_changed is none else screen_changed | tojson }}
+{% if has_screenshot %}
+Screenshot: before this step.
+{% endif %}

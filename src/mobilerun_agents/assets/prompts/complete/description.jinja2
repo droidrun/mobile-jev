@@ -1,0 +1,1 @@
+Mark the task as complete. success=true if the task succeeded, false if it failed. message contains the final answer or explanation.{% if output_schema %} On success, output must match this JSON schema: {{ output_schema | tojson }}{% endif %}

@@ -1,0 +1,7 @@
+{% if kind == 'abstain' %}
+Unfinished: stop and hand this subgoal back to the planner because none of the available choices can continue it (for example, text must be typed).
+{% elif kind == 'complete_success' %}
+complete: subgoal done
+{% else %}
+complete: report failure (blocked or impossible)
+{% endif %}

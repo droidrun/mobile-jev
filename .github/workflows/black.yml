@@ -1,0 +1,9 @@
+name: Black
+on: [push, pull_request]
+jobs:
+  black:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv run --no-project --with 'black==26.10.1' black --check --diff src tests scripts

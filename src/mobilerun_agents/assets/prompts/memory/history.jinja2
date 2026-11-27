@@ -1,0 +1,6 @@
+{% for step, actions, change in steps %}
+{{ step }} · {{ actions | join(' · ') }} · {{ change }}
+{% endfor %}
+{% for warning in warnings %}
+{{ warning }}
+{% endfor %}

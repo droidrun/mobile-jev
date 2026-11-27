@@ -1,10 +1,15 @@
-# Working on Jev Mobile Agent
+# Agent contributor rules
 
-- Keep this repository standalone. Do not add imports or paths to the original Droidrun monorepo.
-- Device IDs and credentials come from environment variables. Never commit `.env` files, raw device traces, screenshots with personal data, or API keys.
-- Jev selects operations and targets; code owns candidate discovery, validation, coordinate resolution, and execution. Do not insert task-specific tap scripts into the agent policy.
-- Read current TypeSafe API/primitive docs before changing inference contracts: https://docs.typesafe.ai/llms.txt.
-- Read current Mobilerun endpoint contracts before changing device operations: https://docs.mobilerun.ai/llms.txt.
-- Keep navigation actions sequential. Retry only stale decisions rejected before input; never replay an uncertain mutation automatically.
-- Report model-declared completion separately from independently verified outcomes. Record unsuccessful benchmark attempts as well as successful ones.
-- Run `pnpm check` before publishing changes. CI must remain offline; live benchmarks need explicit device configuration.
+- Implement the add-on in `src/mobilerun_agents/`. Base owns devices, extensions, macro playback and CLI dispatch; keep the base checkout read-only.
+- Imports go down: CLI/public exports → `macro_agent` → `agent/operators` → workflow steps → services (selectors, planner, tools, memory and consumers) → `agent/events.py` → `workflows/core` → `auth` → `config`/`errors`. Within `agent/tools`, order is `registry` → `atomic` → `helpers`; selectors may use helpers. The agent must not import macro replay.
+- External plugins are base `mobilerun.core.operator.Operator` implementations, not workflows. Register a no-argument subclass or an instance in `mobilerun.agents`; `ExternalOperator` delegates directly to it.
+- Use specific types. No `isinstance` dispatch, no legacy aliases/shims, and no bare `*` except where `execute` mirrors the base API. Keep prompts in `assets/prompts/` and tunables in typed config.
+- Test installed wheels on Python 3.11–3.13. Use `python3 scripts/prepare_split_env.py --base-source ../mobilerun --env .venv --extras dev,langfuse` from the repo root. The harness recreates `.venv`; do not use editable installs or inject source via `PYTHONPATH`.
+- Never print credentials. Unit tests use fakes, not real models, cloud services or devices. Get consent before live tests, clean up resources and report costs. See [CONTRIBUTING.md](CONTRIBUTING.md).
+- `ctx.store` holds the raw `AgentState` or `PlanningState`. LlamaIndex resources inject `Device`, `Memory`, and `Services` (tool registry). The agent steps are observe → select → act → finish; planning cycles through observe → plan → execute a child agent. Selectors take `select(ctx, device, memory, registry)` without binding. Text owners render their own prompts; no workflow renders a prompt.
+- Memory = blocks rendered from the run state via `read_memory(memory, ctx)`; no chat history; per-step content stays outside memory.
+- Extend memory with `StateBlock` factories in `mobilerun.memory_blocks` or an operator's `memory_blocks` mapping.
+- Planner turns and executor actions each cost one step from the shared planning budget. If the planner takes the last step, it must call `complete` and explain any blocker.
+- Use standard logging; the base's `secret_scope` masks sensitive values in logs during sensitive calls. Treat run data as private: core masks secrets and known OTPs in recorded arguments, but full recording saves unredacted screenshots.
+- Reuse existing recorders; auto-wrap plain devices with `RecordingDevice(capture="actions")`. Stealth or recording opt-out prevents agent recording. `record=False`, CLI `--no-record`, `recording.enabled: false`, and `MOBILERUN_AGENT_RECORDING_ENABLED=false` are opt-outs; explicit operator settings take precedence.
+- Core writes `run.json`, `steps.jsonl`, and before/after screen evidence in full capture. The agent writes only `agent.json` with reasoning linked to step IDs, and keeps prompt screenshots in memory only. Macros are versioned `macros/<name>/vN.jsonl` files built from recorded steps. Base resolves vault values from references; do not fetch them into workflow state.

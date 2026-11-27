@@ -1,0 +1,2 @@
+{% if not screenshot_only %}{{ state }}
+{% endif %}The screenshot is {{ width }}x{{ height }}. For coordinate tools, {% if normalized %}use 0–1000 on each axis, (0,0) at top left and (1000,1000) at bottom right{% else %}use pixels in this image, from (0,0) to ({{ width-1 }},{{ height-1 }}){% endif %}. Use element indices for indexed tools.
