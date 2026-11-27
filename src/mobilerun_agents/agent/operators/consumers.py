@@ -12,7 +12,6 @@ from mobilerun.core.devices import Device
 from mobilerun.macro.settings import get_macro_settings
 from mobilerun.models.results import ExecutionResult
 from pydantic import BaseModel, ValidationError
-from pydantic_core import PydanticSerializationError
 from workflows import Context, Workflow
 from workflows.errors import WorkflowTimeoutError
 from workflows.events import Event
@@ -64,9 +63,7 @@ async def execute_workflow(
         try:
             manager = await run_resources(device, memory, Services(registry, images))
             workflow = factory(timeout=timeout, resource_manager=manager)
-            return await _consume(
-                config, workflow, registry, images, run_id, device, goal, output, max_steps
-            )
+            return await _consume(config, workflow, images, run_id, device, goal, output, max_steps)
         finally:
             try:
                 await memory.aclose()
@@ -79,7 +76,6 @@ async def execute_workflow(
 async def _consume(
     config: MobileConfig,
     workflow: Workflow,
-    registry: ToolRegistry,
     images: ImageStore,
     run_id: str,
     device: Device,
@@ -89,31 +85,25 @@ async def _consume(
 ) -> ExecutionResult[T]:
     folder = get_agent_settings().runs_dir / run_id if config.checkpoints.enabled else None
     checkpoint = folder / "context.json" if folder is not None else None
-    redact = registry.redactor
-    console = ConsoleLog(redact, folder)
+    console = ConsoleLog(folder)
     analytics = RunAnalytics(config.analytics, run_id)
     finished: Finished | None = None
     pending: list[Event] = []
     steps = 0
     action_steps = 0
     shared_steps = 0
-    checkpoint_revision = 0
 
     def display_message(message: str | None, success: bool, reason: str) -> str:
         if message is None:
             message = render_prompt(config.agent.decision.completion_prompt, success=success)
-        return redact.text(message or reason)
+        return message or reason
 
     def flush() -> None:
         for detail in pending:
             console.event(detail)
             match detail:
                 case Observed(step=step, package=package, activity=activity):
-                    analytics.on_observe(
-                        redact.text(package) if package else None,
-                        redact.text(activity) if activity else None,
-                        step,
-                    )
+                    analytics.on_observe(package, activity, step)
         pending.clear()
 
     async with trace_run(config.tracing, run_id) as trace:
@@ -127,9 +117,7 @@ async def _consume(
                         if action_steps < action.step:
                             action_steps = steps = action.step
                             if checkpoint is not None:
-                                revision = redact.revision
-                                await save_context(checkpoint, handler.ctx, redact)
-                                checkpoint_revision = revision
+                                await save_context(checkpoint, handler.ctx)
                     case Finished():
                         finished = event
                     case Subgoal(result=subgoal, step=step) if subgoal is not None:
@@ -151,9 +139,7 @@ async def _consume(
             steps = finished.steps
             shared_steps = max(shared_steps, finished.steps)
             if checkpoint is not None:
-                revision = redact.revision
-                saved = await save_context(checkpoint, handler.ctx, redact)
-                checkpoint_revision = revision
+                saved = await save_context(checkpoint, handler.ctx)
                 state = await Context.from_dict(workflow, saved).store.get_state()
                 match state:
                     case AgentState() | PlanningState():
@@ -162,12 +148,8 @@ async def _consume(
                             / run_id
                             / "macro.json"
                         )
-                        await save_macro(macro_path, macro_data(state.goal, state.actions, redact))
-            if (
-                config.tracing.enabled
-                and config.tracing.langfuse_screenshots
-                and not redact.revision
-            ):
+                        await save_macro(macro_path, macro_data(state.goal, state.actions))
+            if config.tracing.enabled and config.tracing.langfuse_screenshots:
                 for path in sorted(images.folder.glob("*.png")):
                     trace.screenshot(await asyncio.to_thread(path.read_bytes))
             flush()
@@ -176,29 +158,17 @@ async def _consume(
             if output is not None and outcome.success:
                 try:
                     public_output = output.model_validate_json(
-                        json.dumps(redact.value(outcome.output)), strict=True
+                        json.dumps(outcome.output), strict=True
                     )
                 except ValidationError:
-                    pass
-                else:
-                    # Defaults and validators can reintroduce protected data after input masking.
-                    try:
-                        serialized = json.loads(public_output.model_dump_json(by_alias=True))
-                    except PydanticSerializationError:
-                        # Without a successful safety check, do not expose the model.
-                        public_output = None
-                    else:
-                        if redact.value(serialized) != serialized:
-                            public_output = None
-                if public_output is None:
-                    _log.warning("Typed output omitted: redacted output did not match the schema")
+                    _log.warning("Typed output omitted: output did not match the schema")
             result: ExecutionResult[T] = ExecutionResult(
                 success=outcome.success,
                 answer=answer,
                 output=public_output,
                 steps=steps,
-                device=redact.text(device.identifier or device.platform),
-                trajectory_path=redact.text(str(folder)) if folder else None,
+                device=device.identifier or device.platform,
+                trajectory_path=str(folder) if folder else None,
             )
             console.finish(outcome.success, answer, finished, folder)
             trace.finish(outcome.success, steps)
@@ -207,17 +177,6 @@ async def _consume(
         except BaseException as error:
             if not handler.is_done():
                 await handler.cancel_run()
-            if (
-                checkpoint is not None
-                and checkpoint.is_file()
-                and checkpoint_revision != redact.revision
-            ):
-                try:
-                    await save_context(checkpoint, handler.ctx, redact)
-                except Exception:
-                    # The earlier checkpoint can contain a newly discovered secret.
-                    checkpoint.unlink(missing_ok=True)
-                    _log.warning("Unable to refresh checkpoint with new redactions")
             cancelled = type(error) in (asyncio.CancelledError, KeyboardInterrupt)
             trace.finish(False, steps)
             console_steps = shared_steps or steps

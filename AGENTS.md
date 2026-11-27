@@ -7,10 +7,9 @@
 - Test installed wheels on Python 3.11–3.13. Use `python3 scripts/prepare_split_env.py --base-source ../mobilerun --env .venv --extras dev,langfuse` from the repo root. The harness recreates `.venv`; do not use editable installs or inject source via `PYTHONPATH`.
 - Never print credentials. Unit tests use fakes, not real models, cloud services or devices. Get consent before live tests, clean up resources and report costs. See [CONTRIBUTING.md](CONTRIBUTING.md).
 - `ctx.store` holds the raw `AgentState` or `PlanningState`. LlamaIndex resources inject `Device`, `Memory`, and `Services` (registry and image store). The agent steps are observe → select → act → finish; planning cycles through observe → plan → execute a child agent. Selectors take `select(ctx, device, memory, registry)` without binding. Text owners render their own prompts; no workflow renders a prompt.
-- Memory = blocks rendered from the run state via `read_memory(memory, ctx, redact)`; no chat history; per-step content stays outside memory.
+- Memory = blocks rendered from the run state via `read_memory(memory, ctx)`; no chat history; per-step content stays outside memory.
+- Extend memory with `StateBlock` factories in `mobilerun.memory_blocks` or an operator's `memory_blocks` mapping.
 - Planner turns and executor actions each cost one step from the shared planning budget. If the planner takes the last step, it must call `complete` and explain any blocker.
-- Subscribe to `AgentOperator` outputs for masked data; `handler.stream_events()` on the handler returned by `workflow.run()` carries raw internal data, like `ctx.store`. Built-in operator consumers mask console output, `context.json`, macro exports, traces, and `ExecutionResult`.
-- With checkpoints enabled, consumers save the native LlamaIndex context in `context.json`, masking only at output boundaries. Macro export uses the saved action history and its before-snapshots. Base resolves vault values from references; do not fetch them into workflow state.
-  - Exception: target labels are masked when built so protected values stay out of model memory.
-  - Exception: arguments of a rejected `complete` call are masked before they are stored in memory for the same reason.
+- Use standard logging; the base's `secret_scope` masks sensitive values in logs during sensitive calls; run data is stored unmasked.
+- With checkpoints enabled, consumers save the native LlamaIndex context in `context.json`. Macro export uses the saved action history and its before-snapshots. Base resolves vault values from references; do not fetch them into workflow state.
 - Run data belongs under `<MOBILERUN_AGENT_RUNS_DIR>/<run_id>/`, defaulting to `<MOBILERUN_USER_CONFIG_DIR>/runs/<run_id>/`; screenshots belong under `<MOBILERUN_AGENT_IMAGES_DIR>/<run_id>/`, defaulting to `<MOBILERUN_USER_CONFIG_DIR>/images/<run_id>/`. Empty overrides mean defaults. Keep the run snapshot as the single source of UI state and screenshot references.

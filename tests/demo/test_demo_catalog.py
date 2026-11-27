@@ -350,34 +350,3 @@ def test_reset_stops_foreground_before_home(demo):
     phone = Phone()
     asyncio.run(demo["reset_phone"](phone))
     assert phone.events == [("stop", "com.android.chrome"), "home"]
-
-
-def test_inspect_masks_full_target_before_clipping(demo, monkeypatch, tmp_path):
-    secret = "SYNTHETIC_INSPECT_PREFIX_" + "z" * 100
-    monkeypatch.setenv("TEST_DEMO_SECRET", secret)
-    monkeypatch.setenv("MOBILERUN_AGENT_RUNS_DIR", str(tmp_path / "runs"))
-    monkeypatch.setenv("MOBILERUN_MACRO_DIRECTORY", str(tmp_path / "macros"))
-    monkeypatch.setattr(Screen, "target_text", secret)
-    monkeypatch.setattr(
-        llama_index, "adapter_capabilities", lambda _: Capabilities(tool_call_format="responses")
-    )
-
-    async def build_llm(provider, model):
-        llm = Replies()
-        llm._history = []
-        llm._inspect = True
-        return llm
-
-    monkeypatch.setitem(demo, "build_llm", build_llm)
-    config = MobileConfig()
-    config.analytics.enabled = config.tracing.enabled = False
-
-    async def run():
-        phone = Phone()
-        await demo["llm"](phone)
-        return await demo["inspect_run"](phone)
-
-    with ConfigLoader.override(config):
-        report = asyncio.run(run())
-    assert 'Button "***"' in report
-    assert "SYNTHETIC_INSPECT_PREFIX_" not in report

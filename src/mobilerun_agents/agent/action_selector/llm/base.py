@@ -123,7 +123,7 @@ class LLMSelector(ActionSelector):
         user = ChatMessage(role="user", content=text)
         if image.data:
             user.blocks.append(ImageBlock(image=image.data))
-        context = await read_memory(memory, ctx, registry.redactor)
+        context = await read_memory(memory, ctx)
         if self.vision == "off":
             context = [
                 ChatMessage(role=message.role, content=message.content) for message in context

@@ -6,7 +6,6 @@ from mobilerun.core.state.ui_state import UIState
 from mobilerun.macro.player import MacroPlayer
 
 from mobilerun_agents.agent.checkpoints.macro_export import macro_data
-from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.state import ActionRecord
 from tests.unit.device_fixtures import MemoryDevice
@@ -31,7 +30,6 @@ def test_macro_uses_before_ui_and_keeps_only_successful_replayable_calls():
             record("note", {"text": "temporary"}),
             record("type_secret", {"name": "entry", "package": "app", "field": "password"}),
         ],
-        Redactor(),
     )
     assert [a["action_type"] for a in macro["actions"]] == ["tap", "type_secret"]
     assert macro["actions"][0]["pre_state"]["nodes"][0]["text"] == "Settings"
@@ -39,27 +37,24 @@ def test_macro_uses_before_ui_and_keeps_only_successful_replayable_calls():
     assert macro["total_actions"] == 2
 
 
-def test_macro_does_not_publish_masked_arguments_or_expanded_credentials():
-    redact = Redactor()
-    redact.add("fixture-sensitive")
+def test_macro_keeps_literal_text_and_omits_nonreference_type_secret_calls():
     macro = macro_data(
         "type fixture-sensitive",
         [
-            record("input_text", {"text": "fixture-sensitive"}),
             record("input_text", {"text": "***"}),
             record("type_secret", {"name": "entry", "text": "fixture-not-a-reference"}),
         ],
-        redact,
     )
-    assert macro["description"] == "type ***"
-    assert not macro["actions"]
+    assert macro["description"] == "type fixture-sensitive"
+    [action] = macro["actions"]
+    assert action["action_type"] == "input_text" and action["text"] == "***"
 
 
 def test_base_can_load_the_export(tmp_path):
     import json
 
     path = tmp_path / "macro.json"
-    path.write_text(json.dumps(macro_data("wait", [record("wait", {"seconds": 0})], Redactor())))
+    path.write_text(json.dumps(macro_data("wait", [record("wait", {"seconds": 0})])))
     assert MacroPlayer().load_macro_from_file(path)["actions"][0]["duration"] == 0
 
 
@@ -92,7 +87,7 @@ def test_exported_gesture_replays_with_the_recorded_coordinates_and_duration(
 
     monkeypatch.setattr("mobilerun.macro.player.asyncio.sleep", no_sleep)
     args = {"x1": 12, "y1": 34, "x2": 56, "y2": 78, **timing}
-    [action] = macro_data("gesture", [record(name, args)], Redactor())["actions"]
+    [action] = macro_data("gesture", [record(name, args)])["actions"]
     device = GestureDevice()
     assert asyncio.run(MacroPlayer(device).replay_action(action))
     assert device.gestures == [(12, 34, 56, 78, expected_duration)]
@@ -105,7 +100,7 @@ def test_input_text_keeps_all_steps_and_omits_unsupported_options():
         record("input_text", {"text": "stealthy", "stealth": True}),
         record("input_text", {"text": "paced", "wpm": 50}),
     ]
-    actions = macro_data("type", records, Redactor())["actions"]
+    actions = macro_data("type", records)["actions"]
     assert [{k: v for k, v in action.items() if k != "pre_state"} for action in actions] == [
         {"action_type": "input_text", "text": "normal", "clear": True},
         {"action_type": "input_text", "text": "stealthy"},

@@ -4,7 +4,7 @@
 
 **What belongs here / what doesn't:** Built-in operators load configuration and consume events; workflow steps and tool dispatch stay in `workflows/`. External operators own their execution and don't use the built-in consumers.
 
-The handler returned by `workflow.run()` streams raw internal data, like `ctx.store`; built-in operator consumers mask console output, `context.json`, macro exports, traces, and `ExecutionResult`. If a masked value no longer fits the requested output schema, `ExecutionResult.output` is `None`.
+The handler returned by `workflow.run()` streams raw internal data, like `ctx.store`. Built-in consumers do not mask run data. The base handles log masking during sensitive calls. If a successful workflow's output does not match the requested schema, `ExecutionResult.output` is `None`.
 
 **Contents:**
 - `__init__.py` — public operator exports.

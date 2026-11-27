@@ -14,7 +14,6 @@ from mobilerun_agents.agent.action_selector.decision_model.base import (
 )
 from mobilerun_agents.agent.action_selector.decision_model.typesafe import TypeSafeDecisionModel
 from mobilerun_agents.agent.action_selector.llm.parsing import ToolCall
-from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.memory.blocks.subgoals import LastSubgoalBlock
 from mobilerun_agents.agent.workflows.core.state import JevAbstention, PlanningState, SubgoalResult
 from mobilerun_agents.config.prompts import render_prompt
@@ -136,8 +135,7 @@ async def test_planner_turn_explains_jev_abstention(
                     ),
                 )
             ],
-        ),
-        Redactor(),
+        )
     )
 
     assert "Latest executor subgoal result: Unfinished: Search for the book:" in prompt

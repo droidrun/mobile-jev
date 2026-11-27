@@ -1,5 +1,5 @@
 import importlib.util
-from inspect import iscoroutinefunction, signature
+from inspect import signature
 from pathlib import Path
 
 import pytest
@@ -42,24 +42,10 @@ def test_device_cloud_flag():
 
 
 def test_device_unwrap():
-    # agent/tools/registry.py:_invoke_device, _route; agent/logs/redaction.py:observe_vault
+    # agent/tools/registry.py:_invoke_device, _route
     device = Device()
     assert device._unwrap() is device
     assert DeviceWrapper(device)._unwrap() is device
-
-
-def test_device_input_secret_can_be_wrapped():
-    # agent/logs/redaction.py:_track_vault_input
-    device = Device()
-    original = device._input_secret
-    assert iscoroutinefunction(original)
-    signature(original).bind("not-a-real-secret")
-
-    async def stub(value: str) -> bool:
-        return True
-
-    vars(device)["_input_secret"] = stub
-    assert device._input_secret is stub
 
 
 def test_device_state_cache_is_readable_and_writable(ui):

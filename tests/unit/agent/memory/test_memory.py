@@ -1,5 +1,6 @@
 import asyncio
 import socket
+from importlib import metadata
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -12,7 +13,6 @@ from mobilerun.core.state.ui_state import UIState
 from mobilerun.models.context import ContextItem
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.memory import memory as memory_module
 from mobilerun_agents.agent.memory.blocks.app_cards import AppCardBlock
 from mobilerun_agents.agent.memory.blocks.goal import GoalBlock
@@ -21,7 +21,7 @@ from mobilerun_agents.agent.memory.blocks.last_step import LastStepBlock
 from mobilerun_agents.agent.memory.memory import build_executor_memory, build_planner_memory
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.state import ActionRecord, AgentState, PlanningState
-from mobilerun_agents.config.user_config import MemoryConfig
+from mobilerun_agents.config.user_config import MobileConfig
 
 
 @pytest.fixture(autouse=True)
@@ -111,11 +111,11 @@ def test_native_memory_keeps_an_image_returned_with_text():
     asyncio.run(check())
 
 
-def test_state_block_requires_state_and_redactor_and_renders_it():
+def test_state_block_requires_state_and_renders_it():
     from mobilerun_agents.agent.memory.blocks import StateBlock
 
     class GoalBlock(StateBlock[AgentState, str]):
-        async def render(self, state: AgentState, redact: Redactor) -> str:
+        async def render(self, state: AgentState) -> str:
             return state.goal
 
     async def check():
@@ -123,11 +123,7 @@ def test_state_block_requires_state_and_redactor_and_renders_it():
         assert not block.accept_short_term_memory
         with pytest.raises(TypeError, match="requires.*state"):
             await block.aget()
-        with pytest.raises(TypeError, match="requires.*redact"):
-            await block.aget(state=AgentState(goal="Find order"))
-        assert (
-            await block.aget(state=AgentState(goal="Find order"), redact=Redactor()) == "Find order"
-        )
+        assert await block.aget(state=AgentState(goal="Find order")) == "Find order"
 
     asyncio.run(check())
 
@@ -141,11 +137,10 @@ def test_read_memory_renders_the_latest_persisted_state():
         ctx = SimpleNamespace(
             store=SimpleNamespace(get_state=AsyncMock(side_effect=[first, second]))
         )
-        memory = build_executor_memory(MemoryConfig(), "android")
+        memory = build_executor_memory(MobileConfig(), "android")
         try:
-            redact = Redactor()
-            assert "Find order" in (await read_memory(memory, ctx, redact))[0].content
-            messages = await read_memory(memory, ctx, redact)
+            assert "Find order" in (await read_memory(memory, ctx))[0].content
+            messages = await read_memory(memory, ctx)
             assert "Find receipt" in messages[0].content and "Find order" not in messages[0].content
         finally:
             await memory.aclose()
@@ -154,7 +149,7 @@ def test_read_memory_renders_the_latest_persisted_state():
 
 
 def test_setup_helper_builds_pinned_static_memory():
-    from mobilerun_agents.agent.memory.memory import build_setup_block
+    from mobilerun_agents.agent.memory.registry import build_setup_block
 
     block = build_setup_block("setup instructions")
     assert (block.name, block.priority) == ("setup", 0)
@@ -162,10 +157,10 @@ def test_setup_helper_builds_pinned_static_memory():
 
 
 def test_goal_renders_planning_state_and_last_step_is_empty_before_acting():
-    assert asyncio.run(
-        GoalBlock().render(PlanningState(goal="Find order", notes=["Pending"]), Redactor())
-    ) == ("Goal: Find order\nPending")
-    assert asyncio.run(LastStepBlock().render(AgentState(), Redactor())) == []
+    assert asyncio.run(GoalBlock().render(PlanningState(goal="Find order", notes=["Pending"]))) == (
+        "Goal: Find order\nPending"
+    )
+    assert asyncio.run(LastStepBlock().render(AgentState())) == []
 
 
 def test_history_window_groups_calls_and_truncates_oldest_first(snapshot):
@@ -189,7 +184,7 @@ def test_history_window_groups_calls_and_truncates_oldest_first(snapshot):
             ]
         ]
         block = HistoryBlock(steps=2)
-        text = await block.render(AgentState(actions=actions), Redactor())
+        text = await block.render(AgentState(actions=actions))
         older, newer = text.splitlines()
         assert older.startswith("2 · swipe")
         assert (
@@ -205,10 +200,12 @@ def test_history_window_groups_calls_and_truncates_oldest_first(snapshot):
 @pytest.mark.parametrize("screenshot_enabled", [True, False])
 def test_executor_config_and_last_step_content(snapshot, screenshot_enabled, tmp_path):
     async def check():
-        config = MemoryConfig(
-            executor={
-                "blocks": ["setup", "last_step", "goal"],
-                "last_step_screenshot": screenshot_enabled,
+        config = MobileConfig(
+            memory={
+                "executor": {
+                    "blocks": ["setup", "last_step", "goal"],
+                    "options": {"last_step": {"screenshot": screenshot_enabled}},
+                }
             }
         )
         memory = build_executor_memory(config, "android")
@@ -260,7 +257,7 @@ def test_executor_config_and_last_step_content(snapshot, screenshot_enabled, tmp
         )
         try:
             assert [block.name for block in memory.memory_blocks] == ["setup", "last_step", "goal"]
-            (message,) = await memory_module.read_memory(memory, ctx, Redactor())
+            (message,) = await memory_module.read_memory(memory, ctx)
             text = message.content
             assert [text.index(f"<{name}>") for name in ("setup", "last_step", "goal")] == sorted(
                 text.index(f"<{name}>") for name in ("setup", "last_step", "goal")
@@ -291,34 +288,11 @@ def test_executor_config_and_last_step_content(snapshot, screenshot_enabled, tmp
     asyncio.run(check())
 
 
-def test_latest_step_masks_arguments_and_thought_but_keeps_result(snapshot):
-    redact = Redactor()
-    redact.add("protected-account")
-    redact.add("fixture-code")
-    action = ActionRecord(
-        step=1,
-        call=ToolSelection(
-            tool_id="fetch",
-            tool_name="fetch_code",
-            tool_kwargs={"account": "protected-account"},
-        ),
-        ok=True,
-        summary="Verification code: fixture-code",
-        thought="Check protected-account",
-        before=snapshot,
-    )
-    (block,) = asyncio.run(LastStepBlock().render(AgentState(actions=[action]), redact))
-    assert block.text.splitlines()[1:3] == [
-        'fetch_code({"account": "***"}) · ok=true: Verification code: fixture-code',
-        "Thought: Check ***",
-    ]
-
-
 def test_shared_engine_keeps_sessions_separate_and_is_caller_owned():
     async def check():
         engine = memory_module._private_engine()
         try:
-            config = MemoryConfig()
+            config = MobileConfig()
             first = build_executor_memory(
                 config, "android", async_engine=engine, session_id="first"
             )
@@ -351,13 +325,13 @@ def test_repeat_uses_the_matching_snapshot_when_two_actions_share_a_step(snapsho
     state = AgentState(current=snapshot, actions=actions)
 
     async def check():
-        memory = build_executor_memory(MemoryConfig(), "android")
+        memory = build_executor_memory(MobileConfig(), "android")
         for current, expected, unexpected in [
             (snapshot, "tap", "long_press"),
             (other, "long_press", "tap"),
         ]:
             state.current = current
-            messages = await memory.aget(state=state, redact=Redactor())
+            messages = await memory.aget(state=state)
             hints = "\n".join(m.content or "" for m in messages)
             assert f"Last action here: {expected}" in hints
             assert f"Last action here: {unexpected}" not in hints
@@ -375,7 +349,7 @@ def test_repeat_uses_the_matching_snapshot_when_two_actions_share_a_step(snapsho
     ],
 )
 def test_app_cards_follow_executor_block_list_on_supported_platforms(platform, executor, expected):
-    config = MemoryConfig.model_validate({"executor": executor} if executor else {})
+    config = MobileConfig(memory={"executor": executor} if executor else {})
     memory = build_executor_memory(config, platform)
     assert any(block.name == "app_cards" for block in memory.memory_blocks) is expected
     asyncio.run(memory.aclose())
@@ -384,32 +358,31 @@ def test_app_cards_follow_executor_block_list_on_supported_platforms(platform, e
 @pytest.mark.parametrize("method", list(InsertMethod))
 def test_blocks_render_notes_but_not_current_device_context(snapshot, method):
     state = AgentState(goal="Find order", notes=["Order is pending"], current=snapshot)
-    memory = build_executor_memory(MemoryConfig(insert_method=method), "android")
+    memory = build_executor_memory(MobileConfig(memory={"insert_method": method}), "android")
 
     async def check():
-        redact = Redactor()
-        result = await memory.aget(state=state, redact=redact)
+        result = await memory.aget(state=state)
         text = result[0].content
         assert result[0].role.value == method.value
         assert "Find order" in text and "battery" not in text
         assert text.count("Order is pending") == 1
         state.notes.clear()
-        assert "Order is pending" not in (await memory.aget(state=state, redact=redact))[0].content
+        assert "Order is pending" not in (await memory.aget(state=state))[0].content
         assert await memory.aget_all() == []
 
     asyncio.run(check())
 
 
 def test_default_memory_budget():
-    memory = build_executor_memory(MemoryConfig(), "android")
+    memory = build_executor_memory(MobileConfig(), "android")
     assert (memory.token_limit, memory.chat_history_token_ratio) == (30000, 0)
 
 
 def test_executor_first_turn_renders_pinned_memory_under_token_pressure():
     async def check():
-        memory = build_executor_memory(MemoryConfig(token_limit=1), "android")
+        memory = build_executor_memory(MobileConfig(memory={"token_limit": 1}), "android")
         try:
-            (message,) = await memory.aget(state=AgentState(goal="Find order"), redact=Redactor())
+            (message,) = await memory.aget(state=AgentState(goal="Find order"))
             assert "Goal: Find order" in message.content
             assert "<history>" not in message.content
         finally:
@@ -418,43 +391,8 @@ def test_executor_first_turn_renders_pinned_memory_under_token_pressure():
     asyncio.run(check())
 
 
-def test_historical_ui_labels_are_masked_in_executor_memory(snapshot):
+def test_history_keeps_arguments_and_compact_lookup_result(snapshot):
     async def check():
-        secret = "private-recipient"
-        redact = Redactor()
-        redact.add(secret)
-        snapshot.ui.elements.append({"index": 1, "text": secret})
-        snapshot.ui.phone_state["focusedElement"] = {"text": secret}
-        current = StepSnapshot(ui=UIState([], "Inbox", "", {}, 0, 0))
-        actions = [
-            ActionRecord(
-                step=step,
-                call=ToolSelection(
-                    tool_id=str(step), tool_name="tap_element", tool_kwargs={"index": 1}
-                ),
-                ok=True,
-                summary="Tapped",
-                before=snapshot,
-            )
-            for step in (1, 2)
-        ]
-        state = AgentState(current=current, actions=actions)
-        memory = build_executor_memory(MemoryConfig(), "android")
-        try:
-            (message,) = await memory.aget(state=state, redact=redact)
-            assert secret not in message.content
-            assert 'Focused element: Element "***"' in message.content
-            assert message.content.count('Element "***"') >= 2
-        finally:
-            await memory.aclose()
-
-    asyncio.run(check())
-
-
-def test_history_keeps_masked_arguments_and_compact_lookup_result(snapshot):
-    async def check():
-        redact = Redactor()
-        redact.add("private-recipient")
         prefix = "Tracking number: 123. " + "a" * 92
         calls = [
             (
@@ -476,12 +414,12 @@ def test_history_keeps_masked_arguments_and_compact_lookup_result(snapshot):
                 for step, (name, args, summary) in enumerate(calls, 1)
             ]
         )
-        memory = build_executor_memory(MemoryConfig(), "android")
+        memory = build_executor_memory(MobileConfig(), "android")
         try:
-            (message,) = await memory.aget(state=state, redact=redact)
-            assert '"query":"order"' in message.content and '"account":"***"' in message.content
-            assert prefix.rstrip() in message.content
-            assert "private" not in message.content and "unneeded tail" not in message.content
+            (message,) = await memory.aget(state=state)
+            assert '{"query":"order","account":"private-recipient"}' in message.content
+            assert f"{prefix}privat · screen change unknown\n" in message.content
+            assert "unneeded tail" not in message.content
         finally:
             await memory.aclose()
 
@@ -504,9 +442,9 @@ def test_executor_truncates_app_cards_before_action_history(snapshot):
                 for step in (1, 2)
             ],
         )
-        memory = build_executor_memory(MemoryConfig(token_limit=300), "android")
+        memory = build_executor_memory(MobileConfig(memory={"token_limit": 300}), "android")
         try:
-            (message,) = await memory.aget(state=state, redact=Redactor())
+            (message,) = await memory.aget(state=state)
             assert "<app_cards>" not in message.content
             assert "1 · wait" in message.content
         finally:
@@ -521,7 +459,7 @@ def test_local_card_mapping_cannot_escape_platform_folder(snapshot, tmp_path):
     (tmp_path / "outside.md").write_text("private")
     (folder / "app_cards.json").write_text('{"mail":"../outside.md"}')
     block = AppCardBlock(platform="android", cards_dir=tmp_path)
-    assert asyncio.run(block.aget(state=AgentState(current=snapshot), redact=Redactor())) == ""
+    assert asyncio.run(block.aget(state=AgentState(current=snapshot))) == ""
 
 
 def test_local_card_uses_platform_and_caches_by_package(snapshot, tmp_path):
@@ -535,15 +473,14 @@ def test_local_card_uses_platform_and_caches_by_package(snapshot, tmp_path):
 
     async def check():
         state = AgentState(goal="Find order", current=snapshot)
-        redact = Redactor()
-        assert await block.aget(state=state, redact=redact) == "ios guide"
+        assert await block.aget(state=state) == "ios guide"
         (tmp_path / "ios" / "mail.md").write_text("updated guide")
         state.goal = "Find receipt"
-        assert await block.aget(state=state, redact=redact) == "ios guide"
+        assert await block.aget(state=state) == "ios guide"
         snapshot.ui.phone_state["packageName"] = "browser"
-        assert await block.aget(state=state, redact=redact) == ""
+        assert await block.aget(state=state) == ""
         snapshot.ui.phone_state.pop("packageName")
-        assert await block.aget(state=state, redact=redact) == ""
+        assert await block.aget(state=state) == ""
 
     asyncio.run(check())
 
@@ -552,9 +489,9 @@ def test_local_card_uses_platform_and_caches_by_package(snapshot, tmp_path):
 def test_builders_share_the_prompt_template_and_private_engine_cleanup(monkeypatch, planner):
     engine = Mock(spec=AsyncEngine)
     monkeypatch.setattr(memory_module, "_private_engine", lambda: engine)
-    config = MemoryConfig()
+    config = MobileConfig()
     memory = (
-        build_planner_memory(config, PlanningState())
+        build_planner_memory(config, PlanningState(), "android")
         if planner
         else build_executor_memory(config, "android")
     )
@@ -563,3 +500,135 @@ def test_builders_share_the_prompt_template_and_private_engine_cleanup(monkeypat
 
     engine.dispose.assert_awaited_once_with()
     assert type(memory.memory_blocks_template) is memory_module._BlockPrompt
+
+
+@pytest.fixture
+def installed_blocks(monkeypatch):
+    from mobilerun_agents.agent.memory import registry
+
+    entries = []
+    queries = []
+
+    def entry_points(group):
+        queries.append(group)
+        return entries
+
+    monkeypatch.setattr(metadata, "entry_points", entry_points)
+    registry._installed.cache_clear()
+    yield entries, queries
+    registry._installed.cache_clear()
+
+
+@pytest.mark.anyio
+async def test_entry_point_block_renders_state_in_configured_order(installed_blocks):
+    from mobilerun_agents.agent.memory import BlockContext, StateBlock, read_memory
+
+    class PriceWatch(StateBlock[AgentState, str]):
+        name: str = "price_watch"
+        priority: int = 3
+        currency: str
+
+        async def render(self, state: AgentState) -> str:
+            return f"{self.currency}: {state.goal}"
+
+    contexts = []
+
+    def factory(context: BlockContext):
+        contexts.append(context)
+        return PriceWatch(currency=context.options["currency"])
+
+    entries, queries = installed_blocks
+    load = Mock(return_value=factory)
+    entries.append(SimpleNamespace(name="price_watch", value="shop.blocks:price_watch", load=load))
+    config = MobileConfig(
+        memory={
+            "executor": {
+                "blocks": ["setup", "price_watch", "goal"],
+                "options": {"price_watch": {"currency": "EUR"}},
+            }
+        }
+    )
+    state = AgentState(goal="Watch private-item")
+    ctx = SimpleNamespace(store=SimpleNamespace(get_state=AsyncMock(return_value=state)))
+    for _ in range(2):
+        memory = build_executor_memory(config, "ios")
+        try:
+            (message,) = await read_memory(memory, ctx)
+            assert message.content.index("<setup>") < message.content.index("<price_watch>")
+            assert message.content.index("<price_watch>") < message.content.index("<goal>")
+            assert "<price_watch>\nEUR: Watch private-item\n</price_watch>" in message.content
+        finally:
+            await memory.aclose()
+    assert len(contexts) == 2 and contexts[0].config is config
+    assert (contexts[0].agent, contexts[0].platform) == ("executor", "ios")
+    assert queries == ["mobilerun.memory_blocks"]
+    load.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("name", "entry_name", "problem", "message"),
+    [
+        (
+            "missing",
+            "price_watch",
+            "none",
+            r"Unknown memory block 'missing'.*goal \(built-in\).*price_watch .*shop\.blocks",
+        ),
+        ("goal", "goal", "none", r"shop\.blocks:price_watch.*built-in.*'goal'"),
+        (
+            "price_watch",
+            "price_watch",
+            "import",
+            r"Cannot load.*'price_watch'.*shop\.blocks:price_watch",
+        ),
+        ("price_watch", "price_watch", "none", r"'price_watch'.*shop\.blocks:price_watch.*'goal'"),
+        ("findings", None, "none", r"'findings'.*planner.*executor"),
+    ],
+)
+def test_registry_rejects_invalid_blocks_at_build(
+    installed_blocks, name, entry_name, problem, message
+):
+    entries, _ = installed_blocks
+    if entry_name:
+        entries.append(
+            SimpleNamespace(
+                name=entry_name,
+                value="shop.blocks:price_watch",
+                load=Mock(
+                    side_effect=ImportError("unavailable") if problem == "import" else None,
+                    return_value=lambda _: GoalBlock(),
+                ),
+            )
+        )
+    config = MobileConfig(memory={"executor": {"blocks": [name]}})
+    with pytest.raises(ValueError, match=message):
+        build_executor_memory(config, "android")
+
+
+@pytest.mark.parametrize(("name", "source"), [("goal", "built-in"), ("price_watch", "shop.blocks")])
+def test_operator_factory_cannot_shadow_a_registration(installed_blocks, name, source):
+    entries, _ = installed_blocks
+    entries.append(
+        SimpleNamespace(name="price_watch", value="shop.blocks:price_watch", load=lambda: GoalBlock)
+    )
+    config = MobileConfig(memory={"executor": {"blocks": []}})
+    with pytest.raises(ValueError, match=rf"Operator-supplied memory block '{name}'.*{source}"):
+        build_executor_memory(config, "android", extra={name: lambda _: GoalBlock()})
+
+
+@pytest.mark.parametrize(
+    ("agent", "name", "options", "message"),
+    [
+        ("executor", "history", {"steps": 0}, "greater than 0"),
+        ("planner", "subgoal_history", {"subgoals": 0}, "greater than 0"),
+        ("executor", "last_step", {"screenshots": False}, "Extra inputs"),
+        ("executor", "goal", {"notes": False}, "Extra inputs"),
+    ],
+)
+def test_builtin_validates_options_when_built(agent, name, options, message):
+    config = MobileConfig(memory={agent: {"blocks": [name], "options": {name: options}}})
+    with pytest.raises(ValueError, match=message):
+        if agent == "executor":
+            build_executor_memory(config, "android")
+        else:
+            build_planner_memory(config, PlanningState(), "android")

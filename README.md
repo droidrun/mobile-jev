@@ -39,6 +39,8 @@ inventory = "my_package.plugin:InventoryOperator"
 
 Export a no-argument subclass of `mobilerun.core.operator.Operator`, or an already configured instance. After installing the package, call `await ExternalOperator("inventory").execute(device, "Count items")` (import `ExternalOperator` from `mobilerun_agents`). It loads the named operator once per wrapper, forwards `output`, `max_steps` and `timeout`, and returns the operator's `ExecutionResult` unchanged. The plugin owns execution and any logging or tracing it needs.
 
+To add context without replacing the operator, [write a memory block](src/mobilerun_agents/agent/memory/README.md#write-your-own-block). Register its factory in `mobilerun.memory_blocks`, or pass it to an operator's `memory_blocks` mapping, then enable it by name in `agents.yaml`.
+
 ## Defaults
 
 | Setting | Default |
@@ -65,6 +67,6 @@ Run data is organized by run ID. Empty directory overrides use the defaults.
 
 With checkpoints enabled, the operator saves the native LlamaIndex context after each step and at completion. It exports a macro from the saved action history into the base Mobilerun macro directory. Step snapshots point to image files; checkpoints don't embed screenshot bytes. When checkpoints are disabled, the image directory is deleted at the end. Treat checkpoints, screenshots and macros as private device data.
 
-Use `mobilerun --debug agent run …` for selector choices, model-call diagnostics, safe run details and tracebacks. Secret values are masked in outputs, not in model inputs. Typed text is not secret by default; vault credentials and explicitly sensitive parameters are protected.
+Use `mobilerun --debug agent run …` for selector choices, model-call diagnostics, run details and tracebacks. The agent uses standard logging; Mobilerun's `secret_scope` masks sensitive values in log records during sensitive calls. Run data, including checkpoints, screenshots, macros and results, is stored unmasked.
 
 See [demo instructions](tests/demo/README.md), [contributing](CONTRIBUTING.md), and [MIT license](LICENSE).

@@ -6,6 +6,6 @@
 
 **Contents:** `__init__.py` — shared exports; `elements.py` — element targeting and labels; `coordinates.py` — coordinate fields, dimensions, and bounds; `errors.py` — tool failure summaries; `usage.py` — schema-derived coordinate and UI-index tool names; `images.py` — `ImageStore`, which writes each screenshot once under `MOBILERUN_AGENT_IMAGES_DIR` and removes the run's images when checkpoints are disabled.
 
-**Examples:** `check_point(x, y, ui, provider)` checks device coordinates against the pinned observation. `ImageStore.forget(state, step, protected_values)` deletes affected images and clears references at action commit.
+**Examples:** `check_point(x, y, ui, provider)` checks device coordinates against the pinned observation. `ImageStore.save(data)` writes the screenshot bytes and returns its path.
 
 **Depends on / used by:** Tools and selectors use these helpers.

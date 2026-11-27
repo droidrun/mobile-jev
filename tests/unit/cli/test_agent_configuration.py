@@ -1,16 +1,21 @@
 from importlib import import_module
-from pathlib import Path
 
 import pytest
 import yaml
 from click.testing import CliRunner
-from filelock import FileLock, Timeout
+from filelock import FileLock
 from mobilerun.cli.base import menu, prompts
+from pydantic import ValidationError
 
 from mobilerun_agents.agent.auth import store
 from mobilerun_agents.cli.agent.group import agent
 from mobilerun_agents.config.loader import ConfigLoader
-from mobilerun_agents.config.user_config import DecisionProfile, LLMProfile
+from mobilerun_agents.config.user_config import (
+    DecisionProfile,
+    LLMProfile,
+    MobileConfig,
+    OldConfigKeys,
+)
 
 
 def invoke(*args, input=None):
@@ -512,43 +517,43 @@ def test_run_on_old_config_has_one_actionable_error():
     )
 
 
-def test_update_holds_lock_during_read_edit_and_replace(monkeypatch):
-    path = ConfigLoader.get_user_config_path()
-    path.parent.mkdir(parents=True)
-    path.write_text("agent: {max_steps: 12}\n", encoding="utf-8")
-    contender = FileLock(str(path) + ".lock", timeout=0)
-    original_load = ConfigLoader.load
-    original_replace = Path.replace
-    phases = []
+def test_missing_agent_config_ignores_base_env_path_and_does_not_write(tmp_path, monkeypatch):
+    base_path = tmp_path / "config.yaml"
+    base_path.write_text("agent: {max_steps: 7}\n")
+    monkeypatch.setenv("MOBILERUN_CONFIG", str(base_path))
 
-    def check_locked(phase):
-        with pytest.raises(Timeout), contender:
-            pytest.fail(f"agents.yaml unlocked during {phase}")
-        phases.append(phase)
+    assert ConfigLoader.load() == MobileConfig()
+    assert not ConfigLoader.get_user_config_path().exists()
 
-    def load(*args, **kwargs):
-        check_locked("load")
-        return original_load(*args, **kwargs)
 
-    def edit(config):
-        check_locked("edit")
-        assert config.agent.max_steps == 12
-        config.agent.max_steps = 18
+def test_agent_config_saves_only_non_default_values():
+    config = MobileConfig()
+    config.agent.max_steps = 12
 
-    def replace(source, target):
-        if target == path:
-            check_locked("replace")
-            assert source.parent == path.parent
-            assert path.read_text(encoding="utf-8") == "agent: {max_steps: 12}\n"
-        return original_replace(source, target)
+    path = ConfigLoader.save(config)
 
-    monkeypatch.setattr(ConfigLoader, "load", load)
-    monkeypatch.setattr(Path, "replace", replace)
-    ConfigLoader.update(edit)
+    assert yaml.safe_load(path.read_text()) == {"agent": {"max_steps": 12}}
+    assert ConfigLoader.load() == config
 
-    assert phases == ["load", "edit", "replace"]
-    with contender:
-        assert original_load().agent.max_steps == 18
+
+def test_config_file_mapping_hook_keeps_removed_key_guidance():
+    with pytest.raises(OldConfigKeys, match=r"Delete agent\.planning\.max_planner_turns"):
+        ConfigLoader.from_dict({"agent": {"planning": {"max_planner_turns": 10}}})
+
+
+@pytest.mark.parametrize(
+    ("content", "error", "message"),
+    [
+        ("[broken", ValueError, "Invalid agents.yaml syntax"),
+        ("- not a mapping", ValidationError, "Input should be a valid dictionary"),
+    ],
+)
+def test_invalid_agent_yaml_keeps_load_error(tmp_path, content, error, message):
+    path = tmp_path / "agents.yaml"
+    path.write_text(content)
+
+    with pytest.raises(error, match=message):
+        ConfigLoader.load(str(path))
 
 
 def test_failed_edit_leaves_original_yaml_untouched():
@@ -564,8 +569,7 @@ def test_failed_edit_leaves_original_yaml_untouched():
     with pytest.raises(RuntimeError, match="edit failed"):
         ConfigLoader.update(edit)
 
-    with FileLock(str(path) + ".lock", timeout=0):
-        assert path.read_bytes() == original
+    assert path.read_bytes() == original
 
 
 @pytest.fixture

@@ -12,14 +12,13 @@ from workflows import Context, Workflow, step
 from workflows.events import StartEvent, StopEvent
 
 from mobilerun_agents.agent.action_selector.llm.models import Capabilities
-from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.memory.blocks.findings import FindingsBlock
 from mobilerun_agents.agent.memory.blocks.subgoals import LastSubgoalBlock, SubgoalHistoryBlock
 from mobilerun_agents.agent.memory.memory import build_planner_memory
 from mobilerun_agents.agent.planner import Finish, LlamaIndexPlanner, Plan
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.state import PlanningState, SubgoalResult
-from mobilerun_agents.config.user_config import MemoryConfig
+from mobilerun_agents.config.user_config import MobileConfig
 
 
 class PlanningProbe(Workflow):
@@ -63,7 +62,7 @@ def anyio_backend():
 
 @pytest.fixture
 async def memory():
-    memory = build_planner_memory(MemoryConfig(), PlanningState())
+    memory = build_planner_memory(MobileConfig(), PlanningState(), "android")
     yield memory
     await memory.aclose()
 
@@ -217,8 +216,8 @@ async def test_planner_config_removes_findings_and_orders_remaining_blocks():
     await ctx.store.set_state(state)
     llm = Replies()
     llm._calls = [("complete", {"success": True, "message": "Done"})]
-    config = MemoryConfig(planner={"blocks": ["goal", "setup"]})
-    memory = build_planner_memory(config, state)
+    config = MobileConfig(memory={"planner": {"blocks": ["goal", "setup"]}})
+    memory = build_planner_memory(config, state, "android")
     try:
         await LlamaIndexPlanner(llm).plan(ctx, memory)
     finally:
@@ -263,7 +262,9 @@ async def test_planner_request_renders_default_memory_order(insert_method):
     await ctx.store.set_state(state)
     llm = Replies()
     llm._calls = [("set_plan", {"subgoals": ["Read tablet"]})]
-    memory = build_planner_memory(MemoryConfig(insert_method=insert_method), state)
+    memory = build_planner_memory(
+        MobileConfig(memory={"insert_method": insert_method}), state, "android"
+    )
     try:
         await LlamaIndexPlanner(llm).plan(ctx, memory)
     finally:
@@ -307,17 +308,14 @@ async def test_planner_blocks_render_latest_result_and_bounded_history():
             ),
         ],
     )
-    redact = Redactor()
-    assert (
-        await FindingsBlock().render(state, redact) == 'Findings and notes: ["Battery is charged"]'
-    )
-    assert (await LastSubgoalBlock().render(state, redact)).splitlines() == [
+    assert await FindingsBlock().render(state) == 'Findings and notes: ["Battery is charged"]'
+    assert (await LastSubgoalBlock().render(state)).splitlines() == [
         "Latest executor subgoal result: Succeeded: Latest: Done",
         "Screen: shop/List → shop/Item (changed)",
         "Reason: complete",
     ]
     history = SubgoalHistoryBlock(history=2)
-    content = await history.render(state, redact)
+    content = await history.render(state)
     recent = "Subgoal results (older):\n- Succeeded: Recent: Done"
     assert content.splitlines() == [
         "Subgoal results (older):",
@@ -331,9 +329,9 @@ async def test_planner_blocks_render_latest_result_and_bounded_history():
 @pytest.mark.anyio
 async def test_planner_first_turn_renders_pinned_memory_under_token_pressure():
     state = PlanningState(goal="Check battery")
-    memory = build_planner_memory(MemoryConfig(token_limit=1), state)
+    memory = build_planner_memory(MobileConfig(memory={"token_limit": 1}), state, "android")
     try:
-        (message,) = await memory.aget(state=state, redact=Redactor())
+        (message,) = await memory.aget(state=state)
         assert "Goal: Check battery" in message.content
         assert "<subgoal_history>" not in message.content
         assert await memory.memory_blocks[-1].atruncate([], 1) == ""
@@ -342,11 +340,7 @@ async def test_planner_first_turn_renders_pinned_memory_under_token_pressure():
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("verify", ["redaction", "device_context"])
-async def test_planner_masks_historical_screen_and_sends_device_context_only_in_step(verify):
-    secret = "private-activity"
-    redact = Redactor()
-    redact.add(secret)
+async def test_planner_sends_device_context_only_in_step():
     state = PlanningState(
         goal="Check battery",
         results=[
@@ -355,7 +349,7 @@ async def test_planner_masks_historical_screen_and_sends_device_context_only_in_
                 success=True,
                 message="Done",
                 reason="complete",
-                before_screen=("settings", secret),
+                before_screen=("settings", "Main"),
                 after_screen=("settings", "Battery"),
             )
         ],
@@ -368,15 +362,12 @@ async def test_planner_masks_historical_screen_and_sends_device_context_only_in_
     await ctx.store.set_state(state)
     llm = Replies()
     llm._calls = [("set_plan", {"subgoals": ["Read battery"]})]
-    memory = build_planner_memory(MemoryConfig(), state)
+    memory = build_planner_memory(MobileConfig(), state, "android")
     try:
-        await LlamaIndexPlanner(llm).bind(None, None, redact).plan(ctx, memory)
+        await LlamaIndexPlanner(llm).bind(None, None).plan(ctx, memory)
     finally:
         await memory.aclose()
     (system, memory_message, step), _ = llm._requests[0]
-    if verify == "redaction":
-        assert "settings/*** → settings/Battery" in memory_message.content
-        assert secret not in memory_message.content
-    else:
-        assert "<device_context>" in step.content and '"level": 63' in step.content
-        assert "<device_context>" not in system.content + memory_message.content
+    assert "settings/Main → settings/Battery" in memory_message.content
+    assert "<device_context>" in step.content and '"level": 63' in step.content
+    assert "<device_context>" not in system.content + memory_message.content

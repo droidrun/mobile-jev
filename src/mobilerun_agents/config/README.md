@@ -48,7 +48,26 @@ setups:
 default_setup: fast
 ```
 
-If `run` reports removed keys, set the old file aside and recreate profiles and setups with the new commands. There is no automatic migration.
+### Memory
+
+Use `memory.executor.blocks` and `memory.planner.blocks` to select and order the
+blocks for each role. Put block-specific settings under `options.<block_name>`:
+
+```yaml
+memory:
+  executor:
+    options:
+      last_step: {screenshot: true}
+      history: {steps: 5}
+  planner:
+    options:
+      subgoal_history: {subgoals: 5}
+```
+
+These values are the defaults. Move `memory.executor.last_step_screenshot`,
+`memory.executor.history`, and `memory.planner.history` to the corresponding
+paths above; the old keys are no longer accepted. For other removed keys,
+recreate profiles and setups with the new commands. There is no automatic migration.
 
 `MOBILERUN_AGENT_RUNS_DIR` and `MOBILERUN_AGENT_IMAGES_DIR` override the parent directories for run records and screenshots. Empty values use the defaults `<MOBILERUN_USER_CONFIG_DIR>/runs` and `<MOBILERUN_USER_CONFIG_DIR>/images`; each run is stored under `<run_id>/`. Screenshots use `NNNN.png` filenames. `ExecutionResult.trajectory_path` locates run data. Macros use `MOBILERUN_MACRO_DIRECTORY`. When checkpoints are disabled, run data is not retained and the run's image directory is deleted at the end.
 

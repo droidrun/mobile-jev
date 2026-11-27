@@ -3,7 +3,6 @@
 import asyncio
 import json
 import logging
-import os
 import signal
 from collections.abc import Awaitable, Callable, Collection, Iterable
 from contextlib import suppress
@@ -42,7 +41,6 @@ from mobilerun_agents.agent.action_selector.decision_model import TypeSafeDecisi
 from mobilerun_agents.agent.action_selector.llm.factory import build_llm
 from mobilerun_agents.agent.auth import CredentialMissing
 from mobilerun_agents.agent.logs import configure_cli_logging
-from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.workflows.core.state import PlanningState
 from mobilerun_agents.agent.workflows.core.targets import target
 from mobilerun_agents.config.loader import ConfigLoader
@@ -73,12 +71,20 @@ GOAL = "Check the cheapest prices of Amazon and eBay prices for the game split f
 EASY_GOAL = "Open Settings and tell me the battery level."
 VISION_GOAL = "Open Settings and describe two things visible on the screen."
 JEV_GOAL = "Open Settings and report the first visible menu item without entering text."
-DELEGATION_GOAL = "Open Chrome, type 'Mobilerun demo' in the search bar without submitting it."
-STRUCTURED_GOAL = "Open Settings and report the battery percentage and whether it is charging."
-CUSTOM_TOOL_GOAL = "Open Settings, read the battery level, and save that observation with note."
+DELEGATION_GOAL = (
+    "Open Chrome, type 'Mobilerun demo' in the search bar without submitting it."
+)
+STRUCTURED_GOAL = (
+    "Open Settings and report the battery percentage and whether it is charging."
+)
+CUSTOM_TOOL_GOAL = (
+    "Open Settings, read the battery level, and save that observation with note."
+)
 COMPARE_GOAL = EASY_GOAL
 
-CREDENTIAL_SOURCE = "local"  # "local" (fake values below) or "cloud" (existing vault entry)
+CREDENTIAL_SOURCE = (
+    "local"  # "local" (fake values below) or "cloud" (existing vault entry)
+)
 CREDENTIAL_NAME = "demo-login"
 CREDENTIAL_PACKAGE = "com.android.chrome"  # vault lookup key for Chrome
 CREDENTIAL_PASSWORD = "test-password-123"  # fake, local only
@@ -87,7 +93,9 @@ CREDENTIAL_GOAL = (
     "of the saved credential {name} into it. Don't press enter. Report whether the field is filled."
 )
 PHONE_NUMBER_ID: str | None = None  # existing cloud number ID, never a new purchase
-PHONE_NUMBER_TEST_CODE: str | None = None  # optional synthetic SMS code to mask in demo output
+PHONE_NUMBER_TEST_CODE: str | None = (
+    None  # optional synthetic SMS code to mask in demo output
+)
 PHONE_NUMBER_GOAL = (
     "Read the attached phone number and use sms.messages to check the latest inbound SMS "
     "for a verification code. Report whether you found a code, not the code itself."
@@ -134,27 +142,23 @@ def decision_selector(exclude: Collection[str] = ()) -> DecisionSelector:
 
 
 async def delegated_selector() -> DelegatingSelector:
-    return DelegatingSelector(decision_selector(), await llm_selector(*VISION_MODEL, vision="on"))
+    return DelegatingSelector(
+        decision_selector(), await llm_selector(*VISION_MODEL, vision="on")
+    )
 
 
 async def execute(
     operator: Operator, phone: Device, goal: str, output: type[T] | None = None
 ) -> ExecutionResult[T]:
-    return await operator.execute(phone, goal, output=output, max_steps=MAX_STEPS, timeout=TIMEOUT)
+    return await operator.execute(
+        phone, goal, output=output, max_steps=MAX_STEPS, timeout=TIMEOUT
+    )
 
 
 def summary(result: ExecutionResult[T]) -> str:
-    return f"success={result.success} steps={result.steps} answer={result.answer or '-'}"
-
-
-def redactor() -> Redactor:
-    redact = Redactor()
-    for key, secret in os.environ.items():
-        if key.endswith(("_KEY", "_TOKEN", "_PASSWORD", "_SECRET")):
-            redact.add(secret)
-    redact.add(CREDENTIAL_PASSWORD)
-    redact.add(PHONE_NUMBER_TEST_CODE)
-    return redact
+    return (
+        f"success={result.success} steps={result.steps} answer={result.answer or '-'}"
+    )
 
 
 async def reset_phone(phone: Device) -> None:
@@ -171,7 +175,9 @@ async def reset_phone(phone: Device) -> None:
 
 # Run a plain LLM with the UI tree and no screenshot.
 async def llm(phone: Device, goal: str = EASY_GOAL, provider: str = DEFAULT) -> Result:
-    return await execute(AgentOperator(await llm_selector(provider, vision="off")), phone, goal)
+    return await execute(
+        AgentOperator(await llm_selector(provider, vision="off")), phone, goal
+    )
 
 
 # Run tree + screenshot, then screenshot only, on the same goal.
@@ -182,7 +188,9 @@ async def llm_vision(phone: Device) -> str:
         if mode == "only":
             await reset_phone(phone)
         operator = AgentOperator(await llm_selector(*VISION_MODEL, vision=mode))
-        results.append(f"{mode}: {summary(await execute(operator, phone, VISION_GOAL))}")
+        results.append(
+            f"{mode}: {summary(await execute(operator, phone, VISION_GOAL))}"
+        )
     return "\n".join(results)
 
 
@@ -206,19 +214,25 @@ async def delegation(phone: Device, goal: str = DELEGATION_GOAL) -> Result:
 # Give the LLM planner a separate LLM executor.
 async def planner_llm(phone: Device) -> Result:
     planner = LlamaIndexPlanner(await build_llm(*PLANNER))
-    return await execute(PlanningOperator(planner, await llm_selector(*EXECUTOR)), phone, EASY_GOAL)
+    return await execute(
+        PlanningOperator(planner, await llm_selector(*EXECUTOR)), phone, EASY_GOAL
+    )
 
 
 # A failed Jev subgoal goes back to the planner rather than to a delegate.
 async def planner_jev(phone: Device) -> Result:
     planner = LlamaIndexPlanner(await build_llm(*PLANNER))
-    return await execute(PlanningOperator(planner, decision_selector()), phone, EASY_GOAL)
+    return await execute(
+        PlanningOperator(planner, decision_selector()), phone, EASY_GOAL
+    )
 
 
 # Give the planner a Jev-first executor for the hard goal.
 async def planner_delegation(phone: Device, goal: str = GOAL) -> Result:
     planner = LlamaIndexPlanner(await build_llm(*PLANNER))
-    return await execute(PlanningOperator(planner, await delegated_selector()), phone, goal)
+    return await execute(
+        PlanningOperator(planner, await delegated_selector()), phone, goal
+    )
 
 
 async def with_extension(
@@ -233,7 +247,9 @@ async def with_extension(
         config = ConfigLoader.load().model_copy(deep=True)
         config.tools.exclude = [*(config.tools.exclude or []), *exclude]
         with ConfigLoader.override(config):
-            return await execute(AgentOperator(await llm_selector()), phone, goal, output)
+            return await execute(
+                AgentOperator(await llm_selector()), phone, goal, output
+            )
     finally:
         await extension.close()  # Base also unbinds; only newly owned resources are released.
 
@@ -298,7 +314,9 @@ async def mailbox(phone: Device) -> str:
 
 # Ask the operator to validate the result against a Pydantic model.
 async def structured(phone: Device) -> str:
-    result = await execute(AgentOperator(await llm_selector()), phone, STRUCTURED_GOAL, Battery)
+    result = await execute(
+        AgentOperator(await llm_selector()), phone, STRUCTURED_GOAL, Battery
+    )
     return result.output.model_dump_json() if result.output else summary(result)
 
 
@@ -312,7 +330,9 @@ async def note(ctx: Context[AgentState], text: str) -> str:
 
 # Register a custom tool with a workflow-injected Context.
 async def custom_tool(phone: Device) -> Result:
-    return await execute(AgentOperator(await llm_selector(), tools=[note]), phone, CUSTOM_TOOL_GOAL)
+    return await execute(
+        AgentOperator(await llm_selector(), tools=[note]), phone, CUSTOM_TOOL_GOAL
+    )
 
 
 def latest_checkpoint() -> Path | None:
@@ -359,14 +379,13 @@ async def inspect_run(_: Device) -> str:
         Reader(), json.loads(checkpoint.read_bytes())
     )
     state = await ctx.store.get_state()
-    redact = redactor()
     lines = []
     for record in state.actions:
-        label = redact.text(target(record, limit=None) or "-")
+        label = target(record, limit=None) or "-"
         if len(label) > 60:
             label = label[:59] + "…"
         lines.append(
-            f"{record.step}: {redact.text(record.call.tool_name)} {label} | "
+            f"{record.step}: {record.call.tool_name} {label} | "
             f"ok={record.ok} changed={record.screen_changed}"
         )
     return "\n".join(lines) or "No actions recorded."
@@ -374,7 +393,6 @@ async def inspect_run(_: Device) -> str:
 
 async def compare(phone: Device, runs: Iterable[tuple[str, Run]]) -> int:
     rows = ["setup/model\tsuccess\tsteps\tseconds\tanswer"]
-    redact = redactor()
     for label, run in runs:
         start = monotonic()
         success: bool | str = "-"
@@ -382,15 +400,17 @@ async def compare(phone: Device, runs: Iterable[tuple[str, Run]]) -> int:
         try:
             await reset_phone(phone)
             result = await run(phone)
-            success, steps, answer = result.success, result.steps or 0, result.answer or "-"
+            success, steps, answer = (
+                result.success,
+                result.steps or 0,
+                result.answer or "-",
+            )
         except CredentialMissing:
             answer = "skipped (no key)"
         except Exception as error:
             success, answer = False, type(error).__name__
-        answer = " ".join(redact.text(answer).split())
-        rows.append(
-            f"{redact.text(label)}\t{success}\t{steps}\t{monotonic() - start:.1f}\t{answer}"
-        )
+        answer = " ".join(answer.split())
+        rows.append(f"{label}\t{success}\t{steps}\t{monotonic() - start:.1f}\t{answer}")
     print("\n".join(rows))
     return len(rows) - 1
 
@@ -481,9 +501,9 @@ async def _run_demos() -> None:
                         await reset_phone(phone)
                     match await DEMOS[name](phone):
                         case str() as text:
-                            print(redactor().text(text))
+                            print(text)
                         case result:
-                            print(redactor().text(summary(result)))
+                            print(summary(result))
                 except Exception as error:
                     print(f"failed: {type(error).__name__}")
 
@@ -500,7 +520,9 @@ def run_main() -> None:
 
     def observe_result(record: logging.LogRecord) -> bool:
         nonlocal reported
-        if record.__dict__.get("agent_result") and record.getMessage().startswith("✗ cancelled"):
+        if record.__dict__.get("agent_result") and record.getMessage().startswith(
+            "✗ cancelled"
+        ):
             reported = True
         return True
 
@@ -517,7 +539,9 @@ def run_main() -> None:
                 # Stop the workflow first, then bound a slow device close.
                 deadline = loop.call_later(1.0, task.cancel)
 
-        previous = signal.signal(signal.SIGINT, lambda *_: loop.call_soon_threadsafe(cancel))
+        previous = signal.signal(
+            signal.SIGINT, lambda *_: loop.call_soon_threadsafe(cancel)
+        )
         try:
             await main()
         except asyncio.CancelledError:

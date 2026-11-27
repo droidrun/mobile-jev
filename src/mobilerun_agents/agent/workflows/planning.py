@@ -2,8 +2,8 @@
 
 import json
 import logging
+from collections.abc import Callable
 from itertools import groupby
-from sys import exc_info
 from typing import Any, Literal, cast
 
 from llama_index.core.base.llms.types import ImageBlock
@@ -29,10 +29,10 @@ from mobilerun_agents.agent.events import (
     Selected,
     Subgoal,
 )
-from mobilerun_agents.agent.memory.memory import build_executor_memory
+from mobilerun_agents.agent.memory.memory import _RunMemory, prepare_child_memory
 from mobilerun_agents.agent.planner import Finish, Plan, Planner
 from mobilerun_agents.agent.planner.base import remaining_child_steps, remaining_steps
-from mobilerun_agents.config.user_config import AgentConfig, MemoryConfig
+from mobilerun_agents.config.user_config import AgentConfig, MemoryConfig, MobileConfig
 
 from .agent import AgentWorkflow
 from .core.snapshot import StepSnapshot
@@ -75,7 +75,6 @@ def _failure_summary(state: AgentState) -> FailureSummary:
     def screen(snapshot: StepSnapshot) -> tuple[str, str]:
         location = snapshot.ui.phone_state
         label = f"{location.get('packageName') or 'unknown'}/{location.get('activityName') or 'unknown'}"
-        # Keep the full text so the output boundaries can mask values learned later.
         return label, snapshot.ui.formatted_text
 
     visits: dict[tuple[str, str], int] = {}
@@ -130,24 +129,6 @@ def executor_kind(
             return "custom"
 
 
-def _forget_previous_images(state: PlanningState, action_count: int) -> None:
-    # The previous children did not know about the newly protected value.
-    # Pixels alone cannot prove which of their observations contain it.
-    def without_image(snapshot: StepSnapshot) -> StepSnapshot:
-        _unlink_screenshot(snapshot)
-        return snapshot.model_copy(update={"screenshot": None})
-
-    state.actions = [
-        *(
-            record.model_copy(update={"before": without_image(record.before)})
-            for record in state.actions[:action_count]
-        ),
-        *state.actions[action_count:],
-    ]
-    if state.current is not None:
-        state.current = without_image(state.current)
-
-
 class PlanningWorkflow(Workflow):
     def __init__(
         self,
@@ -156,6 +137,7 @@ class PlanningWorkflow(Workflow):
         config: AgentConfig | None = None,
         output: type[BaseModel] | None = None,
         memory_config: MemoryConfig | None = None,
+        child_memory_factory: Callable[[], _RunMemory] | None = None,
         **kwargs: Any,
     ) -> None:
         self.planner = planner
@@ -164,8 +146,16 @@ class PlanningWorkflow(Workflow):
         self.output = output
         self.output_schema = output.model_json_schema() if output else None
         self.memory_config = memory_config or MemoryConfig()
+        self._child_memory_factory = child_memory_factory
         kwargs.setdefault("timeout", self.config.workflow_timeout)
         super().__init__(**kwargs)
+
+    def _prepare_child_memory(self, platform: str) -> Callable[[], _RunMemory]:
+        if self._child_memory_factory is None:
+            self._child_memory_factory = prepare_child_memory(
+                MobileConfig(agent=self.config, memory=self.memory_config), platform
+            )
+        return self._child_memory_factory
 
     def _stop(
         self, ctx: Context[PlanningState], state: PlanningState, outcome: Outcome
@@ -188,6 +178,7 @@ class PlanningWorkflow(Workflow):
         device: DeviceResource,
         services: ServicesResource,
     ) -> PlanTurn:
+        self._prepare_child_memory(device.platform)
         state = await ctx.store.get_state()
         match ev:
             case Begin(goal=goal, max_steps=max_steps):
@@ -201,14 +192,13 @@ class PlanningWorkflow(Workflow):
         snapshot = StepSnapshot(
             ui=await device.state.refresh(), device_context=list(await device.context())
         )
-        if not services.registry.protected_values:
-            try:
-                image = await device.screenshot()
-            except DeviceOperationNotSupported:
-                pass
-            else:
-                if image:
-                    snapshot.screenshot = ImageBlock(path=services.images.save(image))
+        try:
+            image = await device.screenshot()
+        except DeviceOperationNotSupported:
+            pass
+        else:
+            if image:
+                snapshot.screenshot = ImageBlock(path=services.images.save(image))
         # Unlike action snapshots, only the current planner observation is retained.
         if state.current is not None:
             if state.results:
@@ -236,7 +226,6 @@ class PlanningWorkflow(Workflow):
         ctx: Context[PlanningState],
         ev: PlanTurn,
         memory: MemoryResource,
-        services: ServicesResource,
     ) -> RunSubgoal | StopEvent:
         state = await ctx.store.get_state()
         repair = None
@@ -247,9 +236,7 @@ class PlanningWorkflow(Workflow):
             complete_only = child_budget <= 0
             await ctx.store.set_state(state)
             try:
-                decision = await self.planner.bind(
-                    self.output_schema, repair, services.registry.redactor
-                ).plan(ctx, memory)
+                decision = await self.planner.bind(self.output_schema, repair).plan(ctx, memory)
             except InvalidResponse:
                 repair = "Invalid planner tool call"
                 continue
@@ -325,8 +312,7 @@ class PlanningWorkflow(Workflow):
             budget=state.max_steps,
         )
         ctx.write_event_to_stream(subgoal)
-        memory = build_executor_memory(self.memory_config, device.platform, self.config)
-        protection = services.registry.redactor.revision
+        memory = self._prepare_child_memory(device.platform)()
         offset = state.executor_steps
         start = len(state.actions)
         child = None
@@ -339,10 +325,6 @@ class PlanningWorkflow(Workflow):
             ).run(goal=ev.goal, max_steps=ev.max_steps)
             child_ctx = cast(Context[AgentState], child.ctx)
             async for event in child.stream_events():
-                if protection != services.registry.redactor.revision:
-                    _forget_previous_images(state, start)
-                    protection = services.registry.redactor.revision
-                    await ctx.store.set_state(state)
                 match event:
                     case Finished() | StopEvent():
                         continue
@@ -368,20 +350,10 @@ class PlanningWorkflow(Workflow):
                 if child is not None and not child.is_done():
                     await child.cancel_run()
             finally:
-                failed = exc_info()[0] is not None
                 try:
-                    if protection != services.registry.redactor.revision:
-                        _forget_previous_images(state, start)
-                        await ctx.store.set_state(state)
+                    await memory.aclose()
                 except Exception:
-                    if not failed:
-                        raise
-                    _log.warning("Unable to purge earlier screenshots")
-                finally:
-                    try:
-                        await memory.aclose()
-                    except Exception:
-                        _log.warning("Unable to close child run memory")
+                    _log.warning("Unable to close child run memory")
 
         outcome = final.outcome
         assert outcome is not None

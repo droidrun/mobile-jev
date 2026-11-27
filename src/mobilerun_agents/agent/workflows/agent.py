@@ -135,8 +135,6 @@ class AgentWorkflow(Workflow):
         registry = services.registry
         try:
             selection = await self.selector.select(ctx, device, memory, registry)
-            for call in selection.calls:
-                registry.protect(call)
             if selection.abstained:
                 abstention = selection.jev_abstention
                 if abstention is None:
@@ -159,7 +157,6 @@ class AgentWorkflow(Workflow):
                         f"was below the cutoff {abstention.cutoff}, so no action was taken."
                     )
                 async with ctx.store.edit_state() as state:
-                    services.images.forget(state, _step_count(state) + 1, registry.protected_values)
                     if state.current is not None:
                         state.current.screenshot = None
                 return Done(
@@ -184,7 +181,6 @@ class AgentWorkflow(Workflow):
             return Act(calls=selection.calls, thought="\n".join(thoughts) or None)
 
         async with ctx.store.edit_state() as state:
-            services.images.forget(state, number, registry.protected_values)
             state.repairs += 1
             attempt = state.repairs
             spent = attempt > self.config.decision.max_response_repair_attempts
@@ -229,13 +225,7 @@ class AgentWorkflow(Workflow):
                             feedback = ActionResult(True, str(raw))
                 except ValidationError as error:
                     schema = self.output if call.tool_name == "complete" else None
-                    feedback = ActionResult(
-                        False, tool_error_summary(error, schema, registry.redactor.add)
-                    )
-                    if schema is not None:
-                        resolved = resolved.model_copy(
-                            update={"tool_kwargs": registry.redactor.value(resolved.tool_kwargs)}
-                        )
+                    feedback = ActionResult(False, tool_error_summary(error, schema))
                 except Exception as error:
                     feedback = ActionResult(False, tool_error_summary(error))
                 record = ActionRecord(
@@ -257,9 +247,8 @@ class AgentWorkflow(Workflow):
                     break
             finished = True
         finally:
-            protected = registry.protected_values
             screenshot = None
-            if finished and before.screenshot is not None and not protected:
+            if finished and before.screenshot is not None:
                 with before.screenshot.resolve_image() as image:
                     screenshot = ImageBlock(path=services.images.save(image.read()))
             persisted = before.model_copy(update={"screenshot": screenshot})
@@ -267,7 +256,6 @@ class AgentWorkflow(Workflow):
                 record.before = persisted
             async with ctx.store.edit_state() as state:
                 state.actions.extend(records)
-                services.images.forget(state, number, protected)
                 state.repairs = 0
                 state.repair = None
                 state.current = persisted

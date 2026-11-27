@@ -10,7 +10,6 @@ from workflows.context.serializers import JsonSerializer
 from workflows.events import StartEvent, StopEvent
 
 from mobilerun_agents.agent.checkpoints.store import save_context
-from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.memory import read_memory
 from mobilerun_agents.agent.memory.memory import build_planner_memory
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
@@ -22,7 +21,7 @@ from mobilerun_agents.agent.workflows.core.state import (
     PlanningState,
     SubgoalResult,
 )
-from mobilerun_agents.config.user_config import MemoryConfig
+from mobilerun_agents.config.user_config import MobileConfig
 
 
 class AgentProbe(Workflow):
@@ -151,11 +150,8 @@ def test_native_context_round_trip(tmp_path):
         flow = PlanningProbe()
         ctx = Context(flow)
         await ctx.store.set_state(plan)
-        redactor = Redactor()
-        redactor.add("fixture-protected-value")
-        saved_plan = await save_context(tmp_path / "context.json", ctx, redactor)
+        saved_plan = await save_context(tmp_path / "context.json", ctx)
         plan_payload = json.dumps(saved_plan)
-        assert "fixture-protected-value" not in plan_payload
         assert pixels.decode() not in plan_payload
         assert base64.b64encode(pixels).decode() not in plan_payload
         restored_plan = Context.from_dict(flow, json.loads(plan_payload), serializer=serializer)
@@ -163,24 +159,27 @@ def test_native_context_round_trip(tmp_path):
         assert restored_state.results[0].message is None
         assert restored_state.results[0].jev_abstention is not None
         abstention = restored_state.results[0].jev_abstention
-        assert abstention.choice == abstention.thought == abstention.choices == "***"
+        assert (
+            abstention.choice
+            == abstention.thought
+            == abstention.choices
+            == "fixture-protected-value"
+        )
         assert [(record.step, record.call.tool_id) for record in restored_state.actions] == [
             (1, "call_7"),
             (4, "call_8"),
         ]
 
         async def render_memory(context, state):
-            memory = build_planner_memory(MemoryConfig(), state)
+            memory = build_planner_memory(MobileConfig(), state, "android")
             try:
-                return (await read_memory(memory, context, redactor))[0].content
+                return (await read_memory(memory, context))[0].content
             finally:
                 await memory.aclose()
 
-        # Compare the original state to a fresh memory over the restored state;
-        # only the separately tested protected fields are expected to differ.
         before = await render_memory(ctx, plan)
         after = await render_memory(restored_plan, restored_state)
-        assert redactor.text(before) == after
+        assert before == after
         assert 'Findings and notes: ["First child reached the target"]' in after
         assert "Latest executor subgoal result: Succeeded: tap" in after
         assert "Screen: shop/List → shop/Detail (changed)" in after

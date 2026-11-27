@@ -10,15 +10,16 @@ belong in the caller's prompt, outside memory.
 
 **Contents:**
 
-- `__init__.py` — exports `read_memory`.
+- `__init__.py` — exports `StateBlock`, `BlockContext`, `BlockFactory`, and `read_memory`.
 - `memory.py` — reads memory and builds executor and planner memory with a shared template and engine setup.
+- `registry.py` — builds named blocks from built-in, installed, and operator-supplied factories.
 - `blocks/` — run-state block base and context blocks.
 
-**Examples:** Read workflow memory with `await read_memory(memory, ctx, redact)`. It loads the latest
+**Examples:** Read workflow memory with `await read_memory(memory, ctx)`. It loads the latest
 `AgentState` or `PlanningState` with `await ctx.store.get_state()` and passes it to
-`memory.aget(state=state, redact=redact)`, using the run's redactor to mask protected UI labels. Do not pass snapshots or read from a selector's local
-copy of state. Setup is a native `StaticMemoryBlock` named `setup` at priority 0:
-the caller renders its text once and passes that text to `build_setup_block(text)`.
+`memory.aget(state=state)`. Do not pass snapshots or read from a selector's local
+copy of state. The `setup` factory renders its prompt once into a native
+`StaticMemoryBlock` at priority 0.
 
 Create one planner memory per planning run and a fresh executor memory for each
 child. Both are closed when their workflows exit. Each memory owns its SQLite
@@ -27,13 +28,66 @@ engine unless the caller supplies one; `memory.aclose()` leaves supplied engines
 **Depends on / used by:** Uses LlamaIndex memory, typed config, and workflow state.
 Operators supply memory to workflows; selectors read the resulting messages.
 
-## Add a block
+## Write your own block
 
 Subclass `StateBlock[YourState, str]` or `StateBlock[YourState, list[ContentBlock]]`.
-Give the block a `name` and a `priority`, and implement `async def render(self, state, redact)`
+Give the block a `name` and a `priority`, and implement `async def render(self, state)`
 to return text or native content blocks. `StateBlock` ignores short-term memory,
-does nothing on put, and raises `TypeError` if read without `state=` or `redact=`. Override
+does nothing on put, and raises `TypeError` if read without `state=`. Override
 `atruncate` only when a block can shrink itself; the native default drops its content.
+
+```python
+# my_pkg/blocks.py
+from mobilerun_agents import AgentState, BlockContext, StateBlock
+
+
+class PriceWatch(StateBlock[AgentState, str]):
+    name: str = "price_watch"
+    priority: int = 3
+    currency: str
+
+    async def render(self, state: AgentState) -> str:
+        return f"Report prices in {self.currency} for: {state.goal}"
+
+
+def price_watch(context: BlockContext) -> PriceWatch:
+    if context.agent != "executor":
+        raise ValueError("price_watch requires the executor")
+    currency = context.options.get("currency", "USD")
+    if type(currency) is not str or currency not in {"USD", "EUR"}:
+        raise ValueError("currency must be USD or EUR")
+    return PriceWatch(currency=currency)
+```
+
+The factory receives the role (`executor` or `planner`), device platform, raw
+options for this block, and the read-only run config. Planner factories also
+receive the initial or restored `PlanningState` as `context.state`, so setup
+can use `state.executor` before any turns run. Use `render`'s `state` argument for
+live content instead of retaining build-time state. The factory should return a
+fresh block whose `name` matches its registration.
+
+Register the factory in your package's `pyproject.toml` and install the package:
+
+```toml
+[project.entry-points."mobilerun.memory_blocks"]
+price_watch = "my_pkg.blocks:price_watch"
+```
+
+Enable it at the desired position in `agents.yaml`. The `blocks` list replaces
+the defaults for that role:
+
+```yaml
+memory:
+  executor:
+    blocks: [setup, goal, price_watch, last_step, history, app_cards]
+    options:
+      price_watch: {currency: EUR}
+```
+
+For code-only registration, pass `memory_blocks={"price_watch": price_watch}`
+to `AgentOperator` or `PlanningOperator`, and enable it using the same config.
+The mapping applies only to that operator's runs, including planning children.
+Names cannot shadow built-ins or installed entry points.
 
 ## Native behavior pinned by tests
 
@@ -54,11 +108,11 @@ does nothing on put, and raises `TypeError` if read without `state=` or `redact=
 Android and iOS for apps with a bundled card. To disable them, omit `app_cards`
 from `memory.executor.blocks`. Delete the removed top-level `memory.blocks` key.
 `last_step` includes every call from the previous step and its screen transition.
-It masks call arguments and the executor's thought, but keeps result summaries
-unmasked so the executor can use a just-fetched value such as a verification code.
-The saved before-screenshot is optional (`memory.executor.last_step_screenshot`,
+It includes call arguments, the executor's thought, and result summaries so the
+executor can use a just-fetched value such as a verification code.
+The saved before-screenshot is optional (`memory.executor.options.last_step.screenshot`,
 default `true`); only vision-enabled LLM selectors send it. `history` shows the
-previous `memory.executor.history` steps (default `5`), excluding `last_step`,
-plus any repeat and cycle warnings. Each older action includes masked arguments
+previous `memory.executor.options.history.steps` steps (default `5`), excluding `last_step`,
+plus any repeat and cycle warnings. Each older action includes its arguments
 and a short result. Under token pressure app cards (priority 1) are dropped
 before executor history (priority 2); history loses its oldest lines first.

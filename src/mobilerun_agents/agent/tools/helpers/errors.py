@@ -1,6 +1,6 @@
 """Format tool failures before they enter memory and run records."""
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from types import UnionType
 from typing import TYPE_CHECKING, Annotated, Literal, Union, cast, get_args, get_origin
 
@@ -82,9 +82,7 @@ def _alias_paths(field: FieldInfo) -> list[list[str | int]]:
     return paths
 
 
-def _location(
-    issue: ErrorDetails, schema: type[BaseModel] | None, protect: Callable[[str], None] | None
-) -> str:
+def _location(issue: ErrorDetails, schema: type[BaseModel] | None) -> str:
     parts: list[str] = []
     annotation: object = schema
     discriminator: str | Discriminator | None = None
@@ -110,7 +108,7 @@ def _location(
             matches = [
                 branch for branch in branches if _branch_matches(branch, part, discriminator)
             ]
-            # An ambiguous or unrecognized tag must not turn any suffix into secrets.
+            # Only a recognized branch can tell us which fields are schema-defined.
             annotation = matches[0] if len(matches) == 1 else None
             discriminator = None
             break
@@ -121,13 +119,11 @@ def _location(
                 case type() as model, str() as name if issubclass(model, BaseModel):
                     field = model.model_fields.get(name)
                     alias_end = i + 1
-                    alias_root = False
                     if field is None:
                         for candidate in model.model_fields.values():
                             for path in _alias_paths(candidate):
                                 if path[0] != name:
                                     continue
-                                alias_root = True
                                 end = i + len(path)
                                 if loc[i:end] == tuple(path) and (field is None or end > alias_end):
                                     field = candidate
@@ -137,13 +133,6 @@ def _location(
                         annotation = field.annotation
                         discriminator = field.discriminator
                         continue
-                    if (
-                        not alias_root
-                        and i == len(loc) - 1
-                        and issue["type"] == "extra_forbidden"
-                        and protect is not None
-                    ):
-                        protect(name)
                 case _, int() as index if origin in (list, tuple, set, frozenset, Sequence):
                     parts.append(str(index))
                     if origin is tuple and args and args[-1] is not Ellipsis:
@@ -152,8 +141,6 @@ def _location(
                         annotation = args[0] if args else None
                     continue
                 case _ if origin in (dict, Mapping) or annotation in (dict, Mapping):
-                    if protect is not None:
-                        protect(str(part))
                     parts.append("*")
                     annotation = args[1] if len(args) == 2 else None
                     continue
@@ -162,18 +149,14 @@ def _location(
     return ".".join(parts) or "output"
 
 
-def tool_error_summary(
-    error: Exception,
-    schema: type[BaseModel] | None = None,
-    protect: Callable[[str], None] | None = None,
-) -> str:
+def tool_error_summary(error: Exception, schema: type[BaseModel] | None = None) -> str:
     match error:
         case ValidationError():
             lines = []
             for issue in error.errors(
                 include_input=False, include_url=False, include_context=False
             ):
-                location = _location(issue, schema, protect)
+                location = _location(issue, schema)
                 kind = issue["type"]
                 message = (
                     _SAFE_MESSAGES.get(kind, issue["msg"])

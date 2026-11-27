@@ -201,7 +201,7 @@ class DecisionSelector(ActionSelector):
         if not options:
             names = ", ".join(registry.by_name) or "(none)"
             raise SelectorCannotServe(f"Jev has no usable action among: {names}.")
-        context = await read_memory(memory, ctx, registry.redactor)
+        context = await read_memory(memory, ctx)
         report_memory(ctx, memory, context)
         step_context = [previous_action_feedback(state), state.repair]
         if snapshot.device_context:

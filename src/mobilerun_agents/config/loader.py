@@ -1,71 +1,48 @@
 """Load agent settings without rewriting the shared device configuration."""
 
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
-from pathlib import Path
-from tempfile import NamedTemporaryFile
+from typing import Any
 
 import yaml
-from filelock import FileLock
-from mobilerun.config.settings import get_settings
+from mobilerun.config.loader import ConfigFile
 
 from .user_config import MobileConfig
 
-_override: ContextVar[MobileConfig | None] = ContextVar("agents_config", default=None)
+
+class _ConfigYAML(yaml.SafeLoader):
+    # Keep on/off as strings without changing true/false.
+    yaml_implicit_resolvers = {
+        initial: [
+            (tag, pattern)
+            for tag, pattern in rules
+            if tag != "tag:yaml.org,2002:bool" or initial in "tTfF"
+        ]
+        for initial, rules in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
 
 
-class ConfigLoader:
-    @staticmethod
-    @contextmanager
-    def override(config: MobileConfig) -> Iterator[None]:
-        token = _override.set(config)
+class ConfigLoader(ConfigFile[MobileConfig]):
+    CONFIG_FILE = "agents.yaml"
+    config_type = MobileConfig
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> MobileConfig:
+        return cls.config_type.validate_file_data(data)
+
+    @classmethod
+    def to_dict(cls, config: MobileConfig) -> dict[str, Any]:
+        data = config.model_dump(mode="json", exclude_defaults=True)
+        cls.config_type.model_validate(data)
+        return data
+
+    @classmethod
+    def parse_yaml(cls, text: str) -> object:
         try:
-            yield
-        finally:
-            _override.reset(token)
-
-    @staticmethod
-    def get_user_config_path() -> Path:
-        return get_settings().MOBILERUN_USER_CONFIG_DIR / "agents.yaml"
-
-    @classmethod
-    def load(cls, config_path: str | None = None) -> MobileConfig:
-        scoped = _override.get()
-        if config_path is None and scoped is not None:
-            return scoped
-        path = Path(config_path) if config_path else cls.get_user_config_path()
-        return MobileConfig.from_yaml(path) if config_path or path.exists() else MobileConfig()
-
-    @classmethod
-    def update(cls, edit: Callable[[MobileConfig], None]) -> Path:
-        """Read and edit the on-disk user config under one interprocess lock."""
-        path = cls.get_user_config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with FileLock(str(path) + ".lock"):
-            config = cls.load(str(path)) if path.exists() else MobileConfig()
-            edit(config)
-            return cls._save(path, config)
-
-    @classmethod
-    def save(cls, config: MobileConfig) -> Path:
-        """Replace the user config; use update for edits to existing settings."""
-        path = cls.get_user_config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with FileLock(str(path) + ".lock"):
-            return cls._save(path, config)
-
-    @staticmethod
-    def _save(path: Path, config: MobileConfig) -> Path:
-        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as file:
-            temp = Path(file.name)
-            try:
-                # exclude_unset would also discard edits made inside a default section.
-                choices = config.model_dump(mode="json", exclude_defaults=True)
-                MobileConfig.model_validate(choices)
-                yaml.safe_dump(choices, file, sort_keys=False)  # type: ignore[no-untyped-call]
-                file.close()
-                temp.replace(path)
-            finally:
-                temp.unlink(missing_ok=True)
-        return path
+            data = yaml.load(text, Loader=_ConfigYAML)  # type: ignore[no-untyped-call]
+        except yaml.YAMLError:
+            raise ValueError("Invalid agents.yaml syntax") from None
+        if data is None:
+            return {}
+        if type(data) is not dict:
+            # Preserve the Pydantic error for a non-mapping document root.
+            cls.config_type.model_validate(data)
+        return data

@@ -172,5 +172,5 @@ def test_normalized_macro_records_device_pixels():
         summary=result.summary,
         before=ctx.state.current,
     )
-    [action] = macro_data("Send", [record], ctx.registry.redactor)["actions"]
+    [action] = macro_data("Send", [record])["actions"]
     assert (action["action_type"], action["x"], action["y"]) == ("tap", 990, 2210)

@@ -18,11 +18,10 @@ from mobilerun_agents.agent.action_selector.llm.base import LLMSelector
 from mobilerun_agents.agent.action_selector.llm.calls import InvalidResponse
 from mobilerun_agents.agent.events import Detail, Observed
 from mobilerun_agents.agent.logs import ConsoleLog
-from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.memory.memory import build_executor_memory
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.state import ActionRecord
-from mobilerun_agents.config.user_config import DecisionConfig, MemoryConfig
+from mobilerun_agents.config.user_config import DecisionConfig, MobileConfig
 from tests.unit.agent.action_selector.fixtures import Turn
 from tests.unit.device_fixtures import fake_tools
 
@@ -76,7 +75,7 @@ async def test_executor_request_renders_default_memory_order():
         )
         for step in (1, 2)
     ]
-    turn.memory = build_executor_memory(MemoryConfig(), "android")
+    turn.memory = build_executor_memory(MobileConfig(), "android")
     try:
         assert (await turn.select(Chat("off"))).calls[0].tool_name == "wait"
     finally:
@@ -129,7 +128,7 @@ async def test_jev_builds_request_from_observation_registry_and_memory(
         )
     ]
     result = await turn.select(DecisionSelector(Model(), vision=vision))
-    turn.memory.aget.assert_awaited_once_with(state=turn.state, redact=turn.registry.redactor)
+    turn.memory.aget.assert_awaited_once_with(state=turn.state)
     assert result.calls[0].tool_name == "wait"
 
 
@@ -173,7 +172,7 @@ async def test_llm_uses_vision_specific_inputs_and_tools(vision, tool, has_image
         )
     ]
     result = await turn.select(Chat(vision))
-    turn.memory.aget.assert_awaited_once_with(state=turn.state, redact=turn.registry.redactor)
+    turn.memory.aget.assert_awaited_once_with(state=turn.state)
     assert result.calls[0].tool_name == tool
 
 
@@ -267,7 +266,7 @@ async def test_selector_reports_only_debug_memory(kind, level, caplog, tmp_path)
             return 1900
 
     history = DEFAULT_MEMORY_BLOCKS_TEMPLATE.format_messages(
-        memory_blocks=[("goal", [TextBlock(text="fixture secret\nfull block second line")])]
+        memory_blocks=[("goal", [TextBlock(text="Find order\nfull block second line")])]
     )
     caplog.set_level(level, logger="mobilerun_agents.agent.logs.console")
     turn = Turn(tools=fake_tools("wait"))
@@ -280,19 +279,15 @@ async def test_selector_reports_only_debug_memory(kind, level, caplog, tmp_path)
         return
 
     (detail,) = details
-    assert "fixture secret\nfull block second line" in detail.text
-    redact = Redactor()
-    redact.add("fixture secret")
-    console = ConsoleLog(redact, tmp_path)
+    assert "Find order\nfull block second line" in detail.text
+    console = ConsoleLog(tmp_path)
     console.event(Observed(step=31))
     console.event(detail)
     (compact,) = [message for message in caplog.messages if "memory: " in message]
     assert "1.9k/24k tokens · blocks: goal(2 lines)" in compact
     assert len(compact.splitlines()) <= 6
-    assert "goal: ***" in compact
+    assert "goal: Find order" in compact
     assert "full block second line" not in compact
     assert "msgs" not in compact
-    assert "fixture secret" not in caplog.text
     saved = (tmp_path / "memory/0031.txt").read_text()
-    assert "***\nfull block second line" in saved
-    assert "fixture secret" not in saved
+    assert "Find order\nfull block second line" in saved

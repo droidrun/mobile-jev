@@ -6,7 +6,6 @@ import pytest
 from llama_index.core.tools import ToolSelection
 from mobilerun.core.state.ui_state import UIState
 
-from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.memory.blocks.history import HistoryBlock
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.state import ActionRecord, AgentState
@@ -101,7 +100,7 @@ async def test_zip_sheet_repeat_ignores_carousel_changes(variation):
         )
         state.current = after
         assert state.actions[-1].screen_changed is True
-        hints = await HistoryBlock(config=config).render(state, Redactor())
+        hints = await HistoryBlock(config=config).render(state)
         if variation in {"same", "index"} and step >= 3:
             assert (
                 warning.replace("3×", f"{step}×")
@@ -203,7 +202,7 @@ async def test_progress_note_and_guard_count_the_same_history(
         threshold = "cycle_fail_after"
         pattern = r"been on this screen (\d+) times"
 
-    hints = await HistoryBlock(config=AgentConfig(**common)).render(state, Redactor())
+    hints = await HistoryBlock(config=AgentConfig(**common)).render(state)
     match = re.search(pattern, hints)
     note_count = int(match[1]) if match else 0
     guard_count = max(
@@ -229,4 +228,4 @@ async def test_default_progress_note_precedes_stop(screens, calls_per_step, note
     state = _history(screens, calls_per_step)
     config = AgentConfig()
     assert check(state, config) is None
-    assert note in await HistoryBlock(config=config).render(state, Redactor())
+    assert note in await HistoryBlock(config=config).render(state)

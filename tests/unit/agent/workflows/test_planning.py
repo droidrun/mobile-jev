@@ -20,8 +20,6 @@ from mobilerun_agents.agent.checkpoints.store import save_context
 from mobilerun_agents.agent.events import Acted, Finished, Observed, Subgoal
 from mobilerun_agents.agent.logs.console import ConsoleLog
 from mobilerun_agents.agent.logs.memory import MemoryDetail
-from mobilerun_agents.agent.logs.redaction import Redactor
-from mobilerun_agents.agent.memory.blocks import clip
 from mobilerun_agents.agent.memory.blocks.subgoals import _render_failure
 from mobilerun_agents.agent.memory.memory import _RunMemory, build_planner_memory
 from mobilerun_agents.agent.planner import Finish, Plan, Planner
@@ -31,7 +29,7 @@ from mobilerun_agents.agent.tools.registry import build_registry
 from mobilerun_agents.agent.workflows.core.state import PlanningState
 from mobilerun_agents.agent.workflows.planning import PlanningWorkflow, executor_kind
 from mobilerun_agents.agent.workflows.resources import Services, run_resources
-from mobilerun_agents.config.user_config import AgentConfig, MemoryConfig, ToolsConfig
+from mobilerun_agents.config.user_config import AgentConfig, MemoryConfig, MobileConfig, ToolsConfig
 from tests.unit.device_fixtures import MemoryDevice
 
 
@@ -41,8 +39,7 @@ class FakePlanner(Planner):
         self.states = []
         self.prompt_inputs = []
 
-    def bind(self, output_schema, repair, redact):
-        self.redact = redact
+    def bind(self, output_schema, repair):
         self.prompt_inputs.append((output_schema, repair))
         return self
 
@@ -106,17 +103,13 @@ async def make_workflow(phone, tmp_path, monkeypatch):
         """Record a fake tick without contacting the device."""
         return "tick"
 
-    @tool(sensitive_parameters=frozenset({"text"}))
-    async def protect(text: str) -> str:
-        """Identify a protected test value."""
-        return "protected"
-
     async def make(planner, executor, **options):
-        registry = build_registry(phone, [tick, protect], ToolsConfig())
+        registry = build_registry(phone, [tick], ToolsConfig())
         services = Services(registry, ImageStore("run", keep=True))
         memory = build_planner_memory(
-            options.get("memory_config") or MemoryConfig(),
+            MobileConfig(memory=options.get("memory_config") or MemoryConfig()),
             PlanningState(executor=executor_kind(executor)),
+            phone.platform,
         )
         memories.append(memory)
         manager = await run_resources(phone, memory, services)
@@ -125,6 +118,20 @@ async def make_workflow(phone, tmp_path, monkeypatch):
     yield make
     for memory in memories:
         await memory.aclose()
+
+
+@pytest.mark.anyio
+async def test_direct_planning_workflow_rejects_invalid_child_memory_before_observing(
+    make_workflow, phone
+):
+    workflow = await make_workflow(
+        FakePlanner(Finish(True, "done")),
+        FakeSelector(),
+        memory_config=MemoryConfig(executor={"blocks": ["missing"]}),
+    )
+    with pytest.raises(ValueError, match="Unknown memory block 'missing'"):
+        await workflow.run(goal="goal")
+    phone._state_provider_override.get_state.assert_not_awaited()
 
 
 @pytest.mark.anyio
@@ -180,7 +187,7 @@ async def test_planner_prompt_describes_executor_and_checkpoint_restores_it(
         setup
     ]
 
-    saved = await save_context(tmp_path / "context.json", handler.ctx, Redactor())
+    saved = await save_context(tmp_path / "context.json", handler.ctx)
     restored = await Context.from_dict(flow, saved).store.get_state()
     assert restored.executor == kind
 
@@ -208,7 +215,7 @@ async def test_planner_replans_after_jev_abstains(make_workflow):
     assert result.success and result.message == "Price found"
     child = planner.states[1].results[0]
     assert not child.success and child.reason == "abstained"
-    assert "Failure reason: abstained" in _render_failure(child, planner.redact)
+    assert "Failure reason: abstained" in _render_failure(child)
     assert planner.states[2].results[-1].subgoal == "Try another screen"
     assert planner.states[2].results[-1].success
     assert [state.executor for state in planner.states] == ["decision_delegate"] * 3
@@ -303,7 +310,7 @@ async def test_planner_reconsiders_each_subgoal_and_saves_one_ordered_action_his
     assert planner.states[1].plan == ["Unused remainder"]
     failed = planner.states[1].results[0]
     assert not failed.success and failed.reason == "complete"
-    summary = _render_failure(failed, planner.redact)
+    summary = _render_failure(failed)
     assert "Sign-in dialog hides prices." in summary and "shop" in summary
     assert [event.action.step for event in events if isinstance(event, Acted)] == [1, 2]
     assert [event.steps for event in events if isinstance(event, Finished)] == [5]
@@ -343,32 +350,12 @@ async def test_console_keeps_memory_for_second_child_when_first_makes_no_action(
     planner = FakePlanner(Plan(("first child",)), Plan(("second child",)), Finish(True, "done"))
     flow = await make_workflow(planner, EmptyFirstSelector())
     handler = flow.run(goal="root")
-    console = ConsoleLog(Redactor())
+    console = ConsoleLog()
     caplog.set_level("DEBUG", logger="mobilerun_agents.agent.logs.console")
     async for event in handler.stream_events():
         console.event(event)
     await handler
     assert "notes: second child" in caplog.text
-
-
-def test_clip_scans_long_screen_once_and_backs_up_across_overlapping_spans():
-    class CountingRedactor(Redactor):
-        calls = 0
-
-        def text(self, value: str) -> str:
-            self.calls += 1
-            return super().text(value)
-
-        def masked_spans(self, value: str) -> list[tuple[int, int]]:
-            self.calls += 1
-            return super().masked_spans(value)
-
-    redact = CountingRedactor()
-    registered = f"{'x' * 98} suffix"
-    redact.add(registered)
-    screen = f"prefix Bearer {registered} " + "line " * 200_000
-    assert clip(screen, 115, redact) == "prefix "
-    assert redact.calls == 1
 
 
 @pytest.mark.anyio
@@ -413,25 +400,6 @@ async def test_planner_observes_fresh_ui_images_and_context_for_free(
 
 
 @pytest.mark.anyio
-async def test_later_child_protection_clears_earlier_image_references(make_workflow):
-    planner = FakePlanner(
-        Plan(("Look",)), Plan(("Identify protected value",)), Finish(True, "Done")
-    )
-    protected = ToolSelection(
-        tool_id="protect", tool_name="protect", tool_kwargs={"text": "fake-secret"}
-    )
-    flow = await make_workflow(planner, FakeSelector(complete(), protected, complete("")))
-    handler = flow.run(goal="Review")
-    assert (await handler).success
-    path = planner.states[1].actions[0].before.screenshot.path
-    assert not path.exists()
-    assert not planner.states[0].current.screenshot.path.exists()
-    assert not planner.states[1].current.screenshot.path.exists()
-    assert planner.states[2].current.screenshot is None
-    assert all(record.before.screenshot is None for record in planner.states[2].actions)
-
-
-@pytest.mark.anyio
 async def test_vision_planner_reads_full_ui_after_child_completes_without_message(
     make_workflow, phone, monkeypatch
 ):
@@ -447,22 +415,21 @@ async def test_vision_planner_reads_full_ui_after_child_completes_without_messag
     old = UIState([{"text": "Old screen"}], "Old screen", "", {}, 100, 100)
     new = UIState([{"text": "New screen"}], full_ui, "", {}, 100, 100)
     phone._state_provider_override.get_state.side_effect = [old, old, old, new]
-    protected = ToolSelection(
-        tool_id="protect", tool_name="protect", tool_kwargs={"text": "fixture-private"}
-    )
+    tick = ToolSelection(tool_id="tick", tool_name="tick", tool_kwargs={})
     llm = Replies()
     llm._calls = [
         ("set_plan", {"subgoals": ["Read the price"]}),
         ("complete", {"success": True, "message": "The price is £42.00"}),
     ]
-    flow = await make_workflow(LlamaIndexPlanner(llm), FakeSelector(protected, complete("")))
+    flow = await make_workflow(LlamaIndexPlanner(llm), FakeSelector(tick, complete("")))
     handler = flow.run(goal="Find the price", max_steps=4)
     assert (await handler).message == "The price is £42.00"
     (first, _), (second, _) = llm._requests
     initial_image = next(block for block in first[-1].blocks if isinstance(block, ImageBlock))
     assert initial_image.path is not None and not initial_image.path.exists()
-    assert phone.screenshot.await_count == 1
-    assert not any(isinstance(block, ImageBlock) for block in second[-1].blocks)
+    current_image = next(block for block in second[-1].blocks if isinstance(block, ImageBlock))
+    assert current_image.path is not None and current_image.path.is_file()
+    assert phone.screenshot.await_count == 2
     assert full_ui in second[-1].content
     assert (
         "Read the values the goal needs yourself if the executor did not report them."
@@ -528,111 +495,6 @@ async def test_planner_keeps_findings_when_switching_between_price_screens(make_
     assert "Screen: ebay/unknown → home/unknown (changed)" in fourth[1].content
     assert fourth[-1].content.endswith("UI summary (observed data):\nHome")
     assert amazon not in fourth[-1].content
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("secret", "boundary"),
-    [
-        ("fixture-abcdefgh", "checkpoint"),
-        ("fixture-first\nfixture-second", "checkpoint"),
-        ("fixture-first\nfixture-second", "prompt"),
-    ],
-    ids=["single-line-checkpoint", "multiline-checkpoint", "multiline-prompt"],
-)
-async def test_output_hides_value_registered_after_earlier_failure_summary(
-    make_workflow, phone, tmp_path, secret, boundary
-):
-    from mobilerun_agents.agent.planner import LlamaIndexPlanner
-    from tests.unit.agent.planner.test_llama_index import Replies
-
-    prefix = "y" * 116
-    phone._state_provider_override.get_state.return_value = UIState(
-        [{"text": "screen"}], prefix + secret + " tail" * 80, "", {}, 100, 100
-    )
-    redact = None
-
-    class Selector(FakeSelector):
-        async def select(self, ctx, device, memory, registry):
-            nonlocal redact
-            redact = registry.redactor
-            return await super().select(ctx, device, memory, registry)
-
-    planner = FakePlanner(Plan(("First",)), Plan(("Second",)), Finish(True, "Done"))
-    protect = ToolSelection(tool_id="protect", tool_name="protect", tool_kwargs={"text": secret})
-    flow = await make_workflow(planner, Selector(complete("blocked", False), protect, complete()))
-    handler = flow.run(goal="Recover")
-    assert (await handler).success
-    assert redact is not None and redact.text(secret) == "***"
-    if boundary == "checkpoint":
-        path = tmp_path / "context.json"
-        saved = await save_context(path, handler.ctx, redact)
-        assert "fixture-" not in path.read_text()
-        restored = await Context.from_dict(flow, saved).store.get_state()
-        assert restored.results[0].summary.screens[0][1] == prefix + "***" + " tail" * 80
-    else:
-        # The planner renders only the latest failure. Render the earlier failure
-        # with the registry after the second child has registered the value.
-        state = await handler.ctx.store.get_state()
-        ctx = Context(flow)
-        await ctx.store.set_state(
-            state.model_copy(update={"results": state.results[:1], "current": None})
-        )
-        llm = Replies()
-        memory = build_planner_memory(MemoryConfig(), state)
-        try:
-            await LlamaIndexPlanner(llm).bind(None, None, redact).plan(ctx, memory)
-        finally:
-            await memory.aclose()
-        messages, _ = llm._requests[0]
-        prompt = messages[1].content
-        assert prefix + "fixt" not in prompt
-        assert f"— {prefix} ×1" in prompt
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("boundary", ["checkpoint", "prompt"])
-async def test_failure_summary_keeps_multiline_values_intact_until_redaction(
-    make_workflow, phone, tmp_path, boundary
-):
-    from mobilerun_agents.agent.planner import LlamaIndexPlanner
-    from tests.unit.agent.planner.test_llama_index import Replies
-
-    secret = "synthetic-first-half\nsynthetic-second-half"
-    before = UIState([], f"Sign in: {secret} unrelated tail", "", {}, 100, 100)
-    after = UIState([], "Sign-in dialog closed", "", {}, 100, 100)
-    phone._state_provider_override.get_state.side_effect = [before, before, after, after]
-    redact = None
-
-    class Selector(ActionSelector):
-        async def select(self, ctx, device, memory, registry):
-            nonlocal redact
-            redact = registry.redactor
-            redact.add(secret)
-            return Selection(
-                calls=[ToolSelection(tool_id="tick", tool_name="tick", tool_kwargs={})]
-            )
-
-    llm = Replies()
-    llm._calls = [
-        ("set_plan", {"subgoals": ["Find price"]}),
-        ("complete", {"success": False, "message": "Price unavailable"}),
-    ]
-    flow = await make_workflow(LlamaIndexPlanner(llm), Selector())
-    handler = flow.run(goal="Find price", max_steps=3)
-    assert (await handler).reason == "complete"
-    if boundary == "checkpoint":
-        assert redact is not None
-        path = tmp_path / "context.json"
-        saved = await save_context(path, handler.ctx, redact)
-        assert "synthetic-first-half" not in path.read_text()
-        state = await Context.from_dict(flow, saved).store.get_state()
-        assert state.results[0].summary.screens[0][1] == "Sign in: *** unrelated tail"
-    else:
-        messages, _ = llm._requests[-1]
-        prompt = messages[1].content
-        assert "synthetic-first-half" not in prompt
-        assert "— Sign in:  ×1" in prompt
 
 
 @pytest.mark.anyio
@@ -813,21 +675,12 @@ async def test_typed_planner_output_repairs_without_rerunning_executor(make_work
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("protect", [False, True])
-async def test_parent_cancellation_stops_child_and_purges_newly_protected_image(
-    make_workflow, protect
-):
+async def test_parent_cancellation_stops_child_and_keeps_checkpoint_image(make_workflow):
     started = asyncio.Event()
     ended = asyncio.Event()
 
     class Waiting(ActionSelector):
         async def select(self, ctx, device, memory, registry):
-            if protect:
-                registry.protect(
-                    ToolSelection(
-                        tool_id="protect", tool_name="protect", tool_kwargs={"text": "fake-secret"}
-                    )
-                )
             started.set()
             try:
                 await asyncio.Future()
@@ -844,7 +697,7 @@ async def test_parent_cancellation_stops_child_and_purges_newly_protected_image(
     with pytest.raises(WorkflowCancelledByUser):
         await handler
     await asyncio.wait_for(ended.wait(), timeout=5)
-    assert path.exists() is not protect
+    assert path.is_file()
 
 
 @pytest.mark.anyio
@@ -886,21 +739,10 @@ async def test_planner_refreshes_after_each_kind_of_terminal_batch(make_workflow
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    "position", ["crossing", "ends_at_cut", "starts_at_cut", "unprotected", "encoded_crossing"]
-)
-async def test_failure_summary_never_clips_through_protected_values(make_workflow, phone, position):
-    secret = "fixture alpha" if position == "encoded_crossing" else "fixture-secret"
-    marker = "fixture%20alpha" if position == "encoded_crossing" else secret
-    remaining = {
-        "crossing": 4,
-        "ends_at_cut": len(marker),
-        "starts_at_cut": 0,
-        "unprotected": 4,
-        "encoded_crossing": 12,
-    }[position]
-    thought_prefix = "x" * (240 - remaining)
-    screen_prefix = "y" * (120 - remaining)
+async def test_failure_summary_clips_plain_text_to_length_limit(make_workflow, phone):
+    marker = "fixture-text"
+    thought_prefix = "x" * 236
+    screen_prefix = "y" * 116
     provider = phone._state_provider_override
     provider.get_state.return_value = UIState(
         [{"text": "screen"}], screen_prefix + marker + " tail", "", {}, 100, 100
@@ -908,8 +750,6 @@ async def test_failure_summary_never_clips_through_protected_values(make_workflo
 
     class Selector(ActionSelector):
         async def select(self, ctx, device, memory, registry):
-            if position != "unprotected":
-                registry.redactor.add(secret)
             return Selection(
                 calls=[complete("blocked", False)], thought=thought_prefix + marker + " tail"
             )
@@ -918,29 +758,9 @@ async def test_failure_summary_never_clips_through_protected_values(make_workflo
     workflow = await make_workflow(planner, Selector())
     await workflow.run(goal="Advance")
 
-    summary = _render_failure(planner.states[1].results[0], planner.redact)
-    suffix = {"ends_at_cut": "***", "unprotected": marker[:remaining]}.get(position, "")
-    assert f"- {thought_prefix}{suffix}\n" in summary
-    assert f" — {screen_prefix}{suffix} ×1\n" in summary
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("secret", ["fixture-a. fixture-b", "fixture-a\nfixture-b"])
-async def test_failure_summary_never_splits_protected_thoughts(make_workflow, secret):
-    thought = f"Blocked by {secret} while signing in."
-
-    class Selector(ActionSelector):
-        async def select(self, ctx, device, memory, registry):
-            registry.redactor.add(secret)
-            return Selection(calls=[complete("blocked", False)], thought=thought)
-
-    planner = FakePlanner(Plan(("Advance",)), Finish(False, "done"))
-    workflow = await make_workflow(planner, Selector())
-    await workflow.run(goal="Advance")
-
-    summary = _render_failure(planner.states[1].results[0], planner.redact)
-    assert "fixture-a" not in summary and "fixture-b" not in summary
-    assert summary.count("- Blocked by *** while signing in.\n") == 2
+    summary = _render_failure(planner.states[1].results[0])
+    assert f"- {thought_prefix}fixt\n" in summary
+    assert f" — {screen_prefix}fixt ×1\n" in summary
 
 
 @pytest.mark.anyio

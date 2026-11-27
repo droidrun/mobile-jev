@@ -18,6 +18,8 @@ Run the split harness with an external Python 3.11–3.13 interpreter; it recrea
 
 Tests use fakes and isolated configuration. Never commit secrets or call providers, cloud services or real devices in CI. Smoke tests are opt-in; inspect `tests/smoke/README.md` and get consent before live or paid runs. Clean up resources and report costs. Add fake tests for behavior changes.
 
+Use standard logging. Mobilerun's `secret_scope` masks sensitive values in log records during sensitive calls; run data is stored unmasked.
+
 ## Layout and import direction
 
 Imports go down: CLI/public exports → `macro_agent/` → `agent/operators/` → `agent/workflows/` → services (including `agent/planner/` and `agent/tools/`) → `agent/events.py` → `agent/workflows/core/` → `agent/auth/` → `config/` and `errors/`. Within `agent/tools/`, imports go from registry to atomic to helpers; selectors may use helpers. Replay may call the agent, never the reverse. Base owns device operations, extensions and macro playback.

@@ -7,8 +7,6 @@ from llama_index.core.base.llms.types import ChatMessage, ContentBlock
 from llama_index.core.memory import BaseMemoryBlock
 from pydantic import BaseModel
 
-from mobilerun_agents.agent.logs.redaction import Redactor
-
 StateT = TypeVar("StateT", bound=BaseModel)
 ContentT = TypeVar("ContentT", str, list[ContentBlock])
 
@@ -25,23 +23,12 @@ class StateBlock(BaseMemoryBlock[ContentT], Generic[StateT, ContentT]):
         self,
         messages: list[ChatMessage] | None = None,
         state: StateT | None = None,
-        redact: Redactor | None = None,
         **kwargs: object,
     ) -> ContentT:
         if state is None:
             raise TypeError(f"{type(self).__name__} requires the workflow state (state=...)")
-        if redact is None:
-            raise TypeError(f"{type(self).__name__} requires the run redactor (redact=...)")
-        return await self.render(state, redact)
+        return await self.render(state)
 
     @abstractmethod
-    async def render(self, state: StateT, redact: Redactor) -> ContentT:
+    async def render(self, state: StateT) -> ContentT:
         """Return the context to include for this state."""
-
-
-def clip(text: str, limit: int, redact: Redactor) -> str:
-    if 0 < limit < len(text):
-        for start, end in redact.masked_spans(text):
-            if start < limit < end:
-                return text[:start]
-    return text[:limit]

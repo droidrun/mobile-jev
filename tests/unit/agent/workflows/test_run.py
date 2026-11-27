@@ -8,7 +8,6 @@ import pytest
 from llama_index.core.base.llms.types import ChatMessage, ChatResponse, ImageBlock
 from llama_index.core.memory import Memory
 from llama_index.core.tools import ToolSelection
-from mobilerun.core.devices import Device
 from mobilerun.core.extensions import Extension, action
 from mobilerun.core.state.ui_state import UIState
 from mobilerun.errors import DeviceError, NoFocusedInput
@@ -73,7 +72,7 @@ class Selector:
         from mobilerun_agents.agent.action_selector.base import Selection
         from mobilerun_agents.agent.memory import read_memory
 
-        self.history.append(await read_memory(memory, ctx, registry.redactor))
+        self.history.append(await read_memory(memory, ctx))
         state = await ctx.store.get_state()
         self.repairs.append(state.repair)
         self.on_select(state)
@@ -101,7 +100,7 @@ async def run(
     from mobilerun_agents.agent.tools.registry import build_registry
     from mobilerun_agents.agent.workflows.agent import AgentWorkflow
     from mobilerun_agents.agent.workflows.resources import Services, run_resources
-    from mobilerun_agents.config.user_config import MemoryConfig, ToolsConfig
+    from mobilerun_agents.config.user_config import MobileConfig, ToolsConfig
 
     monkeypatch.setenv("MOBILERUN_AGENT_IMAGES_DIR", str(tmp_path))
     device = Phone(screens, has_tree)
@@ -116,19 +115,13 @@ async def run(
         return text
 
     @tool(sensitive_parameters=frozenset({"text"}))
-    async def protect(text: str) -> str:
-        """Identify a protected value."""
-        return "protected"
+    async def write_sensitive(text: str) -> str:
+        """Write a sensitive value."""
+        return text
 
-    @tool
-    async def vault(phone: Device) -> str:
-        """Type a secret without exposing the vault value in the call or result."""
-        await phone._input_secret('known "late"')
-        return "protected"
-
-    memory = build_executor_memory(MemoryConfig(), device.platform)
+    memory = build_executor_memory(MobileConfig(), device.platform)
     images = ImageStore("test", keep=True)
-    registry = build_registry(device, [write, protect, vault], ToolsConfig())
+    registry = build_registry(device, [write, write_sensitive], ToolsConfig())
     services = Services(registry=registry, images=images)
     workflow = AgentWorkflow(
         selector, resource_manager=await run_resources(device, memory, services), **settings
@@ -272,22 +265,19 @@ def test_jev_abstention_outcome_keeps_raw_decision_and_choices(
     assert "input_text" not in details.choices
 
 
-def test_abstention_removes_prior_saved_images_for_newly_protected_value(tmp_path, monkeypatch):
+def test_abstention_keeps_prior_saved_images_without_saving_current(tmp_path, monkeypatch):
     from mobilerun_agents.agent.action_selector.base import Selection
 
-    marker = "fixture-late-abstention"
-
-    class ProtectOnAbstain(Selector):
+    class AbstainAfterActions(Selector):
         async def select(self, ctx, device, memory, registry):
             state = await ctx.store.get_state()
             if len(state.actions) < 2:
                 return await super().select(ctx, device, memory, registry)
-            assert sorted(path.read_bytes() for path in tmp_path.rglob("*.png")) == [b"A", b"B"]
-            registry.protect(call("protect", text=marker))
             return Selection(abstained=True)
 
-    selector = ProtectOnAbstain(
-        [call("write", text=marker), call("write", text="next")], lambda _: None
+    selector = AbstainAfterActions(
+        [call("write_sensitive", text="fixture-sensitive-input"), call("write", text="next")],
+        lambda _: None,
     )
     result, state, *_ = asyncio.run(
         run(tmp_path, monkeypatch, [], [b"A", b"B", b"C"], selector=selector)
@@ -295,8 +285,8 @@ def test_abstention_removes_prior_saved_images_for_newly_protected_value(tmp_pat
 
     assert result.reason == "abstained"
     assert result.message == "Unfinished: the selector took no action."
-    assert not list(tmp_path.rglob("*.png"))
-    assert all(record.before.screenshot is None for record in state.actions)
+    assert sorted(path.read_bytes() for path in tmp_path.rglob("*.png")) == [b"A", b"B"]
+    assert [record.before.screenshot.path.read_bytes() for record in state.actions] == [b"A", b"B"]
     assert state.current.screenshot is None
 
 
@@ -389,13 +379,15 @@ def test_repair_budget_ends_without_saving_an_image(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("exhausted", [False, True])
-def test_rejected_sensitive_selection_forgets_images_before_retry(tmp_path, monkeypatch, exhausted):
+def test_rejected_sensitive_selection_preserves_images_during_repair(
+    tmp_path, monkeypatch, exhausted
+):
     from mobilerun_agents.config.user_config import AgentConfig
 
     marker = "FAKE_REPAIR_VALUE"
     cfg = AgentConfig()
     cfg.decision.max_response_repair_attempts = 1
-    rejected = call("protect", text=marker, unexpected=1)
+    rejected = call("write_sensitive", text=marker, unexpected=1)
     choices = [call("write", text=marker if exhausted else "ordinary"), rejected]
     choices.append(rejected if exhausted else complete())
     present = []
@@ -410,9 +402,10 @@ def test_rejected_sensitive_selection_forgets_images_before_retry(tmp_path, monk
         )
     )
     assert result.reason == ("repair_attempts" if exhausted else "complete")
-    assert present == [False, True, False]
-    assert state.actions[0].before.screenshot is None
-    assert not list(tmp_path.rglob("*.png"))
+    assert present == [False, True, True]
+    expected = [b"A"] if exhausted else [b"A", b"B"]
+    assert sorted(path.read_bytes() for path in tmp_path.rglob("*.png")) == expected
+    assert [record.before.screenshot.path.read_bytes() for record in state.actions] == expected
 
 
 def test_selector_parse_error_becomes_a_repair(tmp_path, monkeypatch):
@@ -427,44 +420,20 @@ def test_selector_parse_error_becomes_a_repair(tmp_path, monkeypatch):
     assert selector.repairs == [None, "Malformed model reply"]
 
 
-@pytest.mark.parametrize("first_hit", [1, 2, 3, None])
-def test_late_protection_discards_affected_files_and_clears_references(
-    tmp_path, monkeypatch, first_hit
-):
-    value = 'known "late"'
-    choices = [
-        call("write", text=value if first_hit == 1 else "other"),
-        call("write", text=value if first_hit == 2 else "more"),
-        call("protect", text=value) if first_hit else call("vault"),
-        complete(),
-    ]
-
-    def inspect(state):
-        assert state.current.screenshot.path is None
-        assert state.current.screenshot.image is not None
-        if len(state.actions) == 2:
-            assert sorted(path.read_bytes() for path in tmp_path.rglob("*.png")) == [b"A", b"B"]
-
+def test_sensitive_action_keeps_screenshots_and_raw_arguments(tmp_path, monkeypatch):
+    value = "fixture-sensitive-input"
+    choices = [call("write", text=value), call("write_sensitive", text=value), complete()]
     result, state, _, phone, _ = asyncio.run(
-        run(tmp_path, monkeypatch, choices, [b"A", b"B", b"C", b"D"], inspect)
+        run(tmp_path, monkeypatch, choices, [b"A", b"B", b"C"])
     )
-    assert result.success and phone.captures == 4
-    assert (
-        sorted(path.read_bytes() for path in tmp_path.rglob("*.png"))
-        == {
-            1: [],
-            2: [b"A"],
-            3: [b"A", b"B"],
-            None: [b"A"],
-        }[first_hit]
-    )
-    assert [bool(record.before.screenshot) for record in state.actions] == [
-        first_hit != 1,
-        first_hit == 3,
-        False,
-        False,
+    assert result.success and phone.captures == 3
+    assert sorted(path.read_bytes() for path in tmp_path.rglob("*.png")) == [b"A", b"B", b"C"]
+    assert [record.before.screenshot.path.read_bytes() for record in state.actions] == [
+        b"A",
+        b"B",
+        b"C",
     ]
-    assert [record.screen_changed for record in state.actions] == [True, True, True, None]
+    assert state.actions[1].call.tool_kwargs == {"text": value}
 
 
 def test_output_schema_is_validated_before_completing(tmp_path, monkeypatch):
@@ -687,9 +656,7 @@ def test_rejected_output_is_not_echoed_in_public_answer(tmp_path, monkeypatch):
     assert not result.success and result.answer == "count: Input should be a valid integer"
 
 
-def test_rejected_output_mapping_key_is_hidden_in_feedback_and_artifacts(
-    tmp_path, monkeypatch, caplog
-):
+def test_rejected_output_mapping_key_is_kept_in_run_data_but_not_feedback(tmp_path, monkeypatch):
     from mobilerun_agents import AgentOperator
     from mobilerun_agents.config.loader import ConfigLoader
     from mobilerun_agents.config.user_config import MobileConfig
@@ -707,7 +674,6 @@ def test_rejected_output_mapping_key_is_hidden_in_feedback_and_artifacts(
     cfg.analytics.enabled = cfg.tracing.enabled = False
     monkeypatch.setenv("MOBILERUN_AGENT_RUNS_DIR", str(tmp_path / "runs"))
     monkeypatch.setenv("MOBILERUN_AGENT_IMAGES_DIR", str(tmp_path / "images"))
-    caplog.set_level(logging.DEBUG, logger="mobilerun_agents.agent.logs.console")
     rejected = complete(output={"results": [{"counts": {marker: "bad"}}]})
     selector = Selector([rejected, rejected], lambda _: None)
     with ConfigLoader.override(cfg):
@@ -718,9 +684,8 @@ def test_rejected_output_mapping_key_is_hidden_in_feedback_and_artifacts(
     assert not result.success
     assert result.answer == "results.0.counts.*: Input should be a valid integer"
     history = [message.model_dump_json() for message in selector.history[-1]]
-    assert marker not in "\n".join(history)
-    assert marker not in caplog.text
-    assert marker not in (Path(result.trajectory_path) / "context.json").read_text()
+    assert marker in "\n".join(history)
+    assert marker in (Path(result.trajectory_path) / "context.json").read_text()
 
 
 def test_rejected_custom_validator_exception_text_is_not_echoed(tmp_path, monkeypatch):

@@ -1,10 +1,8 @@
 """Agent settings, independent of the base device configuration."""
 
 import re
-from pathlib import Path
-from typing import Annotated, ClassVar, Literal, Self
+from typing import Annotated, Any, ClassVar, Literal, Self
 
-import yaml
 from llama_index.core.memory import InsertMethod
 from llama_index.core.memory.memory import DEFAULT_TOKEN_LIMIT
 from mobilerun.config.user_config import TelemetryConfig, TracingConfig
@@ -236,18 +234,14 @@ _MEMORY_BLOCKS = {
 
 class AgentMemoryConfig(Section):
     blocks: list[str] = Field(default_factory=list)
-    history: PositiveInt = 5
-
-
-class ExecutorMemoryConfig(AgentMemoryConfig):
-    last_step_screenshot: bool = True
+    options: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class MemoryConfig(Section):
     token_limit: PositiveInt = DEFAULT_TOKEN_LIMIT
     insert_method: InsertMethod = InsertMethod.USER
-    executor: ExecutorMemoryConfig = Field(
-        default_factory=lambda: ExecutorMemoryConfig(blocks=list(_MEMORY_BLOCKS["executor"]))
+    executor: AgentMemoryConfig = Field(
+        default_factory=lambda: AgentMemoryConfig(blocks=list(_MEMORY_BLOCKS["executor"]))
     )
     planner: AgentMemoryConfig = Field(
         default_factory=lambda: AgentMemoryConfig(blocks=list(_MEMORY_BLOCKS["planner"]))
@@ -261,15 +255,6 @@ class MemoryConfig(Section):
                 return {"blocks": list(_MEMORY_BLOCKS[info.field_name or ""]), **value}
             case _:
                 return value
-
-    @field_validator("executor", "planner")
-    @classmethod
-    def _known_blocks(cls, value: AgentMemoryConfig, info: ValidationInfo) -> AgentMemoryConfig:
-        valid = _MEMORY_BLOCKS[info.field_name or ""]
-        for block in value.blocks:
-            if block not in valid:
-                raise ValueError(f"Unknown memory block {block!r}. Valid names: {', '.join(valid)}")
-        return value
 
 
 class MobileConfig(Section):
@@ -301,20 +286,24 @@ class MobileConfig(Section):
         return self
 
     @classmethod
-    def from_yaml(cls, path: str | Path) -> Self:
-        # The schema uses the words on/off as strings. PyYAML's default YAML
-        # 1.1 resolver would coerce them to booleans before validation.
-        with Path(path).open(encoding="utf-8") as stream:
-            try:
-                data = yaml.load(stream, Loader=_ConfigYAML)  # type: ignore[no-untyped-call]
-            except yaml.YAMLError:
-                raise ValueError("Invalid agents.yaml syntax") from None
+    def validate_file_data(cls, data: object) -> Self:
         if type(data) is dict:
             memory = data.get("memory")
-            if type(memory) is dict and "blocks" in memory:
-                raise OldConfigKeys(
-                    "Delete memory.blocks; list blocks under memory.executor.blocks"
-                )
+            if type(memory) is dict:
+                if "blocks" in memory:
+                    raise OldConfigKeys(
+                        "Delete memory.blocks; list blocks under memory.executor.blocks"
+                    )
+                for role, old, new in (
+                    ("executor", "history", "history.steps"),
+                    ("planner", "history", "subgoal_history.subgoals"),
+                    ("executor", "last_step_screenshot", "last_step.screenshot"),
+                ):
+                    section = memory.get(role)
+                    if type(section) is dict and old in section:
+                        raise OldConfigKeys(
+                            f"Move memory.{role}.{old} to memory.{role}.options.{new} in agents.yaml."
+                        )
             agent = data.get("agent")
             planning = agent.get("planning") if type(agent) is dict else None
             if type(planning) is dict and "max_planner_turns" in planning:
@@ -329,7 +318,7 @@ class MobileConfig(Section):
                     "Config uses old keys; run: mobilerun agent profiles add … / agent configure …"
                 )
         try:
-            return cls.model_validate({} if data is None else data)
+            return cls.model_validate(data)
         except ValidationError as exc:
             if message := profile_validation_message(exc):
                 raise ValueError(message) from None
@@ -350,14 +339,3 @@ def profile_validation_message(error: ValidationError) -> str | None:
 
 class OldConfigKeys(ValueError):
     """A removed CLI configuration schema was found."""
-
-
-class _ConfigYAML(yaml.SafeLoader):
-    yaml_implicit_resolvers = {
-        initial: [
-            (tag, pattern)
-            for tag, pattern in rules
-            if tag != "tag:yaml.org,2002:bool" or initial in "tTfF"
-        ]
-        for initial, rules in yaml.SafeLoader.yaml_implicit_resolvers.items()
-    }

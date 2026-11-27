@@ -18,6 +18,8 @@
 
 Successful actions describe their target from the pinned UI, for example `tapped [26] TextView "Enter a US zip code"` or `tapped (12, 12) Button "Open ZIP sheet"`. Focus is included only when the action already obtained a newer UI state. Void device actions omit the `→ None` suffix.
 
+The base's `secret_scope` masks sensitive values in log records during sensitive calls. The registry does not mask arguments or results stored in run data.
+
 **Callable tools:** Layer 1 exposes callable actions as `device.x`: native methods and extensions, minus a denylist, gated by device support. Selectors may add run-local tools such as `complete` and `wait`. The registry does not know about vision; selectors construct exclusions for `vision="off"`, `"on"` or `"only"`.
 
 **Atomic choices:** Literal and boolean values expand. Unsupported or unconvertible tools are omitted. Exceptions expand `tap_element` once per element, `swipe` into four directions, `start_app` once per installed app, and `complete` as success/failure with its message left open.

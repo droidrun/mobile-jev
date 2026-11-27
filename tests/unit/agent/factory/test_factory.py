@@ -185,7 +185,7 @@ async def test_openai_planner_requires_one_native_tool_on_the_wire(monkeypatch):
         default_setup="planned",
     )
     ConfigLoader.save(config)
-    memory = build_planner_memory(config.memory, state)
+    memory = build_planner_memory(config, state, "android")
     try:
         assert await (await default_setup()).planner.plan(ctx, memory) == Plan(("Check status",))
     finally:

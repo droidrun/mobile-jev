@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Mapping
 from datetime import datetime, tzinfo
 from typing import Annotated, Literal, Optional, Union
@@ -26,7 +27,6 @@ from pydantic import (
 from pydantic_core import PydanticCustomError, SchemaValidator, core_schema
 from workflows import Context
 
-from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.tools.base import Source, tool
 from mobilerun_agents.agent.tools.helpers import visual_tool_names
 from mobilerun_agents.agent.tools.helpers.errors import tool_error_summary
@@ -56,10 +56,26 @@ async def test_resources_are_injected_without_exposing_them_as_arguments():
         await registry.execute(call("mark", label="sample name"), turn.ctx)
         == "android: bench: sample name"
     )
-    assert registry.protected_values == {"sample name"}
-    assert registry.redactor.text("sample%20name") == "***"
     with pytest.raises(ExtensionActionError):
         await registry.execute(call("mark", label="sample", phone="pretender"), turn.ctx)
+
+
+@pytest.mark.anyio
+async def test_sensitive_tool_scopes_log_masking_to_invocation(caplog):
+    logger = logging.getLogger(__name__)
+
+    @tool(sensitive_parameters=frozenset({"label"}))
+    async def mark(label: str) -> str:
+        """Label this device."""
+        logger.warning("Inside: %s", label)
+        return label
+
+    turn = Turn()
+    registry = build_registry(turn.device, [mark], ToolsConfig())
+    value = "fixture-sensitive-label"
+    assert await registry.execute(call("mark", label=value), turn.ctx) == value
+    logger.warning("Outside: %s", value)
+    assert caplog.messages == ["Inside: ***", f"Outside: {value}"]
 
 
 @pytest.mark.anyio
@@ -306,7 +322,7 @@ class Parcel(BaseModel):
     tags: Mapping[str, int]
 
 
-def test_only_open_mapping_keys_and_forbidden_extras_are_protected():
+def test_validation_summary_uses_schema_fields_not_input_keys():
     with pytest.raises(ValidationError) as caught:
         Parcel.model_validate(
             {
@@ -316,13 +332,11 @@ def test_only_open_mapping_keys_and_forbidden_extras_are_protected():
                 "tags": {"k": "unknown"},
             }
         )
-    protected: list[str] = []
-    summary = tool_error_summary(caught.value, Parcel, protected.append)
+    summary = tool_error_summary(caught.value, Parcel)
     assert "address.city:" in summary
     assert "stops.0.city:" in summary
     assert "tags.*:" in summary
     assert "fixture-extra" not in summary
-    assert protected == ["fixture-extra", "k"]
 
 
 @pytest.mark.parametrize(
@@ -339,7 +353,7 @@ def test_only_open_mapping_keys_and_forbidden_extras_are_protected():
         (Field(alias="innerB"), "innerB", False, "innerB"),
     ],
 )
-def test_extra_key_is_protected_behind_validation_aliases(field, key, nested, path):
+def test_validation_summary_keeps_alias_paths_but_omits_extra_keys(field, key, nested, path):
     class Outer(BaseModel):
         inner: Address = field
 
@@ -349,53 +363,18 @@ def test_extra_key_is_protected_behind_validation_aliases(field, key, nested, pa
     value = {"city": "Berlin", "fixture-extra": True}
     with pytest.raises(ValidationError) as caught:
         Output.model_validate({"outer": {key: [value] if nested else value}})
-    protected: list[str] = []
-    summary = tool_error_summary(caught.value, Output, protected.append)
-    assert protected == ["fixture-extra"]
+    summary = tool_error_summary(caught.value, Output)
     assert summary == f"outer.{path}.*: Extra inputs are not permitted"
 
 
-def test_nonterminal_unknown_location_is_not_registered_as_an_extra_key():
-    class Output(BaseModel):
-        @field_validator("child")
-        @classmethod
-        def validate_child(cls, child: Address) -> Address:
-            raise ValidationError.from_exception_data(
-                "child",
-                [{"type": "extra_forbidden", "loc": ("unknown", "fixture-extra"), "input": True}],
-            )
-
-        child: Address
-
-    with pytest.raises(ValidationError) as caught:
-        Output.model_validate({"child": {"city": "Berlin"}})
-    protected: list[str] = []
-    tool_error_summary(caught.value, Output, protected.append)
-    assert protected == []
-
-
-def test_model_and_function_union_tags_do_not_poison_the_redactor():
+def test_validation_summary_keeps_field_paths_inside_ordinary_unions():
     class Output(BaseModel):
         target: Annotated[Address, AfterValidator(lambda address: address)] | list[Address]
         value: int | str
 
     with pytest.raises(ValidationError) as caught:
         Output.model_validate({"target": {"city": 3}, "value": [1]})
-    redactor = Redactor()
-    assert "target.city:" in tool_error_summary(caught.value, Output, redactor.add)
-    assert redactor.revision == 0
-    assert redactor.text("print(str(int_value))") == "print(str(int_value))"
-
-
-def test_missing_schema_does_not_register_unknown_path_components():
-    class Cart(BaseModel):
-        items: list[Address]
-
-    with pytest.raises(ValidationError) as caught:
-        Cart.model_validate({"items": [{"city": 3}]})
-    redactor = Redactor()
-    tool_error_summary(caught.value, protect=redactor.add)
-    assert redactor.revision == 0
+    assert "target.city:" in tool_error_summary(caught.value, Output)
 
 
 class Primary(BaseModel):
@@ -413,14 +392,12 @@ class Tagged(BaseModel):
     choice: Primary | Secondary = Field(discriminator="kind")
 
 
-def test_discriminated_union_keeps_fields_and_protects_extras():
+def test_discriminated_union_summary_keeps_fields_but_omits_extra_keys():
     with pytest.raises(ValidationError) as caught:
         Tagged.model_validate({"choice": {"kind": "a", "count": "bad", "fixture_extra": 1}})
-    protected: list[str] = []
-    summary = tool_error_summary(caught.value, Tagged, protected.append)
+    summary = tool_error_summary(caught.value, Tagged)
     assert "choice.count:" in summary
     assert "fixture_extra" not in summary
-    assert protected == ["fixture_extra"]
 
 
 class BrokenOffset(tzinfo):

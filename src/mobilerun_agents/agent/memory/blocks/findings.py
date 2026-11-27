@@ -1,4 +1,3 @@
-from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.workflows.core.state import PlanningState
 from mobilerun_agents.config.prompts import render_prompt
 
@@ -9,7 +8,7 @@ class FindingsBlock(StateBlock[PlanningState, str]):
     name: str = "findings"
     priority: int = 0
 
-    async def render(self, state: PlanningState, redact: Redactor) -> str:
+    async def render(self, state: PlanningState) -> str:
         return (
             render_prompt("assets/prompts/memory/findings.jinja2", notes=state.notes)
             if state.notes

@@ -14,6 +14,6 @@
 - `last_step.py` — the previous executor step, including its screen transition and optional before-screenshot.
 - `subgoals.py` — the latest planner subgoal result and older subgoal history.
 
-**Examples:** `await read_memory(memory, ctx, redact)` renders the configured blocks from the latest workflow state using the run's redactor.
+**Examples:** `await read_memory(memory, ctx)` renders the configured blocks from the latest workflow state.
 
 **Depends on / used by:** Blocks use workflow state and the LlamaIndex memory contract. Executor and planner builders compose them for each run.

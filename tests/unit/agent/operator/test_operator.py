@@ -3,6 +3,7 @@ import json
 import logging
 from datetime import date
 from enum import Enum
+from importlib import metadata
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,9 +20,9 @@ from pydantic import (
     RootModel,
     SerializationInfo,
     field_serializer,
-    field_validator,
 )
-from workflows import Context
+from workflows import Context, Workflow, step
+from workflows.events import StartEvent, StopEvent
 
 from mobilerun_agents import (
     AgentOperator,
@@ -33,10 +34,13 @@ from mobilerun_agents import (
 )
 from mobilerun_agents.agent.action_selector import ActionSelector
 from mobilerun_agents.agent.checkpoints.macro_export import macro_data
-from mobilerun_agents.agent.logs.redaction import Redactor
+from mobilerun_agents.agent.events import Finished
+from mobilerun_agents.agent.memory import read_memory
 from mobilerun_agents.agent.memory.memory import _RunMemory
 from mobilerun_agents.agent.operators import consumers
 from mobilerun_agents.agent.planner import Finish, Plan, Planner
+from mobilerun_agents.agent.tools.helpers.images import ImageStore
+from mobilerun_agents.agent.workflows.core.state import Outcome
 from mobilerun_agents.config.loader import ConfigLoader
 from mobilerun_agents.config.user_config import MobileConfig
 from tests.unit.device_fixtures import MemoryDevice
@@ -124,9 +128,92 @@ async def test_execute_maps_result_and_checkpoints_agent_actions(config, plannin
     replay = MemoryDevice()
     player = MacroPlayer(replay)
     macro = player.load_macro_from_file(macro_path)
-    assert macro == macro_data(state.goal, state.actions, Redactor())
+    assert macro == macro_data(state.goal, state.actions)
     assert await player.replay_macro(macro)
     assert replay.inputs == ["sample text"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("planning", [False, True])
+async def test_operator_memory_blocks_are_available_to_each_agent(config, monkeypatch, planning):
+    from mobilerun_agents import StateBlock
+    from mobilerun_agents.agent.memory import registry as block_registry
+    from mobilerun_agents.agent.workflows.core.state import AgentState, PlanningState
+
+    monkeypatch.setattr(metadata, "entry_points", lambda **kwargs: ())
+    block_registry._installed.cache_clear()
+
+    class LocalBlock(StateBlock[AgentState | PlanningState, str]):
+        name: str = "local"
+        priority: int = 3
+        role: str
+
+        async def render(self, state):
+            return f"{self.role}: {state.goal}"
+
+    class Selector(Script):
+        async def select(self, ctx, device, memory, registry):
+            (message,) = await read_memory(memory, ctx)
+            goal = next(goals)
+            assert f"executor: {goal}" in message.content
+            child_memories.append(memory)
+            return await super().select(ctx, device, memory, registry)
+
+    class LocalPlanner(ScriptPlanner):
+        async def plan(self, ctx, memory):
+            (message,) = await read_memory(memory, ctx)
+            assert "planner: read count" in message.content
+            self.turn += 1
+            if self.turn <= 2:
+                return Plan((f"enter text {self.turn}",))
+            return Finish(success=True, message="done")
+
+    config.memory.executor.blocks = config.memory.planner.blocks = ["local"]
+    goals = iter(["enter text 1", "enter text 2"] if planning else ["read count"])
+    child_memories = []
+    contexts = []
+
+    def factory(context):
+        contexts.append(context)
+        return LocalBlock(role=context.agent)
+
+    calls = [("complete", {"success": True, "message": "done"})] * (2 if planning else 1)
+    selector = Selector(*calls)
+    factories = {"local": factory}
+    operator = (
+        PlanningOperator(LocalPlanner(), selector, memory_blocks=factories)
+        if planning
+        else AgentOperator(selector, memory_blocks=factories)
+    )
+    try:
+        with ConfigLoader.override(config):
+            assert (await operator.execute(Phone(), "read count")).success
+    finally:
+        block_registry._installed.cache_clear()
+    if planning:
+        first, second = child_memories
+        assert first.memory_blocks[0] is not second.memory_blocks[0]
+        assert [context.agent for context in contexts] == ["executor", "planner", "executor"]
+        assert contexts[1].state.executor == "custom"
+    else:
+        assert [context.agent for context in contexts] == ["executor"]
+
+
+@pytest.mark.anyio
+async def test_planning_rejects_invalid_child_memory_before_device_observation(config):
+    class UnusedPhone(Phone):
+        async def refresh(self):
+            pytest.fail("the device must not be observed with invalid memory")
+
+    config.memory.executor.blocks = ["local"]
+    # Returning a wrong name can only be detected by actually building the block.
+    from mobilerun_agents.agent.memory.blocks.goal import GoalBlock
+
+    operator = PlanningOperator(
+        ScriptPlanner(), Script(), memory_blocks={"local": lambda _: GoalBlock()}
+    )
+    with ConfigLoader.override(config), pytest.raises(ValueError, match=r"'local'.*'goal'"):
+        await operator.execute(UnusedPhone(), "read count")
 
 
 @pytest.mark.anyio
@@ -149,7 +236,7 @@ async def test_typed_planning_uses_untyped_decision_executor_completion(config):
             return Decision(option_index=index)
 
     class TypedPlanner(ScriptPlanner):
-        def bind(self, output_schema, repair, redact):
+        def bind(self, output_schema, repair):
             assert output_schema == Answer.model_json_schema()
             return self
 
@@ -172,12 +259,12 @@ async def test_typed_planning_uses_untyped_decision_executor_completion(config):
 
 
 @pytest.mark.anyio
-async def test_sensitive_params_remain_raw_in_state_but_not_outputs(config, caplog):
+async def test_sensitive_params_remain_raw_in_run_data(config):
     captured = []
 
     @tool(sensitive_parameters=frozenset({"text"}))
     async def record_sensitive(text: str) -> str:
-        """Remember a sensitive value without publishing it."""
+        """Receive a sensitive fixture value."""
         captured.append(text)
         return f"received {text}"
 
@@ -185,20 +272,21 @@ async def test_sensitive_params_remain_raw_in_state_but_not_outputs(config, capl
         ("record_sensitive", {"text": "fixture-sensitive-text"}),
         ("complete", {"success": True, "message": "received fixture-sensitive-text"}),
     )
-    caplog.set_level("DEBUG", logger="mobilerun_agents.agent.logs.console")
     with ConfigLoader.override(config):
         result = await AgentOperator(selector, [record_sensitive]).execute(Phone(), "record it")
     assert captured == ["fixture-sensitive-text"]
-    assert result.answer == "received ***"
-    assert "fixture-sensitive-text" not in caplog.text
-    assert (
-        "fixture-sensitive-text" not in (Path(result.trajectory_path) / "context.json").read_text()
-    )
+    assert result.answer == "received fixture-sensitive-text"
+    checkpoint = Path(result.trajectory_path) / "context.json"
+    state = await Context.from_dict(
+        AgentWorkflow(selector), json.loads(checkpoint.read_text())
+    ).store.get_state()
+    assert state.actions[0].summary == "received fixture-sensitive-text"
+    assert state.actions[0].before.screenshot.path.read_bytes() == b"fake screenshot"
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("kind", ["mailbox", "sms"])
-async def test_sensitive_extension_result_is_raw_for_model_only(config, caplog, kind):
+async def test_sensitive_extension_result_remains_raw_for_model_and_run_data(config, caplog, kind):
     from llama_index.core.llms import ChatMessage, ChatResponse
     from mobilerun.core.extensions import action
     from mobilerun.core.mailbox import Mailbox
@@ -277,22 +365,20 @@ async def test_sensitive_extension_result_is_raw_for_model_only(config, caplog, 
     finally:
         await extension.unbind()
     assert result.success and len(model.requests) == 3 and phone.inputs == [code]
-    assert result.answer == "Code: ***"
+    assert result.answer == f"Code: {code}"
     assert any(secret in (message.content or "") for message in model.requests[1])
     folder = Path(result.trajectory_path)
     checkpoint = (folder / "context.json").read_text()
     memory_dump = "\n".join(path.read_text() for path in sorted((folder / "memory").glob("*.txt")))
-    for public in (checkpoint, memory_dump, caplog.text):
-        assert secret not in public and code not in public and "***" in public
+    assert secret in checkpoint and secret in memory_dump
 
 
 @pytest.mark.anyio
-async def test_debug_operator_writes_masked_memory_file(config, caplog):
+async def test_debug_operator_writes_raw_memory_file(config, caplog):
     from mobilerun_agents.agent.logs.memory import MemoryDetail
 
     class MemorySelector(ActionSelector):
         async def select(self, ctx, device, memory, registry):
-            registry.redactor.add("fixture-memory-secret")
             ctx.write_event_to_stream(
                 MemoryDetail(
                     section="memory",
@@ -316,13 +402,12 @@ async def test_debug_operator_writes_masked_memory_file(config, caplog):
     with ConfigLoader.override(config):
         result = await AgentOperator(MemorySelector()).execute(Phone(), "goal")
     saved = Path(result.trajectory_path) / "memory/0001.txt"
-    assert saved.read_text() == "***\n"
-    assert "fixture-memory-secret" not in caplog.text
+    assert saved.read_text() == "fixture-memory-secret\n"
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("planning", [False, True])
-async def test_execution_result_masks_sensitive_values_in_typed_output(config, planning):
+async def test_execution_result_keeps_raw_values_in_typed_output(config, planning):
     marker = "fixture-sensitive-output"
 
     class TypedOutput(BaseModel):
@@ -353,31 +438,8 @@ async def test_execution_result_masks_sensitive_values_in_typed_output(config, p
     )
     with ConfigLoader.override(config):
         result = await operator.execute(Phone(), "receive the value", output=TypedOutput)
-    assert result.success and result.answer == "Received ***"
-    assert result.output == TypedOutput(details={"text": ["***", "ordinary"]})
-
-
-@pytest.mark.anyio
-async def test_execution_result_omits_output_if_mask_breaks_its_schema(config):
-    marker = "fixture-sensitive-constrained-output"
-
-    class ConstrainedOutput(BaseModel):
-        text: str = Field(min_length=5)
-
-    @tool(sensitive_parameters=frozenset({"value"}))
-    async def protect(value: str) -> str:
-        """Receive a sensitive value."""
-        return "done"
-
-    selector = Script(
-        ("protect", {"value": marker}),
-        ("complete", {"success": True, "message": "done", "output": {"text": marker}}),
-    )
-    with ConfigLoader.override(config):
-        result = await AgentOperator(selector, [protect]).execute(
-            Phone(), "receive the value", output=ConstrainedOutput
-        )
-    assert result.success and result.output is None
+    assert result.success and result.answer == message
+    assert result.output == TypedOutput(details={"text": [marker, "ordinary"]})
 
 
 @pytest.mark.anyio
@@ -447,7 +509,7 @@ async def test_subgoal_display_default_does_not_replace_raw_message(config, capl
 
 
 @pytest.mark.anyio
-async def test_vault_value_stays_out_of_checkpoint_console_and_macro(config, caplog):
+async def test_vault_action_exports_reference_without_fetching_value_into_state(config):
     class EditablePhone(Phone):
         async def refresh(self):
             return UIState([], "", "", {"focusedElement": {"text": ""}, "isEditable": True}, 0, 0)
@@ -457,16 +519,15 @@ async def test_vault_value_stays_out_of_checkpoint_console_and_macro(config, cap
     credentials = await DictCredentials({"app": {"sample": {"password": marker}}}).bind(phone)
     selector = Script(
         ("vault__type_field", {"package": "app", "name": "sample", "field": "password"}),
-        ("complete", {"success": True, "message": f"Entered {marker}"}),
+        ("complete", {"success": True, "message": "Entered saved password"}),
     )
-    caplog.set_level("DEBUG", logger="mobilerun_agents.agent.logs.console")
     try:
         with ConfigLoader.override(config):
             result = await AgentOperator(selector).execute(phone, "enter the saved password")
     finally:
         await credentials.unbind()
     assert phone.inputs == [marker]
-    assert result.answer == "Entered ***" and marker not in caplog.text
+    assert result.success
     folder = Path(result.trajectory_path)
     assert marker not in (folder / "context.json").read_text()
     macro_path = Path(get_macro_settings().macro_directory) / folder.name / "macro.json"
@@ -623,90 +684,33 @@ async def test_typed_output_preserves_validated_json(config, planning, raw, expe
 
 
 @pytest.mark.anyio
-async def test_invalid_redacted_output_warns_without_values(config, caplog):
-    marker = "fixture-warning-protected"
+async def test_invalid_public_output_warns_without_values(config, caplog):
+    class InvalidOutputWorkflow(Workflow):
+        @step
+        async def finish(self, ctx: Context, ev: StartEvent) -> StopEvent:
+            outcome = Outcome(success=True, reason="complete", output={"count": "fixture-value"})
+            ctx.write_event_to_stream(Finished(outcome=outcome, steps=1))
+            return StopEvent(result=outcome)
 
-    class Output(BaseModel):
-        text: str = Field(min_length=5)
-
-    @tool(sensitive_parameters=frozenset({"value"}))
-    async def protect(value: str) -> str:
-        """Protect a fixture value."""
-        return "done"
-
-    selector = Script(
-        ("protect", {"value": marker}),
-        ("complete", {"success": True, "message": "done", "output": {"text": marker}}),
+    config.checkpoints.enabled = False
+    result = await consumers._consume(
+        config,
+        InvalidOutputWorkflow(),
+        ImageStore("run", keep=False),
+        "run",
+        Phone(),
+        "read",
+        Answer,
+        1,
     )
-    with ConfigLoader.override(config):
-        result = await AgentOperator(selector, [protect]).execute(Phone(), "read", output=Output)
-
     assert result.success and result.output is None
-    warnings = [
-        r for r in caplog.records if r.name == consumers.__name__ and r.levelname == "WARNING"
-    ]
-    assert len(warnings) == 1 and "redact" in warnings[0].getMessage().lower()
-    assert marker not in warnings[0].getMessage() and "***" not in warnings[0].getMessage()
+    assert [
+        record.getMessage() for record in caplog.records if record.name == consumers.__name__
+    ] == ["Typed output omitted: output did not match the schema"]
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("source", ["default", "validator", "safe"])
-async def test_public_output_checks_values_after_revalidation(config, caplog, source):
-    marker = "fixture-protected-default"
-
-    class DefaultOutput(BaseModel):
-        text: str = marker
-
-    class ValidatorOutput(BaseModel):
-        text: str
-
-        @field_validator("text")
-        @classmethod
-        def add_protected_value(cls, value: str) -> str:
-            return marker
-
-    class SafeOutput(BaseModel):
-        masked: str = Field(validation_alias="incoming", serialization_alias="outgoing")
-        nested: StrictOutput
-        optional: str | None = None
-
-    @tool(sensitive_parameters=frozenset({"value"}))
-    async def protect(value: str) -> str:
-        """Protect a fixture value."""
-        return "done"
-
-    output, raw = {
-        "default": (DefaultOutput, {}),
-        "validator": (ValidatorOutput, {"text": "ordinary"}),
-        "safe": (
-            SafeOutput,
-            {"incoming": marker, "nested": {"day": "2026-01-02", "status": "ready"}},
-        ),
-    }[source]
-    selector = Script(
-        ("protect", {"value": marker}),
-        ("complete", {"success": True, "message": "done", "output": raw}),
-    )
-    with ConfigLoader.override(config):
-        result = await AgentOperator(selector, [protect]).execute(Phone(), "read", output=output)
-
-    assert result.success
-    warnings = [r.message for r in caplog.records if r.name == consumers.__name__]
-    if source == "safe":
-        assert result.output == SafeOutput(
-            incoming="***", nested=StrictOutput(day=date(2026, 1, 2), status=Status.READY)
-        )
-        assert not warnings
-    else:
-        assert result.output is None
-        assert warnings == ["Typed output omitted: redacted output did not match the schema"]
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("use_default", [False, True], ids=["masked-input", "protected-default"])
-async def test_public_output_omits_unverified_model_with_contextual_serializer(
-    config, caplog, use_default
-):
+async def test_public_output_does_not_require_contextual_serialization(config, caplog):
     marker = "fixture-contextual-output"
 
     class ContextualOutput(BaseModel):
@@ -716,67 +720,12 @@ async def test_public_output_omits_unverified_model_with_contextual_serializer(
         def serialize_text(self, value: str, info: SerializationInfo) -> str:
             return info.context["prefix"] + value
 
-    class Selector(Script):
-        async def select(self, ctx, device, memory, registry):
-            registry.redactor.add(marker)
-            return await super().select(ctx, device, memory, registry)
-
-    selector = Selector(
-        (
-            "complete",
-            {"success": True, "message": "done", "output": {} if use_default else {"text": marker}},
-        )
-    )
+    selector = Script(("complete", {"success": True, "message": "done", "output": {}}))
     with ConfigLoader.override(config):
         result = await AgentOperator(selector).execute(Phone(), "read", output=ContextualOutput)
 
-    assert result.success and result.output is None
-    assert [r.message for r in caplog.records if r.name == consumers.__name__] == [
-        "Typed output omitted: redacted output did not match the schema"
-    ]
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("failed_save", ["acted", "final"])
-async def test_failed_checkpoint_write_refreshes_old_redactions(config, monkeypatch, failed_save):
-    marker = "fixture-checkpoint-late-secret"
-    config.checkpoints.enabled = True
-    original = consumers.save_context
-    attempts = []
-
-    @tool
-    async def note() -> str:
-        """Return a value not yet known to be sensitive."""
-        return marker
-
-    @tool(sensitive_parameters=frozenset({"value"}))
-    async def protect(value: str) -> str:
-        """Protect a fixture value."""
-        return "done"
-
-    async def save(path, ctx, redactor):
-        attempts.append(path)
-        number = len(attempts)
-        if number == 1:
-            assert not redactor.revision
-        if failed_save == "final" and number == 3:
-            # Learn the value after the last step save, before the final save starts.
-            saved = await original(path, ctx, redactor)
-            redactor.add(marker)
-            return saved
-        if number == (2 if failed_save == "acted" else 4):
-            assert marker in path.read_text() and redactor.revision
-            raise OSError("checkpoint write failed")
-        return await original(path, ctx, redactor)
-
-    monkeypatch.setattr(consumers, "save_context", save)
-    second = ("protect", {"value": marker}) if failed_save == "acted" else ("note", {})
-    selector = Script(("note", {}), second, ("complete", {"success": True, "message": "done"}))
-    with ConfigLoader.override(config), pytest.raises(OSError, match="checkpoint write failed"):
-        await AgentOperator(selector, [note, protect]).execute(Phone(), "read")
-
-    checkpoint: Path = attempts[0]
-    assert checkpoint.is_file() and marker not in checkpoint.read_text()
+    assert result.success and result.output == ContextualOutput(text=marker)
+    assert not [r for r in caplog.records if r.name == consumers.__name__]
 
 
 @pytest.mark.anyio
@@ -800,8 +749,8 @@ async def test_run_memory_closes_after_workflow_and_checkpoints(
         if close_fails:
             raise RuntimeError("fixture close failure")
 
-    async def save(path, ctx, redactor):
-        saved = await original_save(path, ctx, redactor)
+    async def save(path, ctx):
+        saved = await original_save(path, ctx)
         operations.append("checkpoint")
         return saved
 

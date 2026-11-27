@@ -7,17 +7,14 @@ from mobilerun.core.state.ui_state import UIState
 from mobilerun_agents.agent.events import Acted, Detail, Finished, Observed, Repaired, Subgoal
 from mobilerun_agents.agent.logs import ConsoleLog, configure_cli_logging
 from mobilerun_agents.agent.logs.memory import MemoryDetail
-from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.state import ActionRecord, Outcome
 
 
-def test_console_redacts_event_text_and_arguments(caplog):
+def test_console_logs_event_values_with_single_line_messages(caplog):
     caplog.set_level("DEBUG", logger="mobilerun_agents.agent.logs.console")
-    redact = Redactor()
-    redact.add("fixture secret")
-    console = ConsoleLog(redact)
-    console.event(Subgoal(text="enter fixture secret"))
+    console = ConsoleLog()
+    console.event(Subgoal(text="enter\n fixture secret"))
     console.event(Repaired(step=1, attempt=1, reason="fixture secret"))
     console.event(
         Acted(
@@ -33,17 +30,19 @@ def test_console_redacts_event_text_and_arguments(caplog):
         )
     )
     console.finish(True, "done with fixture secret", 1)
-    assert "→ subgoal: enter ***" in caplog.messages
+    assert "→ subgoal: enter fixture secret" in caplog.messages
     assert "Retrying invalid selection" in caplog.messages
     assert "1 · input_text ✓" in caplog.messages
-    assert "✓ done with *** (1 step)" in caplog.messages
-    assert "fixture" not in caplog.text
+    assert (
+        "  arguments: {'text': 'fixture+secret'} · result: typed fixture secret" in caplog.messages
+    )
+    assert "✓ done with fixture secret (1 step)" in caplog.messages
 
 
 def test_cli_routes_debug_to_stderr_and_result_to_stdout(capsys):
     with click.Context(click.Command("agent")):
         configure_cli_logging(True)
-        console = ConsoleLog(Redactor())
+        console = ConsoleLog()
         console.event(Detail(section="image", text="no image"))
         console.finish(True, "done", 1)
     output = capsys.readouterr()
@@ -54,14 +53,14 @@ def test_cli_routes_debug_to_stderr_and_result_to_stdout(capsys):
 def test_agent_console_keeps_step_count_and_path(caplog, tmp_path):
     caplog.set_level("INFO", logger="mobilerun_agents.agent.logs.console")
     finished = Finished(outcome=Outcome(success=True, reason="completed"), steps=1)
-    ConsoleLog(Redactor()).finish(True, "done", finished, tmp_path)
+    ConsoleLog().finish(True, "done", finished, tmp_path)
 
     assert caplog.messages == [f"✓ done (1 step · {tmp_path})"]
 
 
 def test_console_distinguishes_planner_and_executor_screens(caplog):
     caplog.set_level("DEBUG", logger="mobilerun_agents.agent.logs.console")
-    console = ConsoleLog(Redactor())
+    console = ConsoleLog()
     console.event(Observed(step=0, package="shop", planner=True))
     console.event(Observed(step=1, package="shop"))
 
@@ -70,7 +69,7 @@ def test_console_distinguishes_planner_and_executor_screens(caplog):
 
 def test_console_subgoal_shows_shared_step_progress(caplog):
     caplog.set_level("INFO", logger="mobilerun_agents.agent.logs.console")
-    ConsoleLog(Redactor()).event(Subgoal(text="Open settings", step=12, budget=60))
+    ConsoleLog().event(Subgoal(text="Open settings", step=12, budget=60))
 
     assert caplog.messages == ["→ subgoal (step 12/60): Open settings"]
 
@@ -80,7 +79,7 @@ def test_console_finish_shows_shared_step_breakdown(caplog, tmp_path):
     finished = Finished(
         outcome=Outcome(success=True, reason="completed"), steps=16, planner_turns=10, budget=60
     )
-    ConsoleLog(Redactor()).finish(True, "done", finished, tmp_path)
+    ConsoleLog().finish(True, "done", finished, tmp_path)
 
     assert caplog.messages == [f"✓ done (16/60 steps · 10 planner, 6 actions · {tmp_path})"]
 
@@ -88,12 +87,9 @@ def test_console_finish_shows_shared_step_breakdown(caplog, tmp_path):
 def test_memories_share_a_step_file_without_wrapping_console_output(capsys, tmp_path):
     with click.Context(click.Command("agent")):
         configure_cli_logging(True)
-        redact = Redactor()
-        long_secret = "clipped-secret" * 12
-        redact.add(long_secret)
-        console = ConsoleLog(redact, tmp_path)
+        console = ConsoleLog(tmp_path)
         console.event(Observed(step=3))
-        for text in ("x" * 140, long_secret):
+        for text in ("x" * 140, "second memory read"):
             console.event(
                 MemoryDetail(
                     section="memory",
@@ -103,21 +99,19 @@ def test_memories_share_a_step_file_without_wrapping_console_output(capsys, tmp_
                     counts="1 msg",
                 )
             )
-        redact.add("x" * 140)
         console.finish(True, "done", 3)
     lines = capsys.readouterr().err.splitlines()
     assert sum("Memory details:" in line for line in lines) == 1
     previews = [line for line in lines if "notes:" in line]
     assert previews == [f"    notes: {'x' * 119}…"]
     assert any("memory (jev): 1 msg" in line for line in lines)
-    assert "clipped-secret" not in "\n".join(lines)
-    assert (tmp_path / "memory/0003.txt").read_text() == "***\n"
-    assert (tmp_path / "memory/0003-jev.txt").read_text() == "***\n"
+    assert (tmp_path / "memory/0003.txt").read_text() == "x" * 140 + "\n"
+    assert (tmp_path / "memory/0003-jev.txt").read_text() == "second memory read\n"
 
 
 def test_console_compacts_later_memory_details_and_keeps_separate_files(caplog, tmp_path):
     caplog.set_level("DEBUG", logger="mobilerun_agents.agent.logs.console")
-    console = ConsoleLog(Redactor(), tmp_path)
+    console = ConsoleLog(tmp_path)
     console.event(Observed(step=2))
     console.event(
         MemoryDetail(
@@ -148,7 +142,7 @@ def test_console_compacts_later_memory_details_and_keeps_separate_files(caplog, 
 
 def test_memory_files_use_private_mode_independent_of_umask(tmp_path, caplog):
     caplog.set_level("DEBUG", logger="mobilerun_agents.agent.logs.console")
-    console = ConsoleLog(Redactor(), tmp_path)
+    console = ConsoleLog(tmp_path)
     previous = os.umask(0)
     try:
         console.event(

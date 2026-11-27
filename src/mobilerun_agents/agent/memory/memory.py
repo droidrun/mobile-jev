@@ -2,27 +2,21 @@
 
 import logging
 import sqlite3
+from collections.abc import Callable, Mapping
 from threading import current_thread
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 from llama_index.core.base.llms.types import ChatMessage, ContentBlock, TextBlock
-from llama_index.core.memory import BaseMemoryBlock, Memory, StaticMemoryBlock
+from llama_index.core.memory import BaseMemoryBlock, Memory
 from llama_index.core.prompts import RichPromptTemplate
 from pydantic import PrivateAttr
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from workflows import Context
 
-from mobilerun_agents.agent.logs.redaction import Redactor
-from mobilerun_agents.agent.memory.blocks.app_cards import AppCardBlock
-from mobilerun_agents.agent.memory.blocks.findings import FindingsBlock
-from mobilerun_agents.agent.memory.blocks.goal import GoalBlock
-from mobilerun_agents.agent.memory.blocks.history import HistoryBlock
-from mobilerun_agents.agent.memory.blocks.last_step import LastStepBlock
-from mobilerun_agents.agent.memory.blocks.subgoals import LastSubgoalBlock, SubgoalHistoryBlock
 from mobilerun_agents.agent.workflows.core.state import AgentState, PlanningState
-from mobilerun_agents.config.paths import resolve_prompt_path
-from mobilerun_agents.config.prompts import render_prompt
-from mobilerun_agents.config.user_config import AgentConfig, MemoryConfig
+from mobilerun_agents.config.user_config import MemoryConfig, MobileConfig
+
+from .registry import NO_MEMORY_BLOCKS, BlockContext, BlockFactory, configured_blocks
 
 
 class _MemoryConnection(sqlite3.Connection):
@@ -85,71 +79,52 @@ class _BlockPrompt(RichPromptTemplate):
 
 
 async def read_memory(
-    memory: Memory, ctx: Context[AgentState] | Context[PlanningState], redact: Redactor
+    memory: Memory, ctx: Context[AgentState] | Context[PlanningState]
 ) -> list[ChatMessage]:
     """Render memory from the latest persisted workflow state."""
     state = await ctx.store.get_state()
-    return await memory.aget(state=state, redact=redact)
-
-
-def build_setup_block(text: str) -> StaticMemoryBlock:
-    """Build the pinned setup block for the executor and planner memory builders."""
-    return StaticMemoryBlock(name="setup", static_content=[TextBlock(text=text)], priority=0)
+    return await memory.aget(state=state)
 
 
 def build_executor_memory(
-    config: MemoryConfig,
+    config: MobileConfig,
     platform: str,
-    agent: AgentConfig | None = None,
     async_engine: AsyncEngine | None = None,
     session_id: str | None = None,
+    extra: Mapping[str, BlockFactory] = NO_MEMORY_BLOCKS,
 ) -> _RunMemory:
-    blocks: list[BaseMemoryBlock[Any]] = []
-    for name in config.executor.blocks:
-        match name:
-            case "setup":
-                blocks.append(
-                    build_setup_block(render_prompt("assets/prompts/memory/setup_executor.jinja2"))
-                )
-            case "goal":
-                blocks.append(GoalBlock())
-            case "last_step":
-                blocks.append(LastStepBlock(screenshot=config.executor.last_step_screenshot))
-            case "history":
-                blocks.append(
-                    HistoryBlock(steps=config.executor.history, config=agent or AgentConfig())
-                )
-            case "app_cards" if platform in ("android", "ios"):
-                blocks.append(
-                    AppCardBlock(
-                        platform=cast(Literal["android", "ios"], platform),
-                        cards_dir=resolve_prompt_path("assets/app_cards"),
-                    )
-                )
-    return _build_memory(config, blocks, async_engine, session_id)
+    blocks = configured_blocks(BlockContext("executor", platform, {}, config), extra)
+    return _build_memory(config.memory, blocks, async_engine, session_id)
 
 
-def build_planner_memory(config: MemoryConfig, state: PlanningState) -> _RunMemory:
-    blocks: list[BaseMemoryBlock[Any]] = []
-    for name in config.planner.blocks:
-        match name:
-            case "setup":
-                blocks.append(
-                    build_setup_block(
-                        render_prompt(
-                            "assets/prompts/memory/setup_planner.jinja2", executor=state.executor
-                        )
-                    )
-                )
-            case "goal":
-                blocks.append(GoalBlock(include_notes=False))
-            case "findings":
-                blocks.append(FindingsBlock())
-            case "last_subgoal":
-                blocks.append(LastSubgoalBlock())
-            case "subgoal_history":
-                blocks.append(SubgoalHistoryBlock(history=config.planner.history))
-    return _build_memory(config, blocks)
+def build_planner_memory(
+    config: MobileConfig,
+    state: PlanningState,
+    platform: str,
+    extra: Mapping[str, BlockFactory] = NO_MEMORY_BLOCKS,
+) -> _RunMemory:
+    blocks = configured_blocks(BlockContext("planner", platform, {}, config, state), extra)
+    return _build_memory(config.memory, blocks)
+
+
+def prepare_child_memory(
+    config: MobileConfig,
+    platform: str,
+    extra: Mapping[str, BlockFactory] = NO_MEMORY_BLOCKS,
+) -> Callable[[], _RunMemory]:
+    """Build the first child's blocks up front, without opening a memory engine."""
+    first: list[BaseMemoryBlock[Any]] | None = configured_blocks(
+        BlockContext("executor", platform, {}, config), extra
+    )
+
+    def new_memory() -> _RunMemory:
+        nonlocal first
+        if first is None:
+            return build_executor_memory(config, platform, extra=extra)
+        blocks, first = first, None
+        return _build_memory(config.memory, blocks)
+
+    return new_memory
 
 
 def _build_memory(

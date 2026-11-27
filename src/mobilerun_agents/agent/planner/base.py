@@ -7,7 +7,6 @@ from llama_index.core.memory import Memory
 from mobilerun.models.context import JSONValue
 from workflows import Context
 
-from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.workflows.core.state import PlanningState
 
 
@@ -37,7 +36,6 @@ class Planner(ABC):
         self,
         output_schema: dict[str, JSONValue] | None,
         repair: str | None,
-        redact: Redactor,
     ) -> "Planner":
         """Bind optional prompt inputs for a turn; custom planners can just read the context."""
         return self

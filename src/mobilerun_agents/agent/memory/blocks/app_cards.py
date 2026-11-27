@@ -4,7 +4,6 @@ from typing import Literal
 
 from pydantic import PrivateAttr, TypeAdapter, ValidationError
 
-from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.workflows.core.state import AgentState
 
 from . import StateBlock
@@ -33,7 +32,7 @@ class AppCardBlock(StateBlock[AgentState, str]):
         except (OSError, UnicodeError, ValidationError):
             return ""
 
-    async def render(self, state: AgentState, redact: Redactor) -> str:
+    async def render(self, state: AgentState) -> str:
         snapshot = state.current
         if snapshot is None or not (package := snapshot.ui.phone_state.get("packageName")):
             return ""

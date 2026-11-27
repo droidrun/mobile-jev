@@ -13,7 +13,6 @@ from workflows import Context
 from mobilerun_agents.agent.action_selector.llm.calls import InvalidResponse, achat
 from mobilerun_agents.agent.action_selector.llm.factory import adapter_capabilities
 from mobilerun_agents.agent.action_selector.llm.parsing import parse_native_tool_calls
-from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.memory import read_memory
 from mobilerun_agents.agent.workflows.core.state import PlanningState
 from mobilerun_agents.config.prompts import render_prompt
@@ -71,18 +70,15 @@ class LlamaIndexPlanner(Planner):
         self.config = config or AgentConfig()
         self._output_schema: dict[str, JSONValue] | None = None
         self._repair: str | None = None
-        self._redact = Redactor()
 
     def bind(
         self,
         output_schema: dict[str, JSONValue] | None,
         repair: str | None,
-        redact: Redactor,
     ) -> "LlamaIndexPlanner":
         planner = copy(self)
         planner._output_schema = output_schema
         planner._repair = repair
-        planner._redact = redact
         return planner
 
     async def plan(self, ctx: Context[PlanningState], memory: Memory) -> Plan | Finish:
@@ -134,7 +130,7 @@ class LlamaIndexPlanner(Planner):
         )
         config = self.config.decision
         error = render_prompt(config.invalid_arguments_prompt)
-        context = await read_memory(memory, ctx, self._redact)
+        context = await read_memory(memory, ctx)
         if context and context[0].role == "system":
             # Native adapters expect a single system message; planner blocks are text-only.
             system.blocks.extend(context.pop(0).blocks)

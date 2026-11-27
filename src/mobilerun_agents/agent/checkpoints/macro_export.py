@@ -5,7 +5,6 @@ from typing import Any
 
 from mobilerun.macro.models import MACRO_SCHEMA_VERSION, build_screen_snapshot
 
-from mobilerun_agents.agent.logs.redaction import MASK, Redactor
 from mobilerun_agents.agent.workflows.core.state import ActionRecord
 
 _REPLAYABLE = {
@@ -17,18 +16,6 @@ _REPLAYABLE = {
     "stop_app",
     "tap",
 }
-
-
-def _masked(value: object) -> bool:
-    match value:
-        case str():
-            return MASK in value
-        case dict():
-            return any(_masked(key) or _masked(item) for key, item in value.items())
-        case list():
-            return any(map(_masked, value))
-        case _:
-            return False
 
 
 def _primitive(record: ActionRecord) -> dict[str, Any] | None:
@@ -80,20 +67,16 @@ def _primitive(record: ActionRecord) -> dict[str, Any] | None:
     return None
 
 
-def macro_data(goal: str, records: Iterable[ActionRecord], redact: Redactor) -> dict[str, Any]:
+def macro_data(goal: str, records: Iterable[ActionRecord]) -> dict[str, Any]:
     actions = []
     for record in records:
         if not record.ok or (payload := _primitive(record)) is None:
             continue
-        # A restored checkpoint already contains markers; never replay them as arguments.
-        if redact.value(payload) != payload or _masked(payload):
-            continue
         guard = build_screen_snapshot(record.before.ui)
         has_evidence = guard["nodes"] or any(guard["phone_state"].values())
-        safe = has_evidence and redact.value(guard) == guard and not _masked(guard)
-        actions.append({**payload, "pre_state": guard if safe else None})
+        actions.append({**payload, "pre_state": guard if has_evidence else None})
     return {
-        "description": redact.text(goal),
+        "description": goal,
         "macro_schema_version": MACRO_SCHEMA_VERSION,
         "total_actions": len(actions),
         "actions": actions,

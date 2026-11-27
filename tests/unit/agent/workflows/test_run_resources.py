@@ -13,7 +13,7 @@ from mobilerun_agents.agent.workflows.resources import (
     ServicesResource,
     run_resources,
 )
-from mobilerun_agents.config.user_config import MemoryConfig
+from mobilerun_agents.config.user_config import MobileConfig
 
 
 class Again(Event):
@@ -46,8 +46,8 @@ class Probe(Workflow):
 def test_prebuilt_resources_are_injected_per_workflow_and_child():
     async def run():
         device = Mock(spec=Device)
-        first = build_executor_memory(MemoryConfig(), "android")
-        child = build_executor_memory(MemoryConfig(), "android")
+        first = build_executor_memory(MobileConfig(), "android")
+        child = build_executor_memory(MobileConfig(), "android")
         registry, images = Mock(), Mock()
         parent_services = Services(registry=registry, images=images)
         child_services = Services(registry=registry, images=images)

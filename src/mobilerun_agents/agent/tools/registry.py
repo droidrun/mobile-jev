@@ -15,14 +15,11 @@ from mobilerun.core.devices.base import Device
 from mobilerun.core.devices.components.wrapper import DeviceWrapper
 from mobilerun.core.extensions import Action
 from mobilerun.core.extensions.actions import Declaration
-from mobilerun.core.mailbox import Mailbox
-from mobilerun.core.phone_number import PhoneNumber
 from mobilerun.core.state.ui_state import UIState
 from mobilerun.utils.redaction import secret_scope
 from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 from workflows import Context
 
-from mobilerun_agents.agent.logs.redaction import Redactor, observe_vault
 from mobilerun_agents.agent.workflows.core.state import AgentState
 from mobilerun_agents.agent.workflows.core.targets import (
     ActionTarget,
@@ -67,8 +64,6 @@ DEVICE_TOOL_DENYLIST = frozenset(
 # The cloud driver forwards the base float unchanged to this integer wire field.
 # Keep the device's model-facing schema; normalize only at the cloud boundary.
 _CLOUD_INTEGER_MINIMUMS = {"swipe": {"duration_ms": 10}}
-# Base extracts a standalone run of 4–8 digits; any such run may be the code.
-_SMS_CODE = re.compile(r"(?<!\d)\d{4,8}(?!\d)")
 _ACTION_VERBS = {
     "tap": "tapped",
     "tap_element": "tapped",
@@ -148,7 +143,6 @@ async def _invoke_device(
     ui: UIState | None,
     action: Action,
     arguments: dict[str, Any],
-    redactor: Redactor,
 ) -> ActionResult:
     name = model_name(action)
     try:
@@ -179,9 +173,8 @@ async def _invoke_device(
                 result = action.validate_result(await getattr(view, name)(**validated))
         else:
             result = await view.actions.call(action.name, validated, audience="operator")
-            _protect_extension_result(view, action, result, redactor)
         if resolved is not None and result is not False:
-            summary = _target_summary(name, resolved, cached, redactor)
+            summary = _target_summary(name, resolved, cached)
         else:
             summary = f"{name} {arguments}" if arguments else name
         if result is not None:
@@ -189,27 +182,6 @@ async def _invoke_device(
         return ActionResult(result is not False, summary)
     except Exception as error:
         return ActionResult(False, tool_error_summary(error))
-
-
-def _protect_extension_result(
-    device: Device, action: Action, result: object, redactor: Redactor
-) -> None:
-    # Base declares sensitive inputs, but the mailbox and number result schemas
-    # use ordinary strings. Register these values without altering model memory.
-    extension = device.extensions.get(action.owner)
-    method = action.name.rsplit(".", 1)[-1]
-    match extension, method, result:
-        case (Mailbox() | PhoneNumber()), "wait_for_code", str() as code:
-            redactor.add(code)
-        case PhoneNumber(), "messages", _:
-            match action.serialize(result):
-                case list() as messages:
-                    for message in messages:
-                        match message:
-                            case {"body": str() as body}:
-                                redactor.add(body)
-                                for code in _SMS_CODE.findall(body):
-                                    redactor.add(code)
 
 
 def _cached_ui(*devices: Device) -> tuple[tuple[Device, UIState | None], ...]:
@@ -220,10 +192,9 @@ def _target_summary(
     name: str,
     target: ActionTarget,
     cached: tuple[tuple[Device, UIState | None], ...],
-    redactor: Redactor,
 ) -> str:
     verb = _ACTION_VERBS.get(name.rsplit("__", 1)[-1], name.replace("_", " "))
-    label = target.label(mask=redactor.text)
+    label = target.label()
     if target.index is not None:
         label = f"[{target.index}] {label}"
     elif target.node is not None:
@@ -234,7 +205,7 @@ def _target_summary(
         if current is not None and current is not previous:
             match current.phone_state.get("focusedElement"):
                 case dict() as focused if focused:
-                    return f"{summary} · focused: {element_label(focused, mask=redactor.text, focus=focused)}"
+                    return f"{summary} · focused: {element_label(focused, focus=focused)}"
     return summary
 
 
@@ -283,7 +254,6 @@ def build_registry(
     declared.append((wait.compile(), wait))
     members: list[BaseTool] = []
     seen: set[str] = set()
-    redactor = _ToolRedactor()
     device_actions = _device_entries(device, device.state._resolved_provider.capabilities)
     for action, declaration in [*((action, None) for action in device_actions), *declared]:
         name = model_name(action)
@@ -292,10 +262,8 @@ def build_registry(
         seen.add(name)
         exposed = project(action)
         if exposed is not None:
-            members.append(_route(action, exposed, declaration, output_model, device, redactor))
-    return ToolRegistry(
-        device, tool_config, decision_config or DecisionConfig(), tuple(members), redactor=redactor
-    )
+            members.append(_route(action, exposed, declaration, output_model, device))
+    return ToolRegistry(device, tool_config, decision_config or DecisionConfig(), tuple(members))
 
 
 def _route(
@@ -304,13 +272,12 @@ def _route(
     declaration: Tool | None,
     output: type[BaseModel] | None,
     device: Device,
-    redactor: Redactor,
 ) -> RegistryTool:
     async def invoke(ctx: Context[AgentState], args: dict[str, Any]) -> object:
         if declaration is None:
             state = await ctx.store.get_state()
             return await _invoke_device(
-                device, state.current.ui if state.current else None, action, args, redactor
+                device, state.current.ui if state.current else None, action, args
             )
         validated = action.validate(args)
         ui = None
@@ -322,7 +289,7 @@ def _route(
         with secret_scope(*(str(validated[key]) for key in action.sensitive_parameters)):
             result = action.validate_result(await declaration.invoke(ctx, device, validated))
         if targeted is not None:
-            summary = _target_summary(model_name(action), targeted, cached, redactor)
+            summary = _target_summary(model_name(action), targeted, cached)
             match result:
                 case None:
                     return ActionResult(True, summary)
@@ -372,19 +339,6 @@ def _route(
     )
 
 
-class _ToolRedactor(Redactor):
-    def __init__(self) -> None:
-        super().__init__()
-        self.originals: set[str] = set()
-
-    def add(self, value: object) -> None:
-        # Redactor.add recurses through containers via this same method.
-        match value:
-            case str() | int() | float() | bool() if str(value):
-                self.originals.add(str(value))
-        super().add(value)
-
-
 @dataclass(frozen=True)
 class ToolRegistry:
     """Device and custom actions with model-facing selector projections."""
@@ -394,11 +348,6 @@ class ToolRegistry:
     decision_config: DecisionConfig = field(default_factory=DecisionConfig)
     _members: tuple[BaseTool, ...] = ()
     by_name: Mapping[str, BaseTool] = field(init=False, repr=False)
-    redactor: _ToolRedactor = field(default_factory=_ToolRedactor, repr=False, compare=False)
-
-    @property
-    def protected_values(self) -> frozenset[str]:
-        return frozenset(self.redactor.originals)
 
     def __post_init__(self) -> None:
         names: dict[str, BaseTool] = {}
@@ -450,7 +399,7 @@ class ToolRegistry:
         try:
             schema.model_validate_json(json.dumps(arguments), strict=True)
         except ValidationError as error:
-            return f"Invalid arguments for {name}: {tool_error_summary(error, schema, self.redactor.add)}"
+            return f"Invalid arguments for {name}: {tool_error_summary(error, schema)}"
         except (TypeError, ValueError):
             return f"Arguments for {name} must be JSON."
         return None
@@ -479,16 +428,6 @@ class ToolRegistry:
         member = self.by_name.get(call.tool_name)
         match member:
             case RegistryTool():
-                self.protect(call)
-                with observe_vault(self.device, self.redactor):
-                    return await member.execute(ctx, call.tool_kwargs)
+                return await member.execute(ctx, call.tool_kwargs)
             case _:
                 raise ValueError(f"Unknown tool: {call.tool_name}")
-
-    def protect(self, call: ToolSelection) -> None:
-        match self.by_name.get(call.tool_name):
-            case RegistryTool(action=action) if action is not None:
-                for key in action.sensitive_parameters & call.tool_kwargs.keys():
-                    value = call.tool_kwargs[key]
-                    if value is not None and str(value):
-                        self.redactor.add(value)

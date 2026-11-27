@@ -10,6 +10,7 @@ from .agent.action_selector import (
     Selection,
     Vision,
 )
+from .agent.memory import BlockContext, StateBlock
 from .agent.operators import AgentOperator, ExternalOperator, PlanningOperator
 from .agent.planner import LlamaIndexPlanner, Planner
 from .agent.tools import Tool, ToolRegistry, tool
@@ -38,9 +39,11 @@ __all__ = [
     "Planner",
     "LlamaIndexPlanner",
     "AgentState",
+    "BlockContext",
     "Outcome",
     "PlanningState",
     "PlanningWorkflow",
+    "StateBlock",
     "ToolRegistry",
     "Tool",
     "tool",

@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from functools import partial
 
 from mobilerun.core.devices import Device
@@ -7,7 +7,9 @@ from mobilerun.models.results import ExecutionResult
 
 from mobilerun_agents.agent.action_selector import ActionSelector
 from mobilerun_agents.agent.action_selector.loader import default_setup
-from mobilerun_agents.agent.memory.memory import build_planner_memory
+from mobilerun_agents.agent.memory import BlockFactory
+from mobilerun_agents.agent.memory.memory import build_planner_memory, prepare_child_memory
+from mobilerun_agents.agent.memory.registry import NO_MEMORY_BLOCKS
 from mobilerun_agents.agent.planner import Planner
 from mobilerun_agents.agent.tools import Tool
 from mobilerun_agents.agent.workflows.core.state import PlanningState
@@ -23,10 +25,12 @@ class PlanningOperator(Operator):
         planner: Planner | None = None,
         executor: ActionSelector | None = None,
         tools: Sequence[Tool] = (),
+        memory_blocks: Mapping[str, BlockFactory] = NO_MEMORY_BLOCKS,
     ) -> None:
         self._planner = planner
         self._executor = executor
         self._tools = tuple(tools)
+        self._memory_blocks = dict(memory_blocks)
 
     async def execute(
         self,
@@ -48,6 +52,7 @@ class PlanningOperator(Operator):
                 "Pass a planner and executor or configure a planning setup as default."
             )
         state = PlanningState(executor=executor_kind(executor))
+        child_memory_factory = prepare_child_memory(config, device.platform, self._memory_blocks)
         return await execute_workflow(
             partial(
                 PlanningWorkflow,
@@ -55,7 +60,7 @@ class PlanningOperator(Operator):
                 executor,
                 config=config.agent,
                 output=output,
-                memory_config=config.memory,
+                child_memory_factory=child_memory_factory,
             ),
             config,
             device,
@@ -64,6 +69,8 @@ class PlanningOperator(Operator):
             output,
             config.agent.planning_max_steps if max_steps is None else max_steps,
             config.agent.workflow_timeout if timeout is None else timeout,
-            memory_factory=lambda _: build_planner_memory(config.memory, state),
+            memory_factory=lambda _: build_planner_memory(
+                config, state, device.platform, extra=self._memory_blocks
+            ),
             typed_completion=False,
         )

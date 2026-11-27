@@ -2,7 +2,6 @@ import pytest
 from llama_index.core.tools import ToolSelection
 from mobilerun.core.state.ui_state import UIState
 
-from mobilerun_agents.agent.logs.redaction import Redactor
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.state import ActionRecord, AgentState
 from mobilerun_agents.agent.workflows.core.targets import element_at, element_label, target
@@ -43,16 +42,6 @@ from mobilerun_agents.config.user_config import AgentConfig
 )
 def test_editable_and_password_labels_never_use_current_values(node, expected):
     assert element_label({"text": "private", "value": "private", **node}) == expected
-
-
-def test_masked_value_is_not_truncated_into_an_unredactable_prefix():
-    secret = "FAKE_VALUE_9232" + "Z" * 200
-    redactor = Redactor()
-    redactor.add(secret)
-    assert (
-        element_label({"className": "TextView", "text": secret}, mask=redactor.text)
-        == 'TextView "***"'
-    )
 
 
 def test_focus_metadata_protects_a_tree_node_with_no_editable_flag():

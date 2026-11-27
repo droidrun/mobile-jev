@@ -59,7 +59,6 @@ def _focused_input(ui: UIState, node: dict[str, Any]) -> dict[str, Any] | None:
 def element_label(
     node: dict[str, Any],
     limit: int | None = 60,
-    mask: Callable[[str], str] = str,
     focus: dict[str, Any] | None = None,
 ) -> str:
     details = node.get("details") or {}
@@ -77,7 +76,7 @@ def element_label(
         )
     label = next(
         (
-            " ".join(mask(value).split())
+            " ".join(value.split())
             for value in (
                 *(hint if editable else (node.get("text"),)),
                 *description,
@@ -104,9 +103,9 @@ class ActionTarget:
     def fields(self) -> frozenset[str]:
         return frozenset({"index"} if self.index is not None else {"x", "y"})
 
-    def label(self, limit: int | None = 60, mask: Callable[[str], str] = str) -> str:
+    def label(self, limit: int | None = 60) -> str:
         if self.node is not None:
-            return element_label(self.node, limit, mask, self.focus)
+            return element_label(self.node, limit, self.focus)
         return str(self.point)
 
     def identity(self) -> tuple[object, ...]:
@@ -141,12 +140,10 @@ def _rounded(value: object) -> int | None:
     return round(value) if type(value) is float and isfinite(value) else None
 
 
-def target(
-    record: ActionRecord, limit: int | None = 60, mask: Callable[[str], str] = str
-) -> str | None:
+def target(record: ActionRecord, limit: int | None = 60) -> str | None:
     """Return the shared label, independent of the transient index and screen fingerprint."""
     resolved = _record_target(record)
-    return resolved.label(limit, mask) if resolved is not None else None
+    return resolved.label(limit) if resolved is not None else None
 
 
 def _record_target(record: ActionRecord) -> ActionTarget | None:

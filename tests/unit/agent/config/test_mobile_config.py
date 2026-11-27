@@ -33,7 +33,7 @@ def test_old_top_level_memory_blocks_has_a_migration_message(tmp_path):
     with pytest.raises(
         OldConfigKeys, match=r"Delete memory\.blocks; list blocks under memory\.executor\.blocks"
     ):
-        MobileConfig.from_yaml(path)
+        ConfigLoader.load(str(path))
 
 
 def test_memory_block_defaults_and_custom_order():
@@ -46,29 +46,37 @@ def test_memory_block_defaults_and_custom_order():
         "last_subgoal",
         "subgoal_history",
     ]
-    assert default.executor.history == default.planner.history == 5
+    assert default.executor.options == default.planner.options == {}
 
     custom = MobileConfig.model_validate(
-        {"memory": {"executor": {"blocks": ["history", "goal"]}, "planner": {"history": 2}}}
+        {
+            "memory": {
+                "executor": {"blocks": ["history", "price_watch", "goal"]},
+                "planner": {"options": {"subgoal_history": {"subgoals": 2}}},
+            }
+        }
     ).memory
-    assert custom.executor.blocks == ["history", "goal"]
+    assert custom.executor.blocks == ["history", "price_watch", "goal"]
     assert custom.planner.blocks == default.planner.blocks
-    assert custom.planner.history == 2
+    assert custom.planner.options == {"subgoal_history": {"subgoals": 2}}
 
 
 @pytest.mark.parametrize(
-    ("agent", "block", "valid"),
-    [("executor", "findings", "last_step"), ("planner", "app_cards", "last_subgoal")],
+    ("old", "new", "value"),
+    [
+        ("executor.history", "executor.options.history.steps", "2"),
+        ("planner.history", "planner.options.subgoal_history.subgoals", "2"),
+        ("executor.last_step_screenshot", "executor.options.last_step.screenshot", "false"),
+    ],
 )
-def test_memory_rejects_block_names_unknown_to_the_agent(agent, block, valid):
-    with pytest.raises(ValidationError, match=rf"Unknown memory block '{block}'.*{valid}"):
-        MobileConfig.model_validate({"memory": {agent: {"blocks": [block]}}})
-
-
-@pytest.mark.parametrize("agent", ["executor", "planner"])
-def test_memory_history_must_be_positive(agent):
-    with pytest.raises(ValidationError, match="greater than 0"):
-        MobileConfig.model_validate({"memory": {agent: {"history": 0}}})
+def test_removed_memory_options_name_the_replacement(tmp_path, old, new, value):
+    role, key = old.split(".")
+    path = tmp_path / "agents.yaml"
+    path.write_text(f"memory: {{{role}: {{{key}: {value}}}}}\n")
+    with pytest.raises(OldConfigKeys) as error:
+        ConfigLoader.load(str(path))
+    assert f"memory.{old}" in str(error.value)
+    assert f"memory.{new}" in str(error.value)
 
 
 def test_run_budgets():
