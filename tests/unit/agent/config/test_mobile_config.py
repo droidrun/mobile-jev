@@ -5,7 +5,7 @@ from pydantic import ValidationError
 
 from mobilerun_agents.agent.action_selector.llm.models import MODELS
 from mobilerun_agents.config.loader import ConfigLoader
-from mobilerun_agents.config.user_config import PROVIDER_KINDS, MobileConfig
+from mobilerun_agents.config.user_config import PROVIDER_KINDS, MobileConfig, OldConfigKeys
 
 
 def test_llm_profiles_validate_the_same_providers_the_loader_supports():
@@ -25,6 +25,50 @@ def test_clean_config_round_trip(tmp_path):
     assert config.checkpoints.enabled
     assert config.profiles == {} and config.setups == {} and config.default_setup is None
     assert MobileConfig.model_validate(config.model_dump(mode="json")) == config
+
+
+def test_old_top_level_memory_blocks_has_a_migration_message(tmp_path):
+    path = tmp_path / "agents.yaml"
+    path.write_text("memory: {blocks: [app_cards]}\n")
+    with pytest.raises(
+        OldConfigKeys, match=r"Delete memory\.blocks; list blocks under memory\.executor\.blocks"
+    ):
+        MobileConfig.from_yaml(path)
+
+
+def test_memory_block_defaults_and_custom_order():
+    default = MobileConfig().memory
+    assert default.executor.blocks == ["setup", "goal", "last_step", "history", "app_cards"]
+    assert default.planner.blocks == [
+        "setup",
+        "goal",
+        "findings",
+        "last_subgoal",
+        "subgoal_history",
+    ]
+    assert default.executor.history == default.planner.history == 5
+
+    custom = MobileConfig.model_validate(
+        {"memory": {"executor": {"blocks": ["history", "goal"]}, "planner": {"history": 2}}}
+    ).memory
+    assert custom.executor.blocks == ["history", "goal"]
+    assert custom.planner.blocks == default.planner.blocks
+    assert custom.planner.history == 2
+
+
+@pytest.mark.parametrize(
+    ("agent", "block", "valid"),
+    [("executor", "findings", "last_step"), ("planner", "app_cards", "last_subgoal")],
+)
+def test_memory_rejects_block_names_unknown_to_the_agent(agent, block, valid):
+    with pytest.raises(ValidationError, match=rf"Unknown memory block '{block}'.*{valid}"):
+        MobileConfig.model_validate({"memory": {agent: {"blocks": [block]}}})
+
+
+@pytest.mark.parametrize("agent", ["executor", "planner"])
+def test_memory_history_must_be_positive(agent):
+    with pytest.raises(ValidationError, match="greater than 0"):
+        MobileConfig.model_validate({"memory": {agent: {"history": 0}}})
 
 
 def test_run_budgets():

@@ -1,0 +1,21 @@
+Latest executor subgoal result: {{ status }}: {{ result.subgoal }}{% if result.message %}: {{ result.message }}{% endif %}
+
+{% if before is not none and after is not none %}
+Screen: {{ before[0] or 'unknown' }}/{{ before[1] or 'unknown' }} → {{ after[0] or 'unknown' }}/{{ after[1] or 'unknown' }} ({{ 'change unknown' if result.screen_changed is none else 'changed' if result.screen_changed else 'unchanged' }})
+{% endif %}
+{% set abstention = result.jev_abstention %}
+{% if abstention %}
+Jev ended the subgoal unfinished and handed it back without acting.
+{% if abstention.choice == 'abstain' %}
+It chose 'unfinished'.
+{% else %}
+Its proposed option or target scored below the cutoff.
+{% endif %}
+Jev choice: {{ abstention.choice }} · confidence: {{ abstention.confidence }}{% if abstention.target_confidence is not none %} · target confidence: {{ abstention.target_confidence }}{% endif %} · cutoff: {{ abstention.cutoff }}
+{% if abstention.thought %}Jev thought: {{ abstention.thought }}
+{% endif %}jev choices: {{ abstention.choices }}
+{% endif %}
+{{ summary or ('Reason: ' ~ result.reason) }}
+{% if plan %}
+Remaining plan: {{ plan | tojson }}
+{% endif %}

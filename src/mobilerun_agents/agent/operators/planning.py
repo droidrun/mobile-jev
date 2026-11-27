@@ -7,9 +7,11 @@ from mobilerun.models.results import ExecutionResult
 
 from mobilerun_agents.agent.action_selector import ActionSelector
 from mobilerun_agents.agent.action_selector.loader import default_setup
+from mobilerun_agents.agent.memory.memory import build_planner_memory
 from mobilerun_agents.agent.planner import Planner
 from mobilerun_agents.agent.tools import Tool
-from mobilerun_agents.agent.workflows.planning import PlanningWorkflow
+from mobilerun_agents.agent.workflows.core.state import PlanningState
+from mobilerun_agents.agent.workflows.planning import PlanningWorkflow, executor_kind
 from mobilerun_agents.config.loader import ConfigLoader
 
 from .consumers import T, execute_workflow
@@ -45,6 +47,7 @@ class PlanningOperator(Operator):
             raise ValueError(
                 "Pass a planner and executor or configure a planning setup as default."
             )
+        state = PlanningState(executor=executor_kind(executor))
         return await execute_workflow(
             partial(
                 PlanningWorkflow,
@@ -61,5 +64,6 @@ class PlanningOperator(Operator):
             output,
             config.agent.planning_max_steps if max_steps is None else max_steps,
             config.agent.workflow_timeout if timeout is None else timeout,
+            memory_factory=lambda _: build_planner_memory(config.memory, state),
             typed_completion=False,
         )

@@ -52,7 +52,7 @@ Export a no-argument subclass of `mobilerun.core.operator.Operator`, or an alrea
 
 ## Saved data and diagnostics
 
-The agent uses four workflow steps: observe → select → act → finish. Planning uses three: observe → plan → execute a child agent, with a fresh memory for each child. The workflow context holds the run state. The device, LlamaIndex memory, tool registry and image store are live resources, not checkpoint data.
+The agent uses four workflow steps: observe → select → act → finish. Planning uses three: observe → plan → execute a child agent, with one planner memory per run and a fresh executor memory for each child. Blocks render from workflow state, not chat history. The device, LlamaIndex memory, tool registry and image store are live resources, not checkpoint data.
 
 Each planner turn and executor action costs one step. Override the total with `PlanningOperator.execute(max_steps=...)`. The run stops when the budget runs out. If the planner takes the last step, it must call `complete` and report what blocked it if the goal is unfinished.
 

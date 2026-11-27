@@ -2,7 +2,9 @@
 
 **Purpose:** Decide the next subgoals or finish the overall run.
 
-**What belongs here / what doesn't:** Planners read `Context[PlanningState]` and return a decision. They do not execute actions or write workflow state. `LlamaIndexPlanner` requires a `set_plan` or `complete` tool call. The planner sees the executor setup and full current UI, even when the child reported a result. Vision-capable models also get the current screenshot if available. Failed or unfinished children include recent thoughts, action results, screen visits, and observed blockers. When Jev hands back an unfinished subgoal, the planner also sees the raw choice and confidence details.
+**What belongs here / what doesn't:** Planners receive `Context[PlanningState]` and run-scoped LlamaIndex `Memory` and return a decision. They do not execute actions or write workflow state. `LlamaIndexPlanner` requires a `set_plan` or `complete` tool call. It sends system instructions, memory, then a step message with the full current UI and device context. Vision-capable models also get the current screenshot if available.
+
+`memory.planner.blocks` selects and orders setup, goal, findings, the last subgoal, and older subgoal history. The latest subgoal includes the before and after app/activity, failure evidence, and any raw Jev abstention data. Older entries are capped by `memory.planner.history` (default 5) and dropped oldest first under token pressure. The planner stores no chat history. When restoring a checkpoint, rebuild memory using the restored state's executor kind; each read renders from persisted state.
 
 Planner turns and executor actions each use one step from the same budget. If only one step remains when the planner is called, it must call `complete` and report any blocker instead of setting another plan.
 

@@ -6,7 +6,7 @@ from abc import abstractmethod
 from typing import Any
 from uuid import uuid4
 
-from llama_index.core.base.llms.types import ChatMessage, ChatResponse, ImageBlock
+from llama_index.core.base.llms.types import ChatMessage, ChatResponse, ImageBlock, TextBlock
 from llama_index.core.memory import Memory
 from llama_index.core.tools import ToolSelection
 from mobilerun.core.devices import Device
@@ -20,7 +20,7 @@ from mobilerun_agents.agent.action_selector.base import (
     screenshot_bytes,
 )
 from mobilerun_agents.agent.logs.memory import report_memory
-from mobilerun_agents.agent.memory.messages import text_messages
+from mobilerun_agents.agent.memory import read_memory
 from mobilerun_agents.agent.tools.helpers import visual_tool_names
 from mobilerun_agents.agent.tools.registry import ToolRegistry
 from mobilerun_agents.agent.workflows.core.state import AgentState
@@ -109,23 +109,40 @@ class LLMSelector(ActionSelector):
                 height=image.height,
                 normalized=image.normalized,
             )
-        text = render_prompt(decision.llm_request_prompt, state=screen)
+        text = render_prompt(
+            decision.llm_request_prompt,
+            state=screen,
+            device_context=snapshot.model_dump(mode="json", include={"device_context"})[
+                "device_context"
+            ],
+            repair=state.repair,
+        )
         text = text or "Current screen unavailable."
         if previous := previous_action_feedback(state):
             text = f"{previous}\n{text}"
         user = ChatMessage(role="user", content=text)
         if image.data:
             user.blocks.append(ImageBlock(image=image.data))
-        raw_history = await memory.aget(snapshot=snapshot, state=state)
-        history = raw_history
-        if not self.supports_native_tool_calls or self.native_tool_api == "gemini":
-            # Synthetic tool calls have no Gemini-issued thought signatures.
-            history = text_messages(history)
-        report_memory(ctx, state, memory, raw_history, history, selector="llm")
+        context = await read_memory(memory, ctx, registry.redactor)
+        if self.vision == "off":
+            context = [
+                ChatMessage(role=message.role, content=message.content) for message in context
+            ]
+        report_memory(ctx, memory, context, selector="llm")
         system_message = ChatMessage(role="system", content=system)
-        if history and history[0].role == "system":
-            system_message.blocks.extend(history[0].blocks)
-            history = history[1:]
+        if context and context[0].role == "system":
+            # Native adapters expect a single textual system message. Prior-screen
+            # images must stay in user content, before the current observation.
+            images = []
+            for block in context[0].blocks:
+                match block:
+                    case TextBlock():
+                        system_message.blocks.append(block)
+                    case ImageBlock():
+                        images.append(block)
+            context = context[1:]
+            if images:
+                context.insert(0, ChatMessage(role="user", blocks=images))
         kwargs: dict[str, Any] = {
             "stream": config.streaming,
             "timeout": decision.timeout,
@@ -137,7 +154,7 @@ class LLMSelector(ActionSelector):
                 allow_parallel_tool_calls=config.parallel_tools,
                 tool_required=self.native_tool_api == "responses",
             )
-        response = await self._achat([system_message, *history, user], **kwargs)
+        response = await self._achat([system_message, *context, user], **kwargs)
         if response is None:
             return Selection()
         parsed = self._parse(response)

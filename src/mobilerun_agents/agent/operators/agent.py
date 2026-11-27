@@ -7,6 +7,7 @@ from mobilerun.models.results import ExecutionResult
 
 from mobilerun_agents.agent.action_selector import ActionSelector
 from mobilerun_agents.agent.action_selector.loader import default_setup
+from mobilerun_agents.agent.memory.memory import build_executor_memory
 from mobilerun_agents.agent.tools import Tool
 from mobilerun_agents.agent.workflows.agent import AgentWorkflow
 from mobilerun_agents.config.loader import ConfigLoader
@@ -44,4 +45,7 @@ class AgentOperator(Operator):
             output,
             config.agent.max_steps if max_steps is None else max_steps,
             config.agent.workflow_timeout if timeout is None else timeout,
+            memory_factory=lambda _: build_executor_memory(
+                config.memory, device.platform, config.agent
+            ),
         )

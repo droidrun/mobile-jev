@@ -11,6 +11,8 @@ from workflows.events import StartEvent, StopEvent
 
 from mobilerun_agents.agent.checkpoints.store import save_context
 from mobilerun_agents.agent.logs.redaction import Redactor
+from mobilerun_agents.agent.memory import read_memory
+from mobilerun_agents.agent.memory.memory import build_planner_memory
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.state import (
     ActionRecord,
@@ -20,6 +22,7 @@ from mobilerun_agents.agent.workflows.core.state import (
     PlanningState,
     SubgoalResult,
 )
+from mobilerun_agents.config.user_config import MemoryConfig
 
 
 class AgentProbe(Workflow):
@@ -116,6 +119,9 @@ def test_native_context_round_trip(tmp_path):
                     subgoal="tap",
                     success=True,
                     reason="complete",
+                    before_screen=("shop", "List"),
+                    after_screen=("shop", "Detail"),
+                    screen_changed=True,
                     jev_abstention=JevAbstention(
                         choice="fixture-protected-value",
                         confidence=None,
@@ -162,5 +168,21 @@ def test_native_context_round_trip(tmp_path):
             (1, "call_7"),
             (4, "call_8"),
         ]
+
+        async def render_memory(context, state):
+            memory = build_planner_memory(MemoryConfig(), state)
+            try:
+                return (await read_memory(memory, context, redactor))[0].content
+            finally:
+                await memory.aclose()
+
+        # Compare the original state to a fresh memory over the restored state;
+        # only the separately tested protected fields are expected to differ.
+        before = await render_memory(ctx, plan)
+        after = await render_memory(restored_plan, restored_state)
+        assert redactor.text(before) == after
+        assert 'Findings and notes: ["First child reached the target"]' in after
+        assert "Latest executor subgoal result: Succeeded: tap" in after
+        assert "Screen: shop/List → shop/Detail (changed)" in after
 
     asyncio.run(check())

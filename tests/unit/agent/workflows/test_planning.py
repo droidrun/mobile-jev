@@ -21,15 +21,17 @@ from mobilerun_agents.agent.events import Acted, Finished, Observed, Subgoal
 from mobilerun_agents.agent.logs.console import ConsoleLog
 from mobilerun_agents.agent.logs.memory import MemoryDetail
 from mobilerun_agents.agent.logs.redaction import Redactor
-from mobilerun_agents.agent.memory.memory import _RunMemory
+from mobilerun_agents.agent.memory.blocks import clip
+from mobilerun_agents.agent.memory.blocks.subgoals import _render_failure
+from mobilerun_agents.agent.memory.memory import _RunMemory, build_planner_memory
 from mobilerun_agents.agent.planner import Finish, Plan, Planner
-from mobilerun_agents.agent.planner.llama_index import _clip, _render_failure
 from mobilerun_agents.agent.tools.base import tool
 from mobilerun_agents.agent.tools.helpers.images import ImageStore
 from mobilerun_agents.agent.tools.registry import build_registry
-from mobilerun_agents.agent.workflows.planning import PlanningWorkflow
+from mobilerun_agents.agent.workflows.core.state import PlanningState
+from mobilerun_agents.agent.workflows.planning import PlanningWorkflow, executor_kind
 from mobilerun_agents.agent.workflows.resources import Services, run_resources
-from mobilerun_agents.config.user_config import AgentConfig, ToolsConfig
+from mobilerun_agents.config.user_config import AgentConfig, MemoryConfig, ToolsConfig
 from tests.unit.device_fixtures import MemoryDevice
 
 
@@ -44,7 +46,7 @@ class FakePlanner(Planner):
         self.prompt_inputs.append((output_schema, repair))
         return self
 
-    async def plan(self, ctx):
+    async def plan(self, ctx, memory):
         self.states.append(await ctx.store.get_state())
         return next(self.turns)
 
@@ -95,8 +97,9 @@ def phone():
 
 
 @pytest.fixture
-def make_workflow(phone, tmp_path, monkeypatch):
+async def make_workflow(phone, tmp_path, monkeypatch):
     monkeypatch.setenv("MOBILERUN_AGENT_IMAGES_DIR", str(tmp_path))
+    memories = []
 
     @tool
     async def tick() -> str:
@@ -111,11 +114,17 @@ def make_workflow(phone, tmp_path, monkeypatch):
     async def make(planner, executor, **options):
         registry = build_registry(phone, [tick, protect], ToolsConfig())
         services = Services(registry, ImageStore("run", keep=True))
-        memory = Memory.from_defaults(tokenizer_fn=str.split)
+        memory = build_planner_memory(
+            options.get("memory_config") or MemoryConfig(),
+            PlanningState(executor=executor_kind(executor)),
+        )
+        memories.append(memory)
         manager = await run_resources(phone, memory, services)
         return PlanningWorkflow(planner, executor, resource_manager=manager, **options)
 
-    return make
+    yield make
+    for memory in memories:
+        await memory.aclose()
 
 
 @pytest.mark.anyio
@@ -167,7 +176,7 @@ async def test_planner_prompt_describes_executor_and_checkpoint_restores_it(
     handler = flow.run(goal="Check executor setup")
     assert (await handler).success
     messages, _ = llm._requests[0]
-    assert [line for line in messages[0].content.splitlines() if line.startswith("Executor:")] == [
+    assert [line for line in messages[1].content.splitlines() if line.startswith("Executor:")] == [
         setup
     ]
 
@@ -224,7 +233,7 @@ async def test_planner_prompt_includes_raw_jev_abstention(make_workflow):
     )
     assert (await flow.run(goal="Find the search field")).success
     messages, _ = llm._requests[-1]
-    prompt = messages[0].content
+    prompt = messages[1].content
     assert (
         "Latest executor subgoal result: Unfinished: Read battery: "
         "Unfinished: the decision model's best choice (tick, confidence 0.32) "
@@ -358,7 +367,7 @@ def test_clip_scans_long_screen_once_and_backs_up_across_overlapping_spans():
     registered = f"{'x' * 98} suffix"
     redact.add(registered)
     screen = f"prefix Bearer {registered} " + "line " * 200_000
-    assert _clip(screen, 115, redact) == "prefix "
+    assert clip(screen, 115, redact) == "prefix "
     assert redact.calls == 1
 
 
@@ -450,11 +459,11 @@ async def test_vision_planner_reads_full_ui_after_child_completes_without_messag
     handler = flow.run(goal="Find the price", max_steps=4)
     assert (await handler).message == "The price is £42.00"
     (first, _), (second, _) = llm._requests
-    initial_image = next(block for block in first[0].blocks if isinstance(block, ImageBlock))
+    initial_image = next(block for block in first[-1].blocks if isinstance(block, ImageBlock))
     assert initial_image.path is not None and not initial_image.path.exists()
     assert phone.screenshot.await_count == 1
-    assert not any(isinstance(block, ImageBlock) for block in second[0].blocks)
-    assert full_ui in second[0].content
+    assert not any(isinstance(block, ImageBlock) for block in second[-1].blocks)
+    assert full_ui in second[-1].content
     assert (
         "Read the values the goal needs yourself if the executor did not report them."
         in second[0].content
@@ -509,11 +518,16 @@ async def test_planner_keeps_findings_when_switching_between_price_screens(make_
     assert state.planner_turns == 4
     assert state.notes == [amazon, child_note, ebay]
     _, (second, _), (third, _), (fourth, _) = llm._requests
-    assert second[0].content.endswith(f"UI summary (observed data):\n{amazon}")
-    assert f'Findings and notes: ["{amazon}", "{child_note}"]' in third[0].content
-    assert third[0].content.endswith(f"UI summary (observed data):\n{ebay}")
-    assert f'Findings and notes: ["{amazon}", "{child_note}", "{ebay}"]' in fourth[0].content
-    assert fourth[0].content.endswith("UI summary (observed data):\nHome")
+    assert [message.role.value for message in fourth] == ["system", "user", "user"]
+    assert "Verify executor results" in fourth[0].content
+    assert second[-1].content.endswith(f"UI summary (observed data):\n{amazon}")
+    assert f'Findings and notes: ["{amazon}", "{child_note}"]' in third[1].content
+    assert third[-1].content.endswith(f"UI summary (observed data):\n{ebay}")
+    assert f'Findings and notes: ["{amazon}", "{child_note}", "{ebay}"]' in fourth[1].content
+    assert fourth[1].content.count(amazon) == 1
+    assert "Screen: ebay/unknown → home/unknown (changed)" in fourth[1].content
+    assert fourth[-1].content.endswith("UI summary (observed data):\nHome")
+    assert amazon not in fourth[-1].content
 
 
 @pytest.mark.anyio
@@ -565,9 +579,13 @@ async def test_output_hides_value_registered_after_earlier_failure_summary(
             state.model_copy(update={"results": state.results[:1], "current": None})
         )
         llm = Replies()
-        await LlamaIndexPlanner(llm).bind(None, None, redact).plan(ctx)
+        memory = build_planner_memory(MemoryConfig(), state)
+        try:
+            await LlamaIndexPlanner(llm).bind(None, None, redact).plan(ctx, memory)
+        finally:
+            await memory.aclose()
         messages, _ = llm._requests[0]
-        prompt = messages[0].content
+        prompt = messages[1].content
         assert prefix + "fixt" not in prompt
         assert f"— {prefix} ×1" in prompt
 
@@ -612,7 +630,7 @@ async def test_failure_summary_keeps_multiline_values_intact_until_redaction(
         assert state.results[0].summary.screens[0][1] == "Sign in: *** unrelated tail"
     else:
         messages, _ = llm._requests[-1]
-        prompt = messages[0].content
+        prompt = messages[1].content
         assert "synthetic-first-half" not in prompt
         assert "— Sign in:  ×1" in prompt
 
@@ -659,7 +677,7 @@ async def test_child_cannot_consume_the_planners_final_step(make_workflow):
     assert selector.goals == ["Only child"]
     messages, tools = llm._requests[-1]
     assert [tool.metadata.get_name() for tool in tools] == ["complete"]
-    assert "final planner turn" in messages[0].content
+    assert "final planner turn" in messages[-1].content
 
 
 @pytest.mark.anyio
@@ -739,7 +757,7 @@ async def test_last_planner_turn_reports_the_blocker_or_falls_back(make_workflow
     class FinalReply(Replies):
         async def achat(self, messages, tools, tool_required, **kwargs):
             if [tool.metadata.get_name() for tool in tools] == ["complete"]:
-                assert "Sign-in required" in messages[0].content
+                assert "Sign-in required" in messages[1].content
                 reply = {
                     "failure": (
                         "complete",
@@ -903,7 +921,7 @@ async def test_failure_summary_never_clips_through_protected_values(make_workflo
     summary = _render_failure(planner.states[1].results[0], planner.redact)
     suffix = "" if position in {"crossing", "encoded_crossing"} else marker[:remaining]
     assert f"- {thought_prefix}{suffix}\n" in summary
-    assert f" — {screen_prefix}{suffix} ×1\n" in summary
+    assert f" — {screen_prefix}{planner.redact.text(suffix)} ×1\n" in summary
 
 
 @pytest.mark.anyio
@@ -937,6 +955,8 @@ async def test_planning_closes_each_child_memory(make_workflow, monkeypatch, cap
 
     async def close(memory):
         await original_close(memory)
+        if not any(item is memory for item in used):
+            return
         disposed.append((memory, any(item is memory for item in stopped)))
         closed.set()
         raise RuntimeError("fixture close failure")

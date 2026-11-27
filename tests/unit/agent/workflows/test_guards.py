@@ -6,7 +6,8 @@ import pytest
 from llama_index.core.tools import ToolSelection
 from mobilerun.core.state.ui_state import UIState
 
-from mobilerun_agents.agent.memory.blocks.repeat import RepeatBlock
+from mobilerun_agents.agent.logs.redaction import Redactor
+from mobilerun_agents.agent.memory.blocks.history import HistoryBlock
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.state import ActionRecord, AgentState
 from mobilerun_agents.agent.workflows.guards import Stop, check
@@ -100,12 +101,12 @@ async def test_zip_sheet_repeat_ignores_carousel_changes(variation):
         )
         state.current = after
         assert state.actions[-1].screen_changed is True
-        hints = await RepeatBlock(config=config).aget(snapshot=after, state=state)
+        hints = await HistoryBlock(config=config).render(state, Redactor())
         if variation in {"same", "index"} and step >= 3:
             assert (
-                hints
-                == warning.replace("3×", f"{step}×")
+                warning.replace("3×", f"{step}×")
                 + " — it isn't working; try a different element or action"
+                in hints
             )
         else:
             assert "repeated" not in hints
@@ -202,9 +203,7 @@ async def test_progress_note_and_guard_count_the_same_history(
         threshold = "cycle_fail_after"
         pattern = r"been on this screen (\d+) times"
 
-    hints = await RepeatBlock(config=AgentConfig(**common)).aget(
-        snapshot=state.current, state=state
-    )
+    hints = await HistoryBlock(config=AgentConfig(**common)).render(state, Redactor())
     match = re.search(pattern, hints)
     note_count = int(match[1]) if match else 0
     guard_count = max(
@@ -230,4 +229,4 @@ async def test_default_progress_note_precedes_stop(screens, calls_per_step, note
     state = _history(screens, calls_per_step)
     config = AgentConfig()
     assert check(state, config) is None
-    assert note in await RepeatBlock(config=config).aget(snapshot=state.current, state=state)
+    assert note in await HistoryBlock(config=config).render(state, Redactor())

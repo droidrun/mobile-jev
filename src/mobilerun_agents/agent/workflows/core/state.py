@@ -43,6 +43,7 @@ class AgentState(BaseModel):
     current: StepSnapshot | None = None
     max_steps: int = DEFAULT_MAX_STEPS
     repairs: int = 0
+    repair: str | None = None
     retry_with_delegate: bool = False
     delegate_intent: str = ""
     outcome: Outcome | None = None
@@ -62,6 +63,9 @@ class SubgoalResult(BaseModel):
     reason: str
     summary: FailureSummary | None = None
     jev_abstention: JevAbstention | None = None
+    before_screen: tuple[str | None, str | None] | None = None
+    after_screen: tuple[str | None, str | None] | None = None
+    screen_changed: bool | None = None
 
 
 class PlanningState(BaseModel):

@@ -14,6 +14,8 @@ from mobilerun_agents.agent.action_selector.decision_model.base import (
 )
 from mobilerun_agents.agent.action_selector.decision_model.typesafe import TypeSafeDecisionModel
 from mobilerun_agents.agent.action_selector.llm.parsing import ToolCall
+from mobilerun_agents.agent.logs.redaction import Redactor
+from mobilerun_agents.agent.memory.blocks.subgoals import LastSubgoalBlock
 from mobilerun_agents.agent.workflows.core.state import JevAbstention, PlanningState, SubgoalResult
 from mobilerun_agents.config.prompts import render_prompt
 from mobilerun_agents.config.user_config import DecisionConfig
@@ -111,10 +113,12 @@ def test_decision_criteria_distinguish_unfinished_from_completion(kind, expected
         ("tap search", 0.84, 0.2, "Its proposed option or target scored below the cutoff."),
     ],
 )
-def test_planner_turn_explains_jev_abstention(choice, confidence, target_confidence, explanation):
-    prompt = render_prompt(
-        "assets/prompts/planning/turn.jinja2",
-        state=PlanningState(
+@pytest.mark.anyio
+async def test_planner_turn_explains_jev_abstention(
+    choice, confidence, target_confidence, explanation
+):
+    prompt = await LastSubgoalBlock().render(
+        PlanningState(
             goal="Find a book",
             results=[
                 SubgoalResult(
@@ -133,12 +137,7 @@ def test_planner_turn_explains_jev_abstention(choice, confidence, target_confide
                 )
             ],
         ),
-        repair=None,
-        last_turn=False,
-        summary="",
-        package=None,
-        activity=None,
-        ui="Search field",
+        Redactor(),
     )
 
     assert "Latest executor subgoal result: Unfinished: Search for the book:" in prompt

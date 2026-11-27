@@ -3,7 +3,7 @@
 import asyncio
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Protocol, TypeVar
 from uuid import uuid4
@@ -24,7 +24,7 @@ from mobilerun_agents.agent.checkpoints.macro_export import macro_data
 from mobilerun_agents.agent.checkpoints.store import save_context, save_macro
 from mobilerun_agents.agent.events import Acted, Finished, Observed, Subgoal
 from mobilerun_agents.agent.logs import ConsoleLog
-from mobilerun_agents.agent.memory.memory import build_run_memory
+from mobilerun_agents.agent.memory.memory import _RunMemory
 from mobilerun_agents.agent.tools import Tool
 from mobilerun_agents.agent.tools.helpers.images import ImageStore
 from mobilerun_agents.agent.tools.registry import ToolRegistry, build_registry
@@ -51,6 +51,7 @@ async def execute_workflow(
     output: type[T] | None,
     max_steps: int,
     timeout: float | None,
+    memory_factory: Callable[[ToolRegistry], _RunMemory],
     typed_completion: bool = True,
 ) -> ExecutionResult[T]:
     run_id = uuid4().hex
@@ -59,7 +60,7 @@ async def execute_workflow(
         registry = build_registry(
             device, tools, config.tools, output if typed_completion else None, config.agent.decision
         )
-        memory = build_run_memory(config.memory, device.platform, config.agent)
+        memory = memory_factory(registry)
         try:
             manager = await run_resources(device, memory, Services(registry, images))
             workflow = factory(timeout=timeout, resource_manager=manager)

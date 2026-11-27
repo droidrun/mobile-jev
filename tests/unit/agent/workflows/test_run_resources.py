@@ -5,7 +5,7 @@ from mobilerun.core.devices import Device
 from workflows import Workflow, step
 from workflows.events import Event, StartEvent, StopEvent
 
-from mobilerun_agents.agent.memory.memory import build_run_memory
+from mobilerun_agents.agent.memory.memory import build_executor_memory
 from mobilerun_agents.agent.workflows.resources import (
     DeviceResource,
     MemoryResource,
@@ -46,8 +46,8 @@ class Probe(Workflow):
 def test_prebuilt_resources_are_injected_per_workflow_and_child():
     async def run():
         device = Mock(spec=Device)
-        first = build_run_memory(MemoryConfig(), "android")
-        child = build_run_memory(MemoryConfig(), "android")
+        first = build_executor_memory(MemoryConfig(), "android")
+        child = build_executor_memory(MemoryConfig(), "android")
         registry, images = Mock(), Mock()
         parent_services = Services(registry=registry, images=images)
         child_services = Services(registry=registry, images=images)

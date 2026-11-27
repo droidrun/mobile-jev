@@ -1,12 +1,17 @@
+import re
 from io import BytesIO
 
 import pytest
 from llama_index.core.base.llms.types import TextBlock, ToolCallBlock
 from llama_index.core.llms import ChatMessage, ChatResponse, ImageBlock
 from llama_index.core.memory.memory import DEFAULT_MEMORY_BLOCKS_TEMPLATE
+from llama_index.core.tools import ToolSelection
+from mobilerun.core.state.ui_state import UIState
+from mobilerun.models.context import ContextItem
 from PIL import Image
 
 from mobilerun_agents.agent.action_selector import DecisionSelector
+from mobilerun_agents.agent.action_selector.base import NativeToolAPI
 from mobilerun_agents.agent.action_selector.decision_model.base import Decision
 from mobilerun_agents.agent.action_selector.decision_model.images import prepare_image
 from mobilerun_agents.agent.action_selector.llm.base import LLMSelector
@@ -14,7 +19,10 @@ from mobilerun_agents.agent.action_selector.llm.calls import InvalidResponse
 from mobilerun_agents.agent.events import Detail, Observed
 from mobilerun_agents.agent.logs import ConsoleLog
 from mobilerun_agents.agent.logs.redaction import Redactor
-from mobilerun_agents.config.user_config import DecisionConfig
+from mobilerun_agents.agent.memory.memory import build_executor_memory
+from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
+from mobilerun_agents.agent.workflows.core.state import ActionRecord
+from mobilerun_agents.config.user_config import DecisionConfig, MemoryConfig
 from tests.unit.agent.action_selector.fixtures import Turn
 from tests.unit.device_fixtures import fake_tools
 
@@ -24,6 +32,55 @@ def image():
     stream = BytesIO()
     Image.new("RGB", (100, 200)).save(stream, "PNG")
     return stream.getvalue()
+
+
+@pytest.mark.anyio
+async def test_executor_request_renders_default_memory_order():
+    class Chat(LLMSelector):
+        async def _achat(self, messages, **kwargs):
+            system, memory, step = messages
+            assert [message.role for message in messages] == ["system", "user", "user"]
+            assert "Mobilerun" in system.content
+            assert re.findall(r"^<(\w+)>$", memory.content, re.M) == [
+                "memory",
+                "setup",
+                "goal",
+                "last_step",
+                "history",
+                "app_cards",
+            ]
+            assert "Inbox (current observation)" not in memory.content
+            assert "Inbox (current observation)" in step.content
+            return ChatResponse(
+                message=ChatMessage(
+                    role="assistant",
+                    content=('<function_calls><invoke name="wait"></invoke></function_calls>'),
+                )
+            )
+
+    phone = {"packageName": "com.google.android.gm", "activityName": "Inbox"}
+    turn = Turn(
+        goal="Find order",
+        tools=fake_tools("wait"),
+        ui=UIState([], "Inbox (current observation)", "", phone, 100, 200),
+    )
+    before = StepSnapshot(ui=UIState([], "Previous inbox", "", phone, 100, 200))
+    turn.state.actions = [
+        ActionRecord(
+            step=step,
+            call=ToolSelection(tool_id=str(step), tool_name="wait", tool_kwargs={}),
+            ok=True,
+            summary="Waited",
+            before=before,
+            screen_changed=True,
+        )
+        for step in (1, 2)
+    ]
+    turn.memory = build_executor_memory(MemoryConfig(), "android")
+    try:
+        assert (await turn.select(Chat("off"))).calls[0].tool_name == "wait"
+    finally:
+        await turn.memory.aclose()
 
 
 @pytest.mark.parametrize(
@@ -42,6 +99,8 @@ async def test_jev_builds_request_from_observation_registry_and_memory(
             assert request.screenshot == (image if has_image else None)
             assert request.goal == "Use battery"
             assert request.memory == "checked settings"
+            assert "retry here" in request.previous_action
+            assert "63" in request.previous_action
             assert ("tap_element" in request.registry) is has_tree
             assert ("tap" in request.registry) is has_image
             return Decision(
@@ -56,9 +115,21 @@ async def test_jev_builds_request_from_observation_registry_and_memory(
         screenshot=image,
         elements=[{"index": 1}],
     )
-    turn.memory.aget.return_value = [ChatMessage(role="assistant", content="checked settings")]
+    turn.state.repair = "retry here"
+    turn.state.current.device_context = [
+        ContextItem(source="battery", kind="status", data={"level": 63})
+    ]
+    turn.memory.aget.return_value = [
+        ChatMessage(
+            role="user",
+            blocks=[
+                TextBlock(text="checked settings"),
+                ImageBlock(image=image),
+            ],
+        )
+    ]
     result = await turn.select(DecisionSelector(Model(), vision=vision))
-    turn.memory.aget.assert_awaited_once_with(snapshot=turn.state.current, state=turn.state)
+    turn.memory.aget.assert_awaited_once_with(state=turn.state, redact=turn.registry.redactor)
     assert result.calls[0].tool_name == "wait"
 
 
@@ -73,6 +144,10 @@ async def test_llm_uses_vision_specific_inputs_and_tools(vision, tool, has_image
             assert any(isinstance(block, ImageBlock) for block in messages[-1].blocks) is has_image
             assert ("screen" in messages[-1].content) is (vision != "only") or has_image
             assert messages[-2].content == "checked settings"
+            assert [message.role for message in messages] == ["system", "user", "user"]
+            assert "retry here" in messages[-1].content
+            assert "63" in messages[-1].content
+            assert any(isinstance(block, ImageBlock) for block in messages[-2].blocks) is has_image
             args = (
                 '<parameter name="index">1</parameter>'
                 if tool == "tap_element"
@@ -84,10 +159,65 @@ async def test_llm_uses_vision_specific_inputs_and_tools(vision, tool, has_image
     turn = Turn(
         tools=fake_tools("tap", "tap_element", "wait"), screenshot=image, elements=[{"index": 1}]
     )
-    turn.memory.aget.return_value = [ChatMessage(role="assistant", content="checked settings")]
+    turn.state.repair = "retry here"
+    turn.state.current.device_context = [
+        ContextItem(source="battery", kind="status", data={"level": 63})
+    ]
+    turn.memory.aget.return_value = [
+        ChatMessage(
+            role="user",
+            blocks=[
+                TextBlock(text="checked settings"),
+                ImageBlock(image=image),
+            ],
+        )
+    ]
     result = await turn.select(Chat(vision))
-    turn.memory.aget.assert_awaited_once_with(snapshot=turn.state.current, state=turn.state)
+    turn.memory.aget.assert_awaited_once_with(state=turn.state, redact=turn.registry.redactor)
     assert result.calls[0].tool_name == tool
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("api", ["responses", "chat_completions", "anthropic", "gemini"])
+async def test_native_requests_keep_system_text_and_prior_image_in_supported_roles(api, image):
+    class Chat(LLMSelector):
+        @property
+        def supports_native_tool_calls(self) -> bool:
+            return True
+
+        @property
+        def native_tool_api(self) -> NativeToolAPI:
+            return api
+
+        async def _achat(self, messages, **kwargs):
+            system, memory, step = messages
+            assert [message.role for message in messages] == ["system", "user", "user"]
+            assert "previous action" in system.content
+            assert all(isinstance(block, TextBlock) for block in system.blocks)
+            assert memory.blocks == [previous_image]
+            assert step.content and any(isinstance(block, ImageBlock) for block in step.blocks)
+            assert kwargs["tool_required"] is (api == "responses")
+            return ChatResponse(
+                message=ChatMessage(
+                    role="assistant",
+                    blocks=[
+                        ToolCallBlock(tool_name="wait", tool_call_id="reply", tool_kwargs={}),
+                    ],
+                )
+            )
+
+    previous_image = ImageBlock(image=image)
+    turn = Turn(tools=fake_tools("wait"), screenshot=image)
+    turn.memory.aget.return_value = [
+        ChatMessage(
+            role="system",
+            blocks=[
+                TextBlock(text="previous action"),
+                previous_image,
+            ],
+        )
+    ]
+    assert (await turn.select(Chat())).calls[0].tool_name == "wait"
 
 
 @pytest.mark.anyio
@@ -125,7 +255,7 @@ async def test_selector_reports_only_debug_memory(kind, level, caplog, tmp_path)
             return None
 
     class DiagnosticMemory:
-        memory_blocks = [type("Notes", (), {"name": "notes"})()]
+        memory_blocks = [type("Goal", (), {"name": "goal"})()]
         token_limit = 24000
         estimated = False
 
@@ -137,25 +267,8 @@ async def test_selector_reports_only_debug_memory(kind, level, caplog, tmp_path)
             return 1900
 
     history = DEFAULT_MEMORY_BLOCKS_TEMPLATE.format_messages(
-        memory_blocks=[("notes", [TextBlock(text="fixture secret\nfull block second line")])]
+        memory_blocks=[("goal", [TextBlock(text="fixture secret\nfull block second line")])]
     )
-    for step in range(1, 31):
-        history.extend(
-            [
-                ChatMessage(role="user", content="Action taken:"),
-                ChatMessage(
-                    role="assistant",
-                    blocks=[
-                        ToolCallBlock(
-                            tool_call_id=str(step),
-                            tool_name="tap_element",
-                            tool_kwargs={"index": 12},
-                        )
-                    ],
-                ),
-                ChatMessage(role="tool", content=f"{step} · tap_element [12] ✓\nresult at {step}"),
-            ]
-        )
     caplog.set_level(level, logger="mobilerun_agents.agent.logs.console")
     turn = Turn(tools=fake_tools("wait"))
     turn.memory = DiagnosticMemory()
@@ -168,21 +281,17 @@ async def test_selector_reports_only_debug_memory(kind, level, caplog, tmp_path)
 
     (detail,) = details
     assert "fixture secret\nfull block second line" in detail.text
-    assert 'tap_element({"index": 12})' in detail.text
-    assert "result at 1" in detail.text and "result at 30" in detail.text
     redact = Redactor()
     redact.add("fixture secret")
     console = ConsoleLog(redact, tmp_path)
     console.event(Observed(step=31))
     console.event(detail)
     (compact,) = [message for message in caplog.messages if "memory: " in message]
-    assert "91 msgs · 1.9k/24k tokens · blocks: notes(2 lines)" in compact
+    assert "1.9k/24k tokens · blocks: goal(2 lines)" in compact
     assert len(compact.splitlines()) <= 6
-    assert "notes: ***" in compact
+    assert "goal: ***" in compact
     assert "full block second line" not in compact
-    for step in (28, 29, 30):
-        assert f"{step} tap_element[12] ✓" in compact
-    assert "27 tap_element" not in compact
+    assert "msgs" not in compact
     assert "fixture secret" not in caplog.text
     saved = (tmp_path / "memory/0031.txt").read_text()
     assert "***\nfull block second line" in saved

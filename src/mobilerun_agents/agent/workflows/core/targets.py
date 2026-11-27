@@ -141,10 +141,12 @@ def _rounded(value: object) -> int | None:
     return round(value) if type(value) is float and isfinite(value) else None
 
 
-def target(record: ActionRecord, limit: int | None = 60) -> str | None:
+def target(
+    record: ActionRecord, limit: int | None = 60, mask: Callable[[str], str] = str
+) -> str | None:
     """Return the shared label, independent of the transient index and screen fingerprint."""
     resolved = _record_target(record)
-    return resolved.label(limit) if resolved is not None else None
+    return resolved.label(limit, mask) if resolved is not None else None
 
 
 def _record_target(record: ActionRecord) -> ActionTarget | None:

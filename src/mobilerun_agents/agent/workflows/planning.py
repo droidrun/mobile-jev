@@ -4,7 +4,7 @@ import json
 import logging
 from itertools import groupby
 from sys import exc_info
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from llama_index.core.base.llms.types import ImageBlock
 from mobilerun.errors import DeviceOperationNotSupported
@@ -29,7 +29,7 @@ from mobilerun_agents.agent.events import (
     Selected,
     Subgoal,
 )
-from mobilerun_agents.agent.memory.memory import build_run_memory
+from mobilerun_agents.agent.memory.memory import build_executor_memory
 from mobilerun_agents.agent.planner import Finish, Plan, Planner
 from mobilerun_agents.agent.planner.base import remaining_child_steps, remaining_steps
 from mobilerun_agents.config.user_config import AgentConfig, MemoryConfig
@@ -44,7 +44,7 @@ from .core.state import (
     PlanningState,
     SubgoalResult,
 )
-from .resources import DeviceResource, ServicesResource, run_resources
+from .resources import DeviceResource, MemoryResource, ServicesResource, run_resources
 
 _log = logging.getLogger(__name__)
 
@@ -97,6 +97,37 @@ def _offset(action: ActionRecord, offset: int) -> ActionRecord:
 def _unlink_screenshot(snapshot: StepSnapshot) -> None:
     if snapshot.screenshot is not None and snapshot.screenshot.path is not None:
         snapshot.screenshot.path.unlink(missing_ok=True)
+
+
+def _screen(snapshot: StepSnapshot) -> tuple[str | None, str | None]:
+    phone = snapshot.ui.phone_state
+    return phone.get("packageName"), phone.get("activityName")
+
+
+def _record_subgoal_screen(
+    result: SubgoalResult, before: StepSnapshot, after: StepSnapshot
+) -> None:
+    result.before_screen, result.after_screen = _screen(before), _screen(after)
+    if result.before_screen != result.after_screen:
+        result.screen_changed = True
+    elif (changed := before.compare(after)) is not None:
+        result.screen_changed = changed
+    elif before.ui.formatted_text or after.ui.formatted_text:
+        result.screen_changed = before.ui.formatted_text != after.ui.formatted_text
+
+
+def executor_kind(
+    executor: ActionSelector,
+) -> Literal["decision", "decision_delegate", "llm", "custom"]:
+    match executor:
+        case DelegatingSelector():
+            return "decision_delegate"
+        case DecisionSelector():
+            return "decision"
+        case LLMSelector():
+            return "llm"
+        case _:
+            return "custom"
 
 
 def _forget_previous_images(state: PlanningState, action_count: int) -> None:
@@ -163,16 +194,8 @@ class PlanningWorkflow(Workflow):
                 state = PlanningState(
                     goal=goal,
                     max_steps=max_steps or self.config.planning_max_steps,
+                    executor=executor_kind(self.executor),
                 )
-                match self.executor:
-                    case DelegatingSelector():
-                        state.executor = "decision_delegate"
-                    case DecisionSelector():
-                        state.executor = "decision"
-                    case LLMSelector():
-                        state.executor = "llm"
-                    case _:
-                        state.executor = "custom"
             case SubgoalDone():
                 pass
         snapshot = StepSnapshot(
@@ -188,6 +211,11 @@ class PlanningWorkflow(Workflow):
                     snapshot.screenshot = ImageBlock(path=services.images.save(image))
         # Unlike action snapshots, only the current planner observation is retained.
         if state.current is not None:
+            if state.results:
+                # Copy it instead of updating the result already sent on the event stream.
+                result = state.results[-1].model_copy()
+                _record_subgoal_screen(result, state.current, snapshot)
+                state.results[-1] = result
             _unlink_screenshot(state.current)
         state.current = snapshot
         await ctx.store.set_state(state)
@@ -204,7 +232,11 @@ class PlanningWorkflow(Workflow):
 
     @step
     async def plan(
-        self, ctx: Context[PlanningState], ev: PlanTurn, services: ServicesResource
+        self,
+        ctx: Context[PlanningState],
+        ev: PlanTurn,
+        memory: MemoryResource,
+        services: ServicesResource,
     ) -> RunSubgoal | StopEvent:
         state = await ctx.store.get_state()
         repair = None
@@ -217,7 +249,7 @@ class PlanningWorkflow(Workflow):
             try:
                 decision = await self.planner.bind(
                     self.output_schema, repair, services.registry.redactor
-                ).plan(ctx)
+                ).plan(ctx, memory)
             except InvalidResponse:
                 repair = "Invalid planner tool call"
                 continue
@@ -293,7 +325,7 @@ class PlanningWorkflow(Workflow):
             budget=state.max_steps,
         )
         ctx.write_event_to_stream(subgoal)
-        memory = build_run_memory(self.memory_config, device.platform, self.config)
+        memory = build_executor_memory(self.memory_config, device.platform, self.config)
         protection = services.registry.redactor.revision
         offset = state.executor_steps
         start = len(state.actions)

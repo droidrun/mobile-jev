@@ -74,7 +74,7 @@ class ScriptPlanner(Planner):
     def __init__(self):
         self.turn = 0
 
-    async def plan(self, ctx):
+    async def plan(self, ctx, memory):
         self.turn += 1
         if self.turn == 1:
             return Plan(("enter text",))
@@ -337,7 +337,7 @@ async def test_execution_result_masks_sensitive_values_in_typed_output(config, p
     raw_output = {"details": {"text": [marker, "ordinary"]}}
 
     class OutputPlanner(ScriptPlanner):
-        async def plan(self, ctx):
+        async def plan(self, ctx, memory):
             if (await ctx.store.get_state()).results:
                 return Finish(success=True, message=message, output=raw_output)
             return Plan(("receive the value",))
@@ -407,11 +407,11 @@ async def test_subgoal_display_default_does_not_replace_raw_message(config, capl
     reported = asyncio.Event()
 
     class PausedPlanner(ScriptPlanner):
-        async def plan(self, ctx):
+        async def plan(self, ctx, memory):
             if (await ctx.store.get_state()).results:
                 replanning.set()
                 await may_finish.wait()
-            return await super().plan(ctx)
+            return await super().plan(ctx, memory)
 
     class ProgressLog(logging.Handler):
         def emit(self, record):
@@ -548,11 +548,11 @@ async def test_cancellation_during_second_planner_turn_reports_three_steps(confi
     second_turn = asyncio.Event()
 
     class BlockingPlanner(ScriptPlanner):
-        async def plan(self, ctx):
+        async def plan(self, ctx, memory):
             if self.turn == 1:
                 second_turn.set()
                 await asyncio.Future()
-            return await super().plan(ctx)
+            return await super().plan(ctx, memory)
 
     caplog.set_level(logging.INFO, logger="mobilerun_agents.agent.logs.console")
     config.checkpoints.enabled = False
@@ -605,7 +605,7 @@ class StrictOutput(BaseModel):
 )
 async def test_typed_output_preserves_validated_json(config, planning, raw, expected):
     class Planner(ScriptPlanner):
-        async def plan(self, ctx):
+        async def plan(self, ctx, memory):
             return Finish(success=True, message="done", output=raw)
 
     selector = Script(("complete", {"success": True, "message": "done", "output": raw}))
@@ -782,16 +782,20 @@ async def test_failed_checkpoint_write_refreshes_old_redactions(config, monkeypa
 @pytest.mark.anyio
 @pytest.mark.parametrize("exit_kind", ["success", "failure", "cancellation"])
 @pytest.mark.parametrize("close_fails", [False, True])
+@pytest.mark.parametrize("planning", [False, True])
 async def test_run_memory_closes_after_workflow_and_checkpoints(
-    config, monkeypatch, caplog, exit_kind, close_fails
+    config, monkeypatch, caplog, exit_kind, close_fails, planning
 ):
     started = asyncio.Event()
     operations = []
+    used = []
+    closed = []
     original_close = _RunMemory.aclose
     original_save = consumers.save_context
 
     async def close(memory):
         operations.append("close")
+        closed.append(memory)
         await original_close(memory)
         if close_fails:
             raise RuntimeError("fixture close failure")
@@ -801,30 +805,40 @@ async def test_run_memory_closes_after_workflow_and_checkpoints(
         operations.append("checkpoint")
         return saved
 
+    async def stop(memory):
+        used.append(memory)
+        started.set()
+        try:
+            if exit_kind == "failure":
+                raise ValueError("fixture workflow failure")
+            if exit_kind == "cancellation":
+                await asyncio.Future()
+        finally:
+            operations.append("workflow exited")
+
     class Selector(ActionSelector):
         async def select(self, ctx, device, memory, registry):
-            started.set()
-            try:
-                if exit_kind == "failure":
-                    raise ValueError("fixture workflow failure")
-                if exit_kind == "cancellation":
-                    await asyncio.Future()
-                return Selection(
-                    calls=[
-                        ToolSelection(
-                            tool_id="complete",
-                            tool_name="complete",
-                            tool_kwargs={"success": True, "message": "done"},
-                        )
-                    ]
-                )
-            finally:
-                operations.append("selector exited")
+            await stop(memory)
+            return Selection(
+                calls=[
+                    ToolSelection(
+                        tool_id="complete",
+                        tool_name="complete",
+                        tool_kwargs={"success": True, "message": "done"},
+                    )
+                ]
+            )
+
+    class Planner(ScriptPlanner):
+        async def plan(self, ctx, memory):
+            await stop(memory)
+            return Finish(True, "done")
 
     monkeypatch.setattr(_RunMemory, "aclose", close)
     monkeypatch.setattr(consumers, "save_context", save)
+    operator = PlanningOperator(Planner(), Selector()) if planning else AgentOperator(Selector())
     with ConfigLoader.override(config):
-        run = asyncio.create_task(AgentOperator(Selector()).execute(Phone(), "goal"))
+        run = asyncio.create_task(operator.execute(Phone(), "goal"))
         await asyncio.wait_for(started.wait(), 5)
         if exit_kind == "cancellation":
             run.cancel()
@@ -836,7 +850,10 @@ async def test_run_memory_closes_after_workflow_and_checkpoints(
         else:
             assert (await run).success
 
-    checkpoints = ["checkpoint", "checkpoint"] if exit_kind == "success" else []
-    assert operations == ["selector exited", *checkpoints, "close"]
+    checkpoints = ["checkpoint"] * (1 if planning else 2) if exit_kind == "success" else []
+    assert operations == ["workflow exited", *checkpoints, "close"]
+    assert len(used) == len(closed) == 1 and used[0] is closed[0]
+    if planning:
+        assert [block.name for block in used[0].memory_blocks] == config.memory.planner.blocks
     assert ("Unable to close run memory" in caplog.text) == close_fails
     assert "fixture close failure" not in caplog.text

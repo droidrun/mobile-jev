@@ -1,18 +1,62 @@
 # Run memory
 
-**Purpose:** Carry useful action history and current device context into model calls within one run using LlamaIndex's native `Memory` resource.
+**Purpose:** Carry context between steps with native LlamaIndex
+`Memory.from_defaults(memory_blocks=…, token_limit=…, insert_method=…)`.
 
-**What belongs here / what doesn't:** Budget chat history and render observation context here. Persisted run records and replay artifacts belong to checkpoints. Current UI state and screenshot references are held by `StepSnapshot`, not copied into chat history.
+**What belongs here / what doesn't:** Memory has no chat history:
+blocks render history from persisted workflow state. Per-step
+instructions, the current screen and screenshot, device context, and repair hints
+belong in the caller's prompt, outside memory.
 
 **Contents:**
 
-- `__init__.py` — package entry.
-- `memory.py` — `build_run_memory` and its private SQLite engine. The owner must call `await memory.aclose()` once the workflow has stopped using it.
-- `messages.py` — `remember(memory, call, record)` appends a native action turn using the model-visible call; `text_messages` projects history for text-only models.
-- `blocks/` — `RepeatBlock`, `DeviceContextBlock`, run notes and optional context sources rendered for the model.
+- `__init__.py` — exports `read_memory`.
+- `memory.py` — reads memory and builds executor and planner memory with a shared template and engine setup.
+- `blocks/` — run-state block base and context blocks.
 
-**Examples:** Selectors use `await memory.aget(snapshot=state.current, state=state)` to include explicit notes, live repeat feedback and device context. Add the bundled app cards with `memory: {blocks: [app_cards]}` in the agent config. No extra blocks are enabled by default.
+**Examples:** Read workflow memory with `await read_memory(memory, ctx, redact)`. It loads the latest
+`AgentState` or `PlanningState` with `await ctx.store.get_state()` and passes it to
+`memory.aget(state=state, redact=redact)`, using the run's redactor to mask protected UI labels. Do not pass snapshots or read from a selector's local
+copy of state. Setup is a native `StaticMemoryBlock` named `setup` at priority 0:
+the caller renders its text once and passes that text to `build_setup_block(text)`.
 
-Each invocation, including each planning child, creates fresh `Memory`. A tool call and result are appended together with a user boundary marker for turn eviction. Whether the screen changed is only known at the next observation, so selectors give that feedback with the current screen instead of storing it with the tool result. `RepeatBlock` reads it directly from the action records. The chat queue gets 80% of `memory.token_limit` (24,000 of 30,000 tokens by default), counting tool arguments. Overflow targets a 2,500-token flush at the default budget and evicts complete turns. Archived messages stay in the private in-memory SQLite store for the invocation only. Full action records remain in workflow state. The SQL engine never sends chat rows or bound arguments to host debug handlers.
+Create one planner memory per planning run and a fresh executor memory for each
+child. Both are closed when their workflows exit. Each memory owns its SQLite
+engine unless the caller supplies one; `memory.aclose()` leaves supplied engines open.
 
-**Depends on / used by:** Uses LlamaIndex memory, typed config and action records. The operator supplies memory to workflows; selectors see the assembled context.
+**Depends on / used by:** Uses LlamaIndex memory, typed config, and workflow state.
+Operators supply memory to workflows; selectors read the resulting messages.
+
+## Add a block
+
+Subclass `StateBlock[YourState, str]` or `StateBlock[YourState, list[ContentBlock]]`.
+Give the block a `name` and a `priority`, and implement `async def render(self, state, redact)`
+to return text or native content blocks. `StateBlock` ignores short-term memory,
+does nothing on put, and raises `TypeError` if read without `state=` or `redact=`. Override
+`atruncate` only when a block can shrink itself; the native default drops its content.
+
+## Native behavior pinned by tests
+
+- Priority 0 is never truncated, even when it exceeds the budget on its own.
+- Under pressure, LlamaIndex sorts positive priorities in ascending order and
+  calls `atruncate` on priority 1 before priority 2, even though its documentation
+  calls 1 the highest priority. Retained blocks render in their configured order.
+- `InsertMethod.USER` prepends block content to the latest user message. If there
+  is no user message, it appends a new one.
+- A block can return a `TextBlock` and an `ImageBlock` together. The default template
+  preserves URL-backed images (the tested case) and handles paths, but omits
+  inline-byte images that have neither a URL nor a path.
+
+## Executor
+
+`memory.executor.blocks` selects blocks in order. By default it lists `setup`,
+`goal`, `last_step`, `history`, and `app_cards`. App cards are available on
+Android and iOS for apps with a bundled card. To disable them, omit `app_cards`
+from `memory.executor.blocks`. Delete the removed top-level `memory.blocks` key.
+`last_step` includes every call from the previous step and its screen transition.
+The saved before-screenshot is optional (`memory.executor.last_step_screenshot`,
+default `true`); only vision-enabled LLM selectors send it. `history` shows the
+previous `memory.executor.history` steps (default `5`), excluding `last_step`,
+plus any repeat and cycle warnings. Each older action includes masked arguments
+and a short result. Under token pressure app cards (priority 1) are dropped
+before executor history (priority 2); history loses its oldest lines first.

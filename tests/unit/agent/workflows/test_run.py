@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from llama_index.core.base.llms.types import ChatMessage, ChatResponse, ImageBlock, ToolCallBlock
+from llama_index.core.base.llms.types import ChatMessage, ChatResponse, ImageBlock
 from llama_index.core.memory import Memory
 from llama_index.core.tools import ToolSelection
 from mobilerun.core.devices import Device
@@ -67,12 +67,16 @@ class Selector:
         self.choices = iter(choices)
         self.on_select = on_select
         self.history = []
+        self.repairs = []
 
     async def select(self, ctx, device, memory, registry):
         from mobilerun_agents.agent.action_selector.base import Selection
+        from mobilerun_agents.agent.memory import read_memory
 
-        self.history.append(await memory.aget())
-        self.on_select(await ctx.store.get_state())
+        self.history.append(await read_memory(memory, ctx, registry.redactor))
+        state = await ctx.store.get_state()
+        self.repairs.append(state.repair)
+        self.on_select(state)
         choice = next(self.choices)
         if isinstance(choice, Exception):
             raise choice
@@ -91,12 +95,13 @@ async def run(
     has_tree=False,
     **settings,
 ):
+    from mobilerun_agents.agent.memory.memory import build_executor_memory
     from mobilerun_agents.agent.tools.base import tool
     from mobilerun_agents.agent.tools.helpers.images import ImageStore
     from mobilerun_agents.agent.tools.registry import build_registry
     from mobilerun_agents.agent.workflows.agent import AgentWorkflow
     from mobilerun_agents.agent.workflows.resources import Services, run_resources
-    from mobilerun_agents.config.user_config import ToolsConfig
+    from mobilerun_agents.config.user_config import MemoryConfig, ToolsConfig
 
     monkeypatch.setenv("MOBILERUN_AGENT_IMAGES_DIR", str(tmp_path))
     device = Phone(screens, has_tree)
@@ -121,7 +126,7 @@ async def run(
         await phone._input_secret('known "late"')
         return "protected"
 
-    memory = Memory.from_defaults(tokenizer_fn=lambda text: text.split())
+    memory = build_executor_memory(MemoryConfig(), device.platform)
     images = ImageStore("test", keep=True)
     registry = build_registry(device, [write, protect, vault], ToolsConfig())
     services = Services(registry=registry, images=images)
@@ -129,9 +134,12 @@ async def run(
         selector, resource_manager=await run_resources(device, memory, services), **settings
     )
     handler = workflow.run(goal="Test", max_steps=max_steps)
-    events = [event async for event in handler.stream_events()]
-    result = await handler
-    return result, await handler.ctx.store.get_state(), events, device, selector
+    try:
+        events = [event async for event in handler.stream_events()]
+        result = await handler
+        return result, await handler.ctx.store.get_state(), events, device, selector
+    finally:
+        await memory.aclose()
 
 
 @pytest.mark.parametrize("delay", [None, 0], ids=["default", "disabled"])
@@ -182,15 +190,8 @@ def test_jev_abstention_stops_without_repair_or_fallback(tmp_path, monkeypatch, 
     from mobilerun_agents.agent.events import Repaired
     from tests.unit.agent.action_selector.test_delegating_selector import Model, Stub
 
-    memories = []
-
-    class Primary(DecisionSelector):
-        async def select(self, ctx, device, memory, registry, **kwargs):
-            memories.append(memory)
-            return await super().select(ctx, device, memory, registry, **kwargs)
-
     decision = Model(*[("wait", 0.2)] * 4)
-    primary = Primary(decision, "off", min_confidence=0.7)
+    primary = DecisionSelector(decision, "off", min_confidence=0.7)
     delegate = Stub()
     selector = DelegatingSelector(primary, delegate) if delegated else primary
 
@@ -203,7 +204,7 @@ def test_jev_abstention_stops_without_repair_or_fallback(tmp_path, monkeypatch, 
         assert state.current.screenshot is None
         assert not any(isinstance(event, Repaired) for event in events)
         assert len(decision.requests) == 1 and not delegate.calls
-        assert not await memories[0].aget()
+        assert state.repair is None
 
     asyncio.run(check())
 
@@ -299,7 +300,7 @@ def test_abstention_removes_prior_saved_images_for_newly_protected_value(tmp_pat
     assert state.current.screenshot is None
 
 
-def test_happy_path_keeps_pinned_before_and_adds_call_and_result_to_memory(tmp_path, monkeypatch):
+def test_happy_path_keeps_pinned_before_and_renders_call_and_result(tmp_path, monkeypatch):
     from mobilerun_agents.agent.events import Acted, Finished, Observed, Selected
 
     result, state, events, phone, selector = asyncio.run(
@@ -314,17 +315,10 @@ def test_happy_path_keeps_pinned_before_and_adds_call_and_result_to_memory(tmp_p
     assert action.call.tool_kwargs == {"text": "hello"}
     assert action.screen_changed is True
     assert phone.captures == 2
-    messages = selector.history[-1]
-    block = next(
-        block
-        for message in messages
-        for block in message.blocks
-        if isinstance(block, ToolCallBlock)
-    )
-    feedback = next(message for message in messages if message.role == "tool")
-    assert block.tool_kwargs == {"text": "hello"}
-    assert block.tool_call_id == feedback.additional_kwargs["tool_call_id"]
-    assert "hello" in feedback.content
+    (message,) = selector.history[-1]
+    assert message.role == "user"
+    assert 'write({"text": "hello"}) · ok=true: hello' in message.content
+    assert action.before.screenshot in message.blocks
 
 
 def test_persisting_image_does_not_modify_selected_snapshot(tmp_path, monkeypatch):
@@ -343,7 +337,7 @@ def test_persisting_image_does_not_modify_selected_snapshot(tmp_path, monkeypatc
     assert state.actions[0].before.screenshot.path.read_bytes() == b"A"
 
 
-def test_record_uses_base_action_name_but_memory_uses_selected_name(tmp_path, monkeypatch):
+def test_record_and_memory_use_the_base_action_name(tmp_path, monkeypatch):
     selected = call("bench__ping", text="ready")
     result, state, _, _, selector = asyncio.run(
         run(tmp_path, monkeypatch, [selected, complete()], [b"A", b"B"])
@@ -354,17 +348,8 @@ def test_record_uses_base_action_name_but_memory_uses_selected_name(tmp_path, mo
     assert record.call.tool_name == "bench.ping"
     assert record.call.tool_kwargs == {"text": "ready"}
     assert record.call.tool_id == selected.tool_id
-    messages = selector.history[-1]
-    block = next(
-        block
-        for message in messages
-        for block in message.blocks
-        if isinstance(block, ToolCallBlock)
-    )
-    feedback = next(message for message in messages if message.role == "tool")
-    assert block.tool_name == "bench__ping"
-    assert block.tool_kwargs == selected.tool_kwargs
-    assert block.tool_call_id == feedback.additional_kwargs["tool_call_id"] == selected.tool_id
+    (message,) = selector.history[-1]
+    assert 'bench.ping({"text": "ready"}) · ok=true:' in message.content
 
 
 def test_workflows_do_not_render_prompts():
@@ -389,7 +374,9 @@ def test_repair_keeps_same_observation_and_records_only_valid_calls(tmp_path, mo
     assert [record.call.tool_name for record in state.actions] == ["complete"]
     assert phone.captures == 1
     assert sum(1 for event in events if isinstance(event, Repaired)) == 2
-    assert any("unknown" in (message.content or "") for message in selector.history[-1])
+    assert [event.reason for event in events if isinstance(event, Repaired)] == selector.repairs[1:]
+    assert selector.repairs[0] is None and state.repair is None
+    assert all("Invalid arguments" not in message.content for message in selector.history[-1])
 
 
 def test_repair_budget_ends_without_saving_an_image(tmp_path, monkeypatch):
@@ -437,9 +424,7 @@ def test_selector_parse_error_becomes_a_repair(tmp_path, monkeypatch):
     )
     assert result.success and phone.captures == 1
     assert any(isinstance(event, Repaired) for event in events)
-    assert any(
-        "Malformed model reply" in (message.content or "") for message in selector.history[-1]
-    )
+    assert selector.repairs == [None, "Malformed model reply"]
 
 
 @pytest.mark.parametrize("first_hit", [1, 2, 3, None])
@@ -575,13 +560,16 @@ def test_empty_llm_response_repairs_on_same_observation(tmp_path, monkeypatch):
             '<parameter name="message">done</parameter></invoke>',
         ]
     )
-    result, _, events, phone, _ = asyncio.run(
+    result, state, events, phone, _ = asyncio.run(
         run(tmp_path, monkeypatch, [], [b"A"], selector=selector)
     )
     reason = "No tool selected; choose an available tool."
     assert result.success and phone.captures == 1 and len(selector.requests) == 2
     assert [event.reason for event in events if isinstance(event, Repaired)] == [reason]
-    assert reason in [message.content for message in selector.requests[1]]
+    assert state.repair is None
+    assert [message.role for message in selector.requests[1]] == ["system", "user", "user"]
+    assert reason not in selector.requests[1][-2].content
+    assert f"<repair>{reason}</repair>" in selector.requests[1][-1].content
 
 
 @pytest.mark.parametrize("vision,captures", [("off", 0), ("on", 2), ("only", 2)])
@@ -622,9 +610,8 @@ def test_screenshot_only_change_is_live_model_context_not_stored_history(
     assert phone.captures == 2 and selector.captures_at_entry == [1, 2]
     assert not selector.requests[0][-1].content.startswith("Previous action")
     assert selector.requests[1][-1].content.splitlines()[0] == line
-    assert all(
-        "screen changed:" not in (message.content or "") for message in selector.requests[1][:-1]
-    )
+    assert "<last_step>" in selector.requests[1][-2].content
+    assert "Screen changed:" in selector.requests[1][-2].content
 
 
 @pytest.mark.parametrize(
@@ -649,8 +636,8 @@ def test_run_tool_feedback_only_exposes_value_safe_messages(tmp_path, monkeypatc
         )
     )
     assert not state.actions[0].ok
-    feedback = next(message for message in selector.history[-1] if message.role == "tool")
-    assert feedback.content.splitlines()[-1] == expected
+    (message,) = selector.history[-1]
+    assert f"ok=false: {expected}\n" in message.content
 
 
 def test_untracked_tool_exception_text_is_not_in_public_artifacts(tmp_path, monkeypatch, caplog):
@@ -750,8 +737,8 @@ def test_rejected_custom_validator_exception_text_is_not_echoed(tmp_path, monkey
         run(tmp_path, monkeypatch, [selected, selected], [b"A", b"B"], output=CustomOutput)
     )
     assert not result.success
-    feedback = next(message for message in selector.history[-1] if message.role == "tool")
-    assert feedback.content.splitlines()[-1] == "count: Value error"
+    (message,) = selector.history[-1]
+    assert "ok=false: count: Value error\n" in message.content
 
 
 def test_decision_selector_captures_tree_and_reports_change_as_live_context(tmp_path, monkeypatch):
@@ -787,7 +774,7 @@ def test_decision_selector_captures_tree_and_reports_change_as_live_context(tmp_
     assert [record.before.screenshot.path.read_bytes() for record in state.actions] == images
     assert model.requests[0].previous_action is None
     assert model.requests[1].previous_action == "Previous action did not change the screen"
-    assert "screen changed:" not in model.requests[1].memory
+    assert "Screen changed: false" in model.requests[1].memory
 
 
 @pytest.mark.anyio

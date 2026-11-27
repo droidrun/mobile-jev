@@ -1,17 +1,19 @@
-# Observation context blocks
+# Run-state memory blocks
 
-**Purpose:** Render specific sources of context for the current step.
+**Purpose:** Render selected parts of the persisted executor or planner state.
 
-**What belongs here / what doesn't:** Each block contributes information, not a selection or device action. Token budgeting belongs to the memory builder.
+**What belongs here / what doesn't:** Blocks render stored run context, not chat history or the current observation prompt. Native LlamaIndex memory applies the token budget.
 
 **Contents:**
 
-- `__init__.py` — `ObservationBlock` reads live context rather than archived messages.
+- `__init__.py` — `StateBlock`, the base for blocks that render workflow state.
 - `app_cards.py` — local app-specific guidance for the current platform.
-- `device_context.py` — context published by the device and its extensions.
-- `repeat.py` — prior action on the current screen and repeat guidance.
-- `notes.py` — render the goal and notes without storing them in chat.
+- `findings.py` — planner findings and notes.
+- `goal.py` — the run goal, plus notes for the executor only.
+- `history.py` — older executor steps and progress warnings.
+- `last_step.py` — the previous executor step, including its screen transition and optional before-screenshot.
+- `subgoals.py` — the latest planner subgoal result and older subgoal history.
 
-**Examples:** `await memory.aget(snapshot=state.current, state=state)` renders context for the current screen.
+**Examples:** `await read_memory(memory, ctx, redact)` renders the configured blocks from the latest workflow state using the run's redactor.
 
-**Depends on / used by:** Blocks use the snapshot and memory block contract; the operator or memory builder composes them for a run.
+**Depends on / used by:** Blocks use workflow state and the LlamaIndex memory contract. Executor and planner builders compose them for each run.

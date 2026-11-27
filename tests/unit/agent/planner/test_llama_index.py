@@ -1,16 +1,25 @@
+import re
+
 import pytest
 from llama_index.core.base.llms.types import ImageBlock, ToolCallBlock
 from llama_index.core.llms import ChatMessage, ChatResponse, MockLLM
+from llama_index.core.memory import InsertMethod
+from llama_index.core.utils import get_tokenizer
 from mobilerun.core.state.ui_state import UIState
+from mobilerun.models.context import ContextItem
 from pydantic import PrivateAttr
 from workflows import Context, Workflow, step
 from workflows.events import StartEvent, StopEvent
 
 from mobilerun_agents.agent.action_selector.llm.models import Capabilities
 from mobilerun_agents.agent.logs.redaction import Redactor
+from mobilerun_agents.agent.memory.blocks.findings import FindingsBlock
+from mobilerun_agents.agent.memory.blocks.subgoals import LastSubgoalBlock, SubgoalHistoryBlock
+from mobilerun_agents.agent.memory.memory import build_planner_memory
 from mobilerun_agents.agent.planner import Finish, LlamaIndexPlanner, Plan
 from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
 from mobilerun_agents.agent.workflows.core.state import PlanningState, SubgoalResult
+from mobilerun_agents.config.user_config import MemoryConfig
 
 
 class PlanningProbe(Workflow):
@@ -52,31 +61,39 @@ def anyio_backend():
     return "asyncio"
 
 
+@pytest.fixture
+async def memory():
+    memory = build_planner_memory(MemoryConfig(), PlanningState())
+    yield memory
+    await memory.aclose()
+
+
 @pytest.mark.anyio
-async def test_llama_index_requires_a_valid_planner_tool_call():
+async def test_llama_index_requires_a_valid_planner_tool_call(memory):
     ctx = Context[PlanningState](PlanningProbe())
     await ctx.store.set_state(PlanningState(goal="Check the battery"))
     llm = Replies()
     planner = LlamaIndexPlanner(llm)
 
-    plan = await planner.plan(ctx)
+    plan = await planner.plan(ctx, memory)
     assert plan == Plan(("Read battery",))
     assert plan.findings == ()
-    assert await planner.plan(ctx) == Finish(True, "Battery at 100%")
+    assert await planner.plan(ctx, memory) == Finish(True, "Battery at 100%")
     messages, tools = llm._requests[1]
     assert [tool.metadata.get_name() for tool in tools] == ["set_plan", "complete"]
-    assert "Goal: Check the battery" in messages[0].content
+    assert [message.role.value for message in messages] == ["system", "user", "user"]
+    assert "Goal: Check the battery" in messages[1].content
     assert "previous response was invalid" in messages[-1].content
 
 
 @pytest.mark.anyio
-async def test_set_plan_carries_findings():
+async def test_set_plan_carries_findings(memory):
     ctx = Context[PlanningState](PlanningProbe())
     await ctx.store.set_state(PlanningState(goal="Compare battery levels"))
     llm = Replies()
     llm._calls = [("set_plan", {"subgoals": ["Check tablet"], "findings": ["Phone battery: 100%"]})]
 
-    plan = await LlamaIndexPlanner(llm).plan(ctx)
+    plan = await LlamaIndexPlanner(llm).plan(ctx, memory)
 
     assert plan == Plan(("Check tablet",), findings=("Phone battery: 100%",))
     _, (set_plan, _) = llm._requests[0]
@@ -88,7 +105,7 @@ async def test_set_plan_carries_findings():
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("remaining", [0, 1])
-async def test_last_planner_turn_offers_only_complete_even_during_repair(remaining):
+async def test_last_planner_turn_offers_only_complete_even_during_repair(remaining, memory):
     ctx = Context[PlanningState](PlanningProbe())
     llm = Replies()
     llm._calls = [
@@ -101,13 +118,13 @@ async def test_last_planner_turn_offers_only_complete_even_during_repair(remaini
     await ctx.store.set_state(
         PlanningState(goal="Read battery", planner_turns=1, executor_steps=2, max_steps=5)
     )
-    assert await planner.plan(ctx) == Plan(("Read battery",))
+    assert await planner.plan(ctx, memory) == Plan(("Read battery",))
     await ctx.store.set_state(
         PlanningState(
             goal="Read battery", planner_turns=3 - remaining, executor_steps=2, max_steps=5
         )
     )
-    assert await planner.plan(ctx) == Finish(False, "Battery settings are locked.")
+    assert await planner.plan(ctx, memory) == Finish(False, "Battery settings are locked.")
 
     earlier, *last = llm._requests
     assert [tool.metadata.get_name() for tool in earlier[1]] == ["set_plan", "complete"]
@@ -130,16 +147,16 @@ async def test_last_planner_turn_offers_only_complete_even_during_repair(remaini
     assert len(last) == 2
     for messages, tools in last:
         assert [tool.metadata.get_name() for tool in tools] == ["complete"]
-        assert "final planner turn" in messages[0].content
-        assert "success=false" in messages[0].content
-        assert "state what blocked it" in messages[0].content
+        assert "final planner turn" in messages[-1].content
+        assert "success=false" in messages[-1].content
+        assert "state what blocked it" in messages[-1].content
         assert observed_or_unknown in messages[0].content
         assert repeated_failure not in messages[0].content
         assert "`set_plan`" not in messages[0].content
 
 
 @pytest.mark.anyio
-async def test_last_planner_turn_repairs_blank_failure_message():
+async def test_last_planner_turn_repairs_blank_failure_message(memory):
     ctx = Context[PlanningState](PlanningProbe())
     await ctx.store.set_state(PlanningState(goal="Read battery", planner_turns=1, max_steps=1))
     llm = Replies()
@@ -148,7 +165,9 @@ async def test_last_planner_turn_repairs_blank_failure_message():
         ("complete", {"success": False, "message": "Battery settings are locked."}),
     ]
 
-    assert await LlamaIndexPlanner(llm).plan(ctx) == Finish(False, "Battery settings are locked.")
+    assert await LlamaIndexPlanner(llm).plan(ctx, memory) == Finish(
+        False, "Battery settings are locked."
+    )
     assert len(llm._requests) == 2
     messages, tools = llm._requests[-1]
     assert "previous response was invalid" in messages[-1].content
@@ -157,7 +176,9 @@ async def test_last_planner_turn_repairs_blank_failure_message():
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("vision", [True, False])
-async def test_llm_gets_path_backed_screenshot_if_it_supports_vision(tmp_path, monkeypatch, vision):
+async def test_llm_gets_path_backed_screenshot_if_it_supports_vision(
+    tmp_path, monkeypatch, vision, memory
+):
     path = tmp_path / "screen.png"
     path.write_bytes(b"fake screenshot payload")
     monkeypatch.setattr(
@@ -179,11 +200,183 @@ async def test_llm_gets_path_backed_screenshot_if_it_supports_vision(tmp_path, m
         )
     )
     llm = Replies()
-    await LlamaIndexPlanner(llm).bind(None, None, Redactor()).plan(ctx)
+    await LlamaIndexPlanner(llm).plan(ctx, memory)
     messages, _ = llm._requests[0]
     assert (
         "Verify executor results against the current screen and screenshot" in messages[0].content
     )
-    assert "Battery 100%" in messages[0].content
-    images = [block for block in messages[0].blocks if isinstance(block, ImageBlock)]
+    assert "Battery 100%" in messages[-1].content
+    images = [block for block in messages[-1].blocks if isinstance(block, ImageBlock)]
     assert [image.path for image in images] == ([path] if vision else [])
+
+
+@pytest.mark.anyio
+async def test_planner_config_removes_findings_and_orders_remaining_blocks():
+    state = PlanningState(goal="Check the battery", notes=["Measured 60% earlier"], executor="llm")
+    ctx = Context[PlanningState](PlanningProbe())
+    await ctx.store.set_state(state)
+    llm = Replies()
+    llm._calls = [("complete", {"success": True, "message": "Done"})]
+    config = MemoryConfig(planner={"blocks": ["goal", "setup"]})
+    memory = build_planner_memory(config, state)
+    try:
+        await LlamaIndexPlanner(llm).plan(ctx, memory)
+    finally:
+        await memory.aclose()
+    (system, memory_message, step), _ = llm._requests[0]
+    assert [message.role.value for message in (system, memory_message, step)] == [
+        "system",
+        "user",
+        "user",
+    ]
+    assert memory_message.content.index("Goal: Check the battery") < memory_message.content.index(
+        "Executor: an LLM"
+    )
+    assert all(
+        "Measured 60% earlier" not in message.content for message in (system, memory_message, step)
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("insert_method", list(InsertMethod))
+async def test_planner_request_renders_default_memory_order(insert_method):
+    state = PlanningState(
+        goal="Compare battery levels",
+        executor="llm",
+        notes=["Phone battery: 100%"],
+        results=[
+            SubgoalResult(subgoal="Open settings", success=True, message="Done", reason="complete"),
+            SubgoalResult(subgoal="Read battery", success=True, message="100%", reason="complete"),
+        ],
+        current=StepSnapshot(
+            ui=UIState(
+                [],
+                "Battery 100%",
+                "",
+                {"packageName": "settings", "activityName": "Battery"},
+                100,
+                100,
+            )
+        ),
+    )
+    ctx = Context[PlanningState](PlanningProbe())
+    await ctx.store.set_state(state)
+    llm = Replies()
+    llm._calls = [("set_plan", {"subgoals": ["Read tablet"]})]
+    memory = build_planner_memory(MemoryConfig(insert_method=insert_method), state)
+    try:
+        await LlamaIndexPlanner(llm).plan(ctx, memory)
+    finally:
+        await memory.aclose()
+
+    messages, _ = llm._requests[0]
+    expected_roles = (
+        ["system", "user"] if insert_method is InsertMethod.SYSTEM else ["system", "user", "user"]
+    )
+    assert [message.role for message in messages] == expected_roles
+    assert re.findall(r"^<(\w+)>$", messages[-2].content, re.M) == [
+        "memory",
+        "setup",
+        "goal",
+        "findings",
+        "last_subgoal",
+        "subgoal_history",
+    ]
+    assert sum(message.content.count("Phone battery: 100%") for message in messages) == 1
+    assert "Battery 100%" in messages[-1].content
+
+
+@pytest.mark.anyio
+async def test_planner_blocks_render_latest_result_and_bounded_history():
+    def result(subgoal, message="Done", **screen):
+        return SubgoalResult(
+            subgoal=subgoal, success=True, message=message, reason="complete", **screen
+        )
+
+    state = PlanningState(
+        notes=["Battery is charged"],
+        results=[
+            result("Too old"),
+            result("Oldest in range", "first line\nsecond line"),
+            result("Recent"),
+            result(
+                "Latest",
+                before_screen=("shop", "List"),
+                after_screen=("shop", "Item"),
+                screen_changed=True,
+            ),
+        ],
+    )
+    redact = Redactor()
+    assert (
+        await FindingsBlock().render(state, redact) == 'Findings and notes: ["Battery is charged"]'
+    )
+    assert (await LastSubgoalBlock().render(state, redact)).splitlines() == [
+        "Latest executor subgoal result: Succeeded: Latest: Done",
+        "Screen: shop/List → shop/Item (changed)",
+        "Reason: complete",
+    ]
+    history = SubgoalHistoryBlock(history=2)
+    content = await history.render(state, redact)
+    recent = "Subgoal results (older):\n- Succeeded: Recent: Done"
+    assert content.splitlines() == [
+        "Subgoal results (older):",
+        "- Succeeded: Oldest in range: first line second line",
+        "- Succeeded: Recent: Done",
+    ]
+    assert await history.atruncate(content, 1) == recent
+    assert await history.atruncate(content, len(get_tokenizer()(content))) == ""
+
+
+@pytest.mark.anyio
+async def test_planner_first_turn_renders_pinned_memory_under_token_pressure():
+    state = PlanningState(goal="Check battery")
+    memory = build_planner_memory(MemoryConfig(token_limit=1), state)
+    try:
+        (message,) = await memory.aget(state=state, redact=Redactor())
+        assert "Goal: Check battery" in message.content
+        assert "<subgoal_history>" not in message.content
+        assert await memory.memory_blocks[-1].atruncate([], 1) == ""
+    finally:
+        await memory.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("verify", ["redaction", "device_context"])
+async def test_planner_masks_historical_screen_and_sends_device_context_only_in_step(verify):
+    secret = "private-activity"
+    redact = Redactor()
+    redact.add(secret)
+    state = PlanningState(
+        goal="Check battery",
+        results=[
+            SubgoalResult(
+                subgoal="Open settings",
+                success=True,
+                message="Done",
+                reason="complete",
+                before_screen=("settings", secret),
+                after_screen=("settings", "Battery"),
+            )
+        ],
+        current=StepSnapshot(
+            ui=UIState([], "Battery screen", "", {}, 100, 100),
+            device_context=[ContextItem(source="battery", kind="status", data={"level": 63})],
+        ),
+    )
+    ctx = Context[PlanningState](PlanningProbe())
+    await ctx.store.set_state(state)
+    llm = Replies()
+    llm._calls = [("set_plan", {"subgoals": ["Read battery"]})]
+    memory = build_planner_memory(MemoryConfig(), state)
+    try:
+        await LlamaIndexPlanner(llm).bind(None, None, redact).plan(ctx, memory)
+    finally:
+        await memory.aclose()
+    (system, memory_message, step), _ = llm._requests[0]
+    if verify == "redaction":
+        assert "settings/*** → settings/Battery" in memory_message.content
+        assert secret not in memory_message.content
+    else:
+        assert "<device_context>" in step.content and '"level": 63' in step.content
+        assert "<device_context>" not in system.content + memory_message.content

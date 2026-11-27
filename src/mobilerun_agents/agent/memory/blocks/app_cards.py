@@ -2,21 +2,21 @@ import asyncio
 from pathlib import Path
 from typing import Literal
 
-from llama_index.core.base.llms.types import ChatMessage
 from pydantic import PrivateAttr, TypeAdapter, ValidationError
 
-from mobilerun_agents.agent.workflows.core.snapshot import StepSnapshot
+from mobilerun_agents.agent.logs.redaction import Redactor
+from mobilerun_agents.agent.workflows.core.state import AgentState
 
-from . import ObservationBlock
+from . import StateBlock
 
 _MAPPING = TypeAdapter(dict[str, str])
 
 
-class AppCardBlock(ObservationBlock):
+class AppCardBlock(StateBlock[AgentState, str]):
     """Load app-specific guidance from the local card root for the current platform."""
 
-    name: str = "app_card"
-    priority: int = 2
+    name: str = "app_cards"
+    priority: int = 1
     platform: Literal["android", "ios"]
     cards_dir: Path
     _cache: dict[str, str] = PrivateAttr(default_factory=dict)
@@ -33,12 +33,8 @@ class AppCardBlock(ObservationBlock):
         except (OSError, UnicodeError, ValidationError):
             return ""
 
-    async def _aget(
-        self,
-        messages: list[ChatMessage] | None = None,
-        snapshot: StepSnapshot | None = None,
-        **kwargs: object,
-    ) -> str:
+    async def render(self, state: AgentState, redact: Redactor) -> str:
+        snapshot = state.current
         if snapshot is None or not (package := snapshot.ui.phone_state.get("packageName")):
             return ""
         if package not in self._cache:

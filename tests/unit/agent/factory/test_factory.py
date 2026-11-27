@@ -152,6 +152,7 @@ async def test_anthropic_without_offline_thinking_capability(monkeypatch):
 async def test_openai_planner_requires_one_native_tool_on_the_wire(monkeypatch):
     from workflows import Context
 
+    from mobilerun_agents.agent.memory.memory import build_planner_memory
     from mobilerun_agents.agent.planner import Plan
     from mobilerun_agents.agent.workflows.core.state import PlanningState
     from mobilerun_agents.config.user_config import AgentConfig
@@ -175,16 +176,20 @@ async def test_openai_planner_requires_one_native_tool_on_the_wire(monkeypatch):
     install_transport(monkeypatch, "openai", respond)
     monkeypatch.setenv("OPENAI_API_KEY", "fake")
     ctx = Context[PlanningState](PlanningProbe())
-    await ctx.store.set_state(PlanningState(goal="Check status"))
-    ConfigLoader.save(
-        MobileConfig(
-            agent=AgentConfig(streaming=False),
-            profiles={"main": LLMProfile(provider="openai", model="gpt-5-mini")},
-            setups={"planned": SetupConfig(planner="main", executor="main")},
-            default_setup="planned",
-        )
+    state = PlanningState(goal="Check status")
+    await ctx.store.set_state(state)
+    config = MobileConfig(
+        agent=AgentConfig(streaming=False),
+        profiles={"main": LLMProfile(provider="openai", model="gpt-5-mini")},
+        setups={"planned": SetupConfig(planner="main", executor="main")},
+        default_setup="planned",
     )
-    assert await (await default_setup()).planner.plan(ctx) == Plan(("Check status",))
+    ConfigLoader.save(config)
+    memory = build_planner_memory(config.memory, state)
+    try:
+        assert await (await default_setup()).planner.plan(ctx, memory) == Plan(("Check status",))
+    finally:
+        await memory.aclose()
     [request] = requests
     assert [tool["name"] for tool in request["tools"]] == ["set_plan", "complete"]
     assert request["tool_choice"] == "required" and request["parallel_tool_calls"] is False

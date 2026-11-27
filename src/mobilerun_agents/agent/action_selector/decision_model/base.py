@@ -24,7 +24,7 @@ from mobilerun_agents.agent.action_selector.llm.calls import InvalidResponse
 from mobilerun_agents.agent.action_selector.llm.parsing import ToolCall
 from mobilerun_agents.agent.events import Detail
 from mobilerun_agents.agent.logs.memory import report_memory
-from mobilerun_agents.agent.memory.messages import text_messages
+from mobilerun_agents.agent.memory import read_memory
 from mobilerun_agents.agent.tools.atomic import AtomicTool, has_device_atomic_exception
 from mobilerun_agents.agent.tools.helpers import device_dimensions, visual_tool_names
 from mobilerun_agents.agent.tools.registry import ToolRegistry
@@ -201,15 +201,17 @@ class DecisionSelector(ActionSelector):
         if not options:
             names = ", ".join(registry.by_name) or "(none)"
             raise SelectorCannotServe(f"Jev has no usable action among: {names}.")
-        raw_history = await memory.aget(snapshot=snapshot, state=state)
-        history = text_messages(raw_history)
-        report_memory(ctx, state, memory, raw_history, history)
+        context = await read_memory(memory, ctx, registry.redactor)
+        report_memory(ctx, memory, context)
+        step_context = [previous_action_feedback(state), state.repair]
+        if snapshot.device_context:
+            step_context.append(snapshot.model_dump_json(include={"device_context"}))
         model_request = DecisionInput(
             goal=state.goal,
-            previous_action=previous_action_feedback(state),
+            previous_action="\n".join(part for part in step_context if part) or None,
             state=None if only else ui,
             screenshot=screenshot,
-            memory="\n".join(m.content or "" for m in history),
+            memory="\n".join(m.content or "" for m in context),
             registry=offered,
             options=options,
             intent=intent,

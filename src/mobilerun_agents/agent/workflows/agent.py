@@ -4,7 +4,7 @@ import json
 from asyncio import sleep
 from typing import Any, cast
 
-from llama_index.core.base.llms.types import ChatMessage, ImageBlock
+from llama_index.core.base.llms.types import ImageBlock
 from llama_index.core.tools import ToolSelection
 from mobilerun.models.context import JSONValue
 from pydantic import BaseModel, ValidationError
@@ -14,7 +14,6 @@ from workflows.events import Event, StartEvent, StopEvent
 from mobilerun_agents.agent.action_selector.base import ActionSelector, Selection
 from mobilerun_agents.agent.action_selector.llm.calls import InvalidResponse
 from mobilerun_agents.agent.events import Acted, Finished, Observed, Repaired, Selected
-from mobilerun_agents.agent.memory.messages import remember
 from mobilerun_agents.agent.tools.base import ActionResult, Completion
 from mobilerun_agents.agent.tools.helpers.errors import tool_error_summary
 from mobilerun_agents.config.user_config import AgentConfig
@@ -189,12 +188,12 @@ class AgentWorkflow(Workflow):
             state.repairs += 1
             attempt = state.repairs
             spent = attempt > self.config.decision.max_response_repair_attempts
+            state.repair = None if spent else reason
             if spent and state.current is not None:
                 state.current.screenshot = None
         ctx.write_event_to_stream(Repaired(step=number, attempt=attempt, reason=reason))
         if spent:
             return Done(outcome=Outcome(success=False, message=reason, reason="repair_attempts"))
-        await memory.aput_messages([ChatMessage(role="user", content=reason)])
         return Select(thoughts=thoughts)
 
     @step
@@ -202,7 +201,6 @@ class AgentWorkflow(Workflow):
         self,
         ctx: Context[AgentState],
         ev: Act,
-        memory: MemoryResource,
         services: ServicesResource,
     ) -> Observe | Done:
         state = await ctx.store.get_state()
@@ -219,7 +217,6 @@ class AgentWorkflow(Workflow):
         try:
             for call in ev.calls:
                 resolved = registry.resolve(call)
-                memory_call = call
                 try:
                     raw = await registry.execute(call, ctx)
                     match raw:
@@ -236,10 +233,8 @@ class AgentWorkflow(Workflow):
                         False, tool_error_summary(error, schema, registry.redactor.add)
                     )
                     if schema is not None:
-                        memory_call = ToolSelection(
-                            tool_id=call.tool_id,
-                            tool_name=call.tool_name,
-                            tool_kwargs=registry.redactor.value(call.tool_kwargs),
+                        resolved = resolved.model_copy(
+                            update={"tool_kwargs": registry.redactor.value(resolved.tool_kwargs)}
                         )
                 except Exception as error:
                     feedback = ActionResult(False, tool_error_summary(error))
@@ -252,7 +247,6 @@ class AgentWorkflow(Workflow):
                     before=before,
                 )
                 records.append(record)
-                await remember(memory, memory_call, record)
                 if outcome is None and call.tool_name == "complete" and not record.ok:
                     output_rejections += 1
                     if output_rejections >= self.config.max_output_validation_attempts:
@@ -275,6 +269,7 @@ class AgentWorkflow(Workflow):
                 state.actions.extend(records)
                 services.images.forget(state, number, protected)
                 state.repairs = 0
+                state.repair = None
                 state.current = persisted
 
         for record in records:

@@ -3,3 +3,9 @@
 {% else %}
 Current screen observation.
 {% endif %}
+{% if device_context is defined and device_context %}
+<device_context>{{ device_context | tojson }}</device_context>
+{% endif %}
+{% if repair is defined and repair %}
+<repair>{{ repair }}</repair>
+{% endif %}

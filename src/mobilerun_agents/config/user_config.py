@@ -17,6 +17,7 @@ from pydantic import (
     PositiveFloat,
     PositiveInt,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -227,10 +228,48 @@ class CheckpointsConfig(Section):
     enabled: bool = True
 
 
+_MEMORY_BLOCKS = {
+    "executor": ("setup", "goal", "last_step", "history", "app_cards"),
+    "planner": ("setup", "goal", "findings", "last_subgoal", "subgoal_history"),
+}
+
+
+class AgentMemoryConfig(Section):
+    blocks: list[str] = Field(default_factory=list)
+    history: PositiveInt = 5
+
+
+class ExecutorMemoryConfig(AgentMemoryConfig):
+    last_step_screenshot: bool = True
+
+
 class MemoryConfig(Section):
     token_limit: PositiveInt = DEFAULT_TOKEN_LIMIT
     insert_method: InsertMethod = InsertMethod.USER
-    blocks: list[Literal["app_cards"]] = Field(default_factory=list)
+    executor: ExecutorMemoryConfig = Field(
+        default_factory=lambda: ExecutorMemoryConfig(blocks=list(_MEMORY_BLOCKS["executor"]))
+    )
+    planner: AgentMemoryConfig = Field(
+        default_factory=lambda: AgentMemoryConfig(blocks=list(_MEMORY_BLOCKS["planner"]))
+    )
+
+    @field_validator("executor", "planner", mode="before")
+    @classmethod
+    def _default_blocks(cls, value: object, info: ValidationInfo) -> object:
+        match value:
+            case dict() if "blocks" not in value:
+                return {"blocks": list(_MEMORY_BLOCKS[info.field_name or ""]), **value}
+            case _:
+                return value
+
+    @field_validator("executor", "planner")
+    @classmethod
+    def _known_blocks(cls, value: AgentMemoryConfig, info: ValidationInfo) -> AgentMemoryConfig:
+        valid = _MEMORY_BLOCKS[info.field_name or ""]
+        for block in value.blocks:
+            if block not in valid:
+                raise ValueError(f"Unknown memory block {block!r}. Valid names: {', '.join(valid)}")
+        return value
 
 
 class MobileConfig(Section):
@@ -271,6 +310,11 @@ class MobileConfig(Section):
             except yaml.YAMLError:
                 raise ValueError("Invalid agents.yaml syntax") from None
         if type(data) is dict:
+            memory = data.get("memory")
+            if type(memory) is dict and "blocks" in memory:
+                raise OldConfigKeys(
+                    "Delete memory.blocks; list blocks under memory.executor.blocks"
+                )
             agent = data.get("agent")
             planning = agent.get("planning") if type(agent) is dict else None
             if type(planning) is dict and "max_planner_turns" in planning:
